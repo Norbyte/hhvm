@@ -107,6 +107,19 @@ int HttpClient::post(const char *url, const char *data, int size,
 }
 
 const StaticString
+  s_http("http"),
+  s_method("method"),
+  s_header("header"),
+  s_crlf("\r\n"),
+  s_user_agent("user_agent"),
+  s_user_agent_header("User-Agent: "),
+  s_content("content"),
+  s_follow_location("follow_location"),
+  s_max_redirects("max_redirects"),
+  s_protocol_version("protocol_version"),
+  s_timeout("timeout"),
+  s_proxy("proxy"),
+  s_ignore_errors("ignore_errors"),
   s_ssl("ssl"),
   s_verify_peer("verify_peer"),
   s_capath("capath"),
@@ -147,14 +160,80 @@ int HttpClient::request(const char* verb,
     curl_easy_setopt(cp, CURLOPT_SSL_CIPHER_LIST, "ALL");
   }
 
-  curl_easy_setopt(cp, CURLOPT_TIMEOUT,           m_timeout);
-  if (m_maxRedirect > 1) {
+  int maxRedirects = m_maxRedirect;
+  int timeout = m_timeout * 1000;
+  bool use11 = m_use11;
+  curl_slist *slist = nullptr;
+  String method;
+
+  if (verb != nullptr) {
+    method = verb;
+  }
+
+  if (m_stream_context_options[s_http].isArray()) {
+    const Array http = m_stream_context_options[s_http].toArray();
+    if (http.exists(s_method)) {
+      method = http[s_method].toString();
+    }
+
+    if (http.exists(s_user_agent)) {
+      const String header = s_user_agent_header + 
+	                        http[s_user_agent].toString();
+      slist = curl_slist_append(slist, header.data());
+    }
+
+    if (http.exists(s_header)) {
+      String header = http[s_header].toString();
+      for (int pos = 0; pos < header.length();) {
+        int nextPos = header.find(s_crlf, pos);
+        if (nextPos == String::npos) {
+          slist = curl_slist_append(slist, header.substr(pos).data());
+          pos = header.length();
+        } else {
+          slist = curl_slist_append(slist, header.substr(pos, nextPos).data());
+          pos = nextPos + 2;
+        }
+      }
+    }
+
+    if (http.exists(s_content)) {
+      const String contents = http[s_content].toString();
+      curl_easy_setopt(cp, CURLOPT_POST,          1);
+      curl_easy_setopt(cp, CURLOPT_POSTFIELDS,    contents.data());
+      curl_easy_setopt(cp, CURLOPT_POSTFIELDSIZE, contents.length());
+    }
+
+    if (http.exists(s_max_redirects)) {
+      maxRedirects = std::max(http[s_max_redirects].toInt32(), 1);
+    }
+
+    if (http.exists(s_follow_location) && 
+	    http[s_follow_location].toInt32() == 0) {
+      maxRedirects = 0;
+    }
+
+    if (http.exists(s_protocol_version)) {
+      use11 = (http[s_protocol_version].toDouble() == 1.0);
+    }
+
+    if (http.exists(s_timeout)) {
+      timeout = (int)std::max(http[s_timeout].toDouble() * 1000.0, 0.0);
+    }
+
+    if (http.exists(s_proxy)) {
+      curl_easy_setopt(cp, CURLOPT_PROXY, http[s_proxy].toString().data());
+    }
+  }
+
+
+  curl_easy_setopt(cp, CURLOPT_TIMEOUT_MS,          timeout);
+  if (maxRedirects > 1) {
     curl_easy_setopt(cp, CURLOPT_FOLLOWLOCATION,    1);
-    curl_easy_setopt(cp, CURLOPT_MAXREDIRS,         m_maxRedirect);
+    curl_easy_setopt(cp, CURLOPT_MAXREDIRS,         maxRedirects);
   } else {
     curl_easy_setopt(cp, CURLOPT_FOLLOWLOCATION,    0);
   }
-  if (!m_use11) {
+  if (!use11) {
     curl_easy_setopt(cp, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
   }
   if (m_decompress) {
@@ -178,7 +257,6 @@ int HttpClient::request(const char* verb,
     }
   }
 
-  curl_slist *slist = nullptr;
   if (requestHeaders) {
     for (HeaderMap::const_iterator iter = requestHeaders->begin();
          iter != requestHeaders->end(); ++iter) {
@@ -187,9 +265,10 @@ int HttpClient::request(const char* verb,
         slist = curl_slist_append(slist, header.data());
       }
     }
-    if (slist) {
-      curl_easy_setopt(cp, CURLOPT_HTTPHEADER, slist);
-    }
+  }
+
+  if (slist) {
+     curl_easy_setopt(cp, CURLOPT_HTTPHEADER, slist);
   }
 
   if (data && size) {
@@ -198,8 +277,8 @@ int HttpClient::request(const char* verb,
     curl_easy_setopt(cp, CURLOPT_POSTFIELDSIZE, size);
   }
 
-  if (verb != nullptr) {
-    curl_easy_setopt(cp, CURLOPT_CUSTOMREQUEST, verb);
+  if (method) {
+    curl_easy_setopt(cp, CURLOPT_CUSTOMREQUEST, method.data());
 
     if (strcasecmp(verb, "HEAD") == 0) {
       curl_easy_setopt(cp, CURLOPT_NOBODY, 1);
