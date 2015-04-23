@@ -22,7 +22,9 @@
 #include <list>
 #include <utility>
 
-#include "folly/MapUtil.h"
+#include <folly/MapUtil.h>
+#include <folly/Format.h>
+#include <folly/Likely.h>
 
 #include "hphp/util/logger.h"
 #include "hphp/util/process.h"
@@ -33,18 +35,19 @@
 #include "hphp/runtime/base/array-iterator.h"
 #include "hphp/runtime/base/memory-manager.h"
 #include "hphp/runtime/base/sweepable.h"
-#include "hphp/runtime/server/server-stats.h"
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/comparisons.h"
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/externals.h"
+#include "hphp/runtime/base/program-functions.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/type-conversions.h"
-#include "hphp/runtime/debugger/debugger.h"
 #include "hphp/runtime/base/unit-cache.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/debugger/debugger.h"
+#include "hphp/runtime/ext/ext_system_profiler.h"
 #include "hphp/runtime/ext/std/ext_std_output.h"
+#include "hphp/runtime/ext/string/ext_string.h"
+#include "hphp/runtime/server/server-stats.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/vm/jit/translator.h"
 #include "hphp/runtime/vm/debugger-hook.h"
@@ -59,7 +62,7 @@ IMPLEMENT_THREAD_LOCAL_NO_CHECK(ExecutionContext, g_context);
 
 ExecutionContext::ExecutionContext()
   : m_transport(nullptr)
-  , m_out(nullptr)
+  , m_sb(nullptr)
   , m_implicitFlush(false)
   , m_protectedLevel(0)
   , m_stdout(nullptr)
@@ -68,17 +71,17 @@ ExecutionContext::ExecutionContext()
   , m_errorState(ExecutionContext::ErrorState::NoError)
   , m_lastErrorNum(0)
   , m_throwAllErrors(false)
+  , m_pageletTasksStarted(0)
   , m_vhost(nullptr)
   , m_globalVarEnv(nullptr)
   , m_lambdaCounter(0)
   , m_nesting(0)
   , m_dbgNoBreak(false)
-  , m_coverPrevLine(-1)
-  , m_coverPrevUnit(nullptr)
   , m_lastErrorPath(staticEmptyString())
   , m_lastErrorLine(0)
   , m_executingSetprofileCallback(false)
 {
+  resetCoverageCounters();
   // We don't want a new execution context to cause any smart allocations
   // (because it will cause us to hold a slab, even while idle)
   static auto s_cwd = makeStaticString(Process::CurrentWorkingDirectory);
@@ -97,9 +100,11 @@ ExecutionContext::ExecutionContext()
   // the default on every request.
   hasSystemDefault = IniSetting::ResetSystemDefault("error_reporting");
   if (!hasSystemDefault) {
-    ThreadInfo::s_threadInfo.getNoCheck()->m_reqInjectionData.
-      setErrorReportingLevel(RuntimeOption::RuntimeErrorReportingLevel);
+    RID().setErrorReportingLevel(RuntimeOption::RuntimeErrorReportingLevel);
   }
+
+  VariableSerializer::serializationSizeLimit =
+    RuntimeOption::SerializationSizeLimit;
 }
 
 template<> void ThreadLocalNoCheck<ExecutionContext>::destroy() {
@@ -121,11 +126,6 @@ void ExecutionContext::cleanup() {
 
 void ExecutionContext::sweep() {
   cleanup();
-  m_breakPointFilter.~PCFilter();
-  m_flowFilter.~PCFilter();
-  m_lineBreakPointFilter.~PCFilter();
-  m_callBreakPointFilter.~PCFilter();
-  m_retBreakPointFilter.~PCFilter();
 }
 
 ExecutionContext::~ExecutionContext() {
@@ -169,8 +169,7 @@ String ExecutionContext::getMimeType() const {
       mimetype = mimetype.substr(0, pos);
     }
   } else if (m_transport && m_transport->getUseDefaultContentType()) {
-    mimetype =
-        ThreadInfo::s_threadInfo->m_reqInjectionData.getDefaultMimeType();
+    mimetype = RID().getDefaultMimeType();
   }
   return mimetype;
 }
@@ -232,8 +231,13 @@ size_t ExecutionContext::getStdoutBytesWritten() const {
 }
 
 void ExecutionContext::write(const char *s, int len) {
-  if (m_out) {
-    m_out->append(s, len);
+  if (m_sb) {
+    m_sb->append(s, len);
+    if (m_out && m_out->chunk_size > 0) {
+      if (m_sb->size() >= m_out->chunk_size) {
+        obFlush();
+      }
+    }
   } else {
     writeStdout(s, len);
   }
@@ -247,12 +251,13 @@ void ExecutionContext::obProtect(bool on) {
   m_protectedLevel = on ? m_buffers.size() : 0;
 }
 
-void ExecutionContext::obStart(const Variant& handler /* = null */) {
+void ExecutionContext::obStart(const Variant& handler /* = null */,
+                               int chunk_size /* = 0 */) {
   if (m_insideOBHandler) {
     raise_error("ob_start(): Cannot use output buffering "
                 "in output buffering display handlers");
   }
-  m_buffers.emplace_back(Variant(handler));
+  m_buffers.emplace_back(Variant(handler), chunk_size);
   resetCurrentBuffer();
 }
 
@@ -333,7 +338,6 @@ bool ExecutionContext::obFlush() {
   }
 
   auto str = last.oss.detach();
-
   if (!last.handler.isNull()) {
     try {
       Variant tout;
@@ -385,6 +389,8 @@ const StaticString
   s_type("type"),
   s_name("name"),
   s_args("args"),
+  s_chunk_size("chunk_size"),
+  s_buffer_used("buffer_used"),
   s_default_output_handler("default output handler");
 
 Array ExecutionContext::obGetStatus(bool full) {
@@ -392,14 +398,16 @@ Array ExecutionContext::obGetStatus(bool full) {
   int level = 0;
   for (auto& buffer : m_buffers) {
     Array status;
-    status.set(s_level, level);
-    if (level < m_protectedLevel) {
-      status.set(s_type, 1);
+    if (level < m_protectedLevel || buffer.handler.isNull()) {
       status.set(s_name, s_default_output_handler);
-    } else {
       status.set(s_type, 0);
+    } else {
       status.set(s_name, buffer.handler);
+      status.set(s_type, 1);
     }
+    status.set(s_level, level);
+    status.set(s_chunk_size, buffer.chunk_size);
+    status.set(s_buffer_used, buffer.oss.size());
 
     if (full) {
       ret.append(status);
@@ -446,9 +454,11 @@ void ExecutionContext::flush() {
 
 void ExecutionContext::resetCurrentBuffer() {
   if (m_buffers.empty()) {
+    m_sb = nullptr;
     m_out = nullptr;
   } else {
-    m_out = &m_buffers.back().oss;
+    m_sb = &m_buffers.back().oss;
+    m_out = &m_buffers.back();
   }
 }
 
@@ -518,14 +528,8 @@ void ExecutionContext::popUserExceptionHandler() {
 
 void ExecutionContext::registerRequestEventHandler(
   RequestEventHandler *handler) {
-  assert(handler);
-  if (m_requestEventHandlerSet.find(handler) ==
-      m_requestEventHandlerSet.end()) {
-    m_requestEventHandlerSet.insert(handler);
-    m_requestEventHandlers.push_back(handler);
-  } else {
-    assert(false);
-  }
+  assert(handler && handler->getInited());
+  m_requestEventHandlers.push_back(handler);
 }
 
 static bool requestEventHandlerPriorityComp(RequestEventHandler *a,
@@ -534,29 +538,46 @@ static bool requestEventHandlerPriorityComp(RequestEventHandler *a,
 }
 
 void ExecutionContext::onRequestShutdown() {
-  // Sort handlers by priority so that lower priority values get shutdown
-  // first
-  sort(m_requestEventHandlers.begin(), m_requestEventHandlers.end(),
-       requestEventHandlerPriorityComp);
-  for (unsigned int i = 0; i < m_requestEventHandlers.size(); i++) {
-    RequestEventHandler *handler = m_requestEventHandlers[i];
-    assert(handler->getInited());
-    if (handler->getInited()) {
+  while (!m_requestEventHandlers.empty()) {
+    // handlers could cause other handlers to be registered,
+    // so need to repeat until done
+    decltype(m_requestEventHandlers) tmp;
+    tmp.swap(m_requestEventHandlers);
+
+    // Sort handlers by priority so that lower priority values get shutdown
+    // first
+    sort(tmp.begin(), tmp.end(),
+         requestEventHandlerPriorityComp);
+    for (auto* handler : tmp) {
+      assert(handler->getInited());
       handler->requestShutdown();
       handler->setInited(false);
     }
   }
-  m_requestEventHandlers.clear();
-  m_requestEventHandlerSet.clear();
 }
 
-void ExecutionContext::executeFunctions(const Array& funcs) {
-  ThreadInfo::s_threadInfo->m_reqInjectionData.resetTimer(
-    RuntimeOption::PspTimeoutSeconds);
+void ExecutionContext::executeFunctions(ShutdownType type) {
+  RID().resetTimer(RuntimeOption::PspTimeoutSeconds);
+  RID().resetCPUTimer(RuntimeOption::PspCpuTimeoutSeconds);
 
-  for (ArrayIter iter(funcs); iter; ++iter) {
-    Array callback = iter.second().toArray();
-    vm_call_user_func(callback[s_name], callback[s_args].toArray());
+  if (!m_shutdowns.isNull() && m_shutdowns.exists(type)) {
+    SCOPE_EXIT {
+      try { m_shutdowns.remove(type); } catch (...) {}
+    };
+    // We mustn't destroy any callbacks until we're done with all
+    // of them. So hold them in tmp.
+    Array tmp;
+    while (true) {
+      auto& var = m_shutdowns.lvalAt(type);
+      if (!var.isArray()) break;
+      auto funcs = var.toArray();
+      var.unset();
+      for (int pos = 0; pos < funcs.size(); ++pos) {
+        Array callback = funcs[pos].toArray();
+        vm_call_user_func(callback[s_name], callback[s_args].toArray());
+      }
+      tmp.append(funcs);
+    }
   }
 }
 
@@ -566,30 +587,18 @@ void ExecutionContext::onShutdownPreSend() {
     try { obFlushAll(); } catch (...) {}
   };
 
-  if (!m_shutdowns.isNull() && m_shutdowns.exists(ShutDown)) {
-    SCOPE_EXIT {
-      try { m_shutdowns.remove(ShutDown); } catch (...) {}
-    };
-    executeFunctions(m_shutdowns[ShutDown].toArray());
-  }
+  executeFunctions(ShutDown);
 }
 
 extern void ext_session_request_shutdown();
 
 void ExecutionContext::onShutdownPostSend() {
   ServerStats::SetThreadMode(ServerStats::ThreadMode::PostProcessing);
-  MM().resetCouldOOM();
+  MM().resetCouldOOM(isStandardRequest());
   try {
     try {
       ServerStatsHelper ssh("psp", ServerStatsHelper::TRACK_HWINST);
-      if (!m_shutdowns.isNull()) {
-        if (m_shutdowns.exists(PostSend)) {
-          SCOPE_EXIT {
-            try { m_shutdowns.remove(PostSend); } catch (...) {}
-          };
-          executeFunctions(m_shutdowns[PostSend].toArray());
-        }
-      }
+      executeFunctions(PostSend);
     } catch (...) {
       try {
         bump_counter_and_rethrow(true /* isPsp */);
@@ -621,11 +630,11 @@ void ExecutionContext::onShutdownPostSend() {
 bool ExecutionContext::errorNeedsHandling(int errnum,
                                               bool callUserHandler,
                                               ErrorThrowMode mode) {
-  if (m_throwAllErrors) {
-    throw errnum;
+  if (UNLIKELY(m_throwAllErrors)) {
+    throw Exception(folly::sformat("throwAllErrors: {}", errnum));
   }
   if (mode != ErrorThrowMode::Never || errorNeedsLogging(errnum) ||
-      ThreadInfo::s_threadInfo->m_reqInjectionData.hasTrackErrors()) {
+      RID().hasTrackErrors()) {
     return true;
   }
   if (callUserHandler) {
@@ -639,7 +648,7 @@ bool ExecutionContext::errorNeedsHandling(int errnum,
 
 bool ExecutionContext::errorNeedsLogging(int errnum) {
   auto level =
-    ThreadInfo::s_threadInfo->m_reqInjectionData.getErrorReportingLevel() |
+    RID().getErrorReportingLevel() |
     RuntimeOption::ForceErrorReportingLevel;
   return RuntimeOption::NoSilencer || (level & errnum) != 0;
 }
@@ -687,8 +696,8 @@ void ExecutionContext::handleError(const std::string& msg,
 
   // Potentially upgrade the error to E_USER_ERROR
   if (errnum & RuntimeOption::ErrorUpgradeLevel &
-      static_cast<int>(ErrorConstants::ErrorModes::UPGRADEABLE_ERROR)) {
-    errnum = static_cast<int>(ErrorConstants::ErrorModes::USER_ERROR);
+      static_cast<int>(ErrorMode::UPGRADEABLE_ERROR)) {
+    errnum = static_cast<int>(ErrorMode::USER_ERROR);
     mode = ErrorThrowMode::IfUnhandled;
   }
 
@@ -696,25 +705,36 @@ void ExecutionContext::handleError(const std::string& msg,
   auto const ee = skipFrame ?
     ExtendedException(ExtendedException::SkipFrame{}, msg) :
     ExtendedException(msg);
-  recordLastError(ee, errnum);
   bool handled = false;
   if (callUserHandler) {
     handled = callUserErrorHandler(ee, errnum, false);
   }
+
+  if (!handled) {
+    recordLastError(ee, errnum);
+  }
+
+  if (g_system_profiler) {
+    g_system_profiler->errorCallBack(ee, errnum, msg);
+  }
+
   if (mode == ErrorThrowMode::Always ||
       (mode == ErrorThrowMode::IfUnhandled && !handled)) {
     DEBUGGER_ATTACHED_ONLY(phpDebuggerErrorHook(ee, errnum, msg));
-    auto exn = FatalErrorException(msg, ee.getBacktrace());
+    bool isRecoverable =
+      errnum == static_cast<int>(ErrorMode::RECOVERABLE_ERROR);
+    auto exn = FatalErrorException(msg, ee.getBacktrace(), isRecoverable);
     exn.setSilent(!errorNeedsLogging(errnum));
     throw exn;
   }
   if (!handled) {
-    if (ThreadInfo::s_threadInfo->m_reqInjectionData.hasTrackErrors()) {
+    VMRegAnchor _;
+    auto fp = vmfp();
+
+    if (RID().hasTrackErrors() && fp) {
       // Set $php_errormsg in the parent scope
       Variant varFrom(ee.getMessage());
       const auto tvFrom(varFrom.asTypedValue());
-      VMRegAnchor _;
-      auto fp = vmfp();
       if (fp->func()->isBuiltin()) {
         fp = getPrevVMState(fp);
       }
@@ -727,7 +747,7 @@ void ExecutionContext::handleError(const std::string& msg,
         }
         tvDup(*tvFrom, *tvTo);
       } else if (fp->hasVarEnv()) {
-        g_context->setVar(s_php_errormsg.get(), tvFrom);
+        fp->getVarEnv()->set(s_php_errormsg.get(), tvFrom);
       }
     }
 
@@ -777,9 +797,17 @@ bool ExecutionContext::callUserErrorHandler(const Exception &e, int errnum,
 }
 
 bool ExecutionContext::onFatalError(const Exception &e) {
-  MM().resetCouldOOM();
+  MM().resetCouldOOM(isStandardRequest());
+  RID().resetTimer();
 
-  int errnum = static_cast<int>(ErrorConstants::ErrorModes::FATAL_ERROR);
+  auto prefix = "\nFatal error: ";
+  auto errnum = static_cast<int>(ErrorMode::FATAL_ERROR);
+  auto const fatal = dynamic_cast<const FatalErrorException*>(&e);
+  if (fatal && fatal->isRecoverable()) {
+     prefix = "\nCatchable fatal error: ";
+     errnum = static_cast<int>(ErrorMode::RECOVERABLE_ERROR);
+  }
+
   recordLastError(e, errnum);
 
   bool silenced = false;
@@ -790,16 +818,16 @@ bool ExecutionContext::onFatalError(const Exception &e) {
   }
   // need to silence even with the AlwaysLogUnhandledExceptions flag set
   if (!silenced && RuntimeOption::AlwaysLogUnhandledExceptions) {
-    Logger::Log(Logger::LogError, "\nFatal error: ", e,
-                fileAndLine.first.c_str(), fileAndLine.second);
+    Logger::Log(Logger::LogError, prefix, e, fileAndLine.first.c_str(),
+                fileAndLine.second);
   }
   bool handled = false;
   if (RuntimeOption::CallUserHandlerOnFatals) {
     handled = callUserErrorHandler(e, errnum, true);
   }
   if (!handled && !silenced && !RuntimeOption::AlwaysLogUnhandledExceptions) {
-    Logger::Log(Logger::LogError, "\nFatal error: ", e,
-                fileAndLine.first.c_str(), fileAndLine.second);
+    Logger::Log(Logger::LogError, prefix, e, fileAndLine.first.c_str(),
+                fileAndLine.second);
   }
   return handled;
 }
@@ -845,8 +873,7 @@ void ExecutionContext::debuggerInfo(
     info.emplace_back("Max Memory", IDebuggable::FormatSize(newInt));
   }
   info.emplace_back("Max Time",
-    IDebuggable::FormatTime(ThreadInfo::s_threadInfo.getNoCheck()->
-                 m_reqInjectionData.getTimeout() * 1000));
+                    IDebuggable::FormatTime(RID().getTimeout() * 1000));
 }
 
 ///////////////////////////////////////////////////////////////////////////////

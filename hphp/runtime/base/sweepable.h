@@ -17,35 +17,19 @@
 #ifndef incl_HPHP_SWEEPABLE_H_
 #define incl_HPHP_SWEEPABLE_H_
 
+#include "hphp/util/portability.h"
+
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
 /*
  * Objects that need to do special clean up at the end of the request
  * may register themselves for this by deriving from Sweepable.  After
- * every request, Sweepable::SweepAll is called so the objects may
- * clear out request-local allocations that are not smart-allocated.
+ * every request, MemoryManager::sweep() called each Sweepable::sweep()
+ * method, allowing objects to clear out request-local allocations that
+ * are not smart-allocated, do cleanup, etc.
  */
-class Sweepable {
-  /*
-   * Sweepable objects are not supposed to be copied or assigned
-   * naively.
-   */
-  Sweepable(const Sweepable&) = delete;
-  Sweepable& operator=(const Sweepable&) = delete;
-
-public:
-  struct Node {
-    Node *next, *prev;
-    void enlist(Node& head);
-    void delist();
-    void init();
-  };
-  static void SweepAll();
-  static void InitSweepableList();
-
-public:
-  Sweepable();
+struct Sweepable: private boost::noncopyable {
 
   /*
    * There is no default behavior. Make sure this function frees all
@@ -54,27 +38,61 @@ public:
   virtual void sweep() = 0;
 
   /*
-   * Note: "Persistent" here means that the object will stay alive
-   * across requests, but *as a thread local*.  It can be reused once
-   * the same server thread gets around to handling a new request.  If
-   * you need this you probably should be using it via PersistentResourceStore.
-   */
-  void incPersistent() { ++m_persistentCount; }
-  void decPersistent() { --m_persistentCount; }
-  bool isPersistent() { return m_persistentCount > 0; }
-
-  /*
    * Remove this object from the sweepable list, so it won't have
    * sweep() called at the next SweepAll.
    */
-  void unregister();
+  void unregister() {
+    delist();
+    init(); // in case destructor runs later.
+  }
+
+  /*
+   * List manipulation methods; mainly for use by MemoryManager.
+   */
+  bool empty() const {
+    assert((this == m_prev) == (this == m_next)); // both==this or both!=this
+    return this == m_next;
+  }
+  void init() { m_prev = m_next = this; }
+  Sweepable* next() const { return m_next; }
+
+  void delist() {
+    auto n = m_next, p = m_prev;
+    n->m_prev = p;
+    p->m_next = n;
+  }
+
+  void enlist(Sweepable* head) {
+    auto next = head->m_next;
+    m_next = next;
+    m_prev = head;
+    head->m_next = next->m_prev = this;
+  }
 
 protected:
-  ~Sweepable();
+  Sweepable();
+  enum class Init {};
+  explicit Sweepable(Init) { init(); }
+  virtual ~Sweepable() { delist(); }
 
 private:
-  Node m_sweepNode;
-  unsigned int m_persistentCount;
+  Sweepable *m_next, *m_prev;
+};
+
+/*
+ * SweepableMember is a Sweepable used as a member of an otherwise nonvirtual
+ * class. The member must be named m_sweepable. If T is a derived class, it
+ * should only have one m_sweepable member. Anything fancier than that voids
+ * your warranty.
+ */
+template<class T>
+struct SweepableMember: Sweepable {
+  void sweep() {
+    auto obj = reinterpret_cast<T*>(
+      uintptr_t(this) - offsetof(T, m_sweepable)
+    );
+    obj->sweep();
+  };
 };
 
 ///////////////////////////////////////////////////////////////////////////////

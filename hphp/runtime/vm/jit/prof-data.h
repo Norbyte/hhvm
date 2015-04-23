@@ -133,10 +133,10 @@ class PrologueToTransMap {
  */
 class ProfTransRec {
  public:
-  ProfTransRec(TransID id, TransKind kind, Offset lastBcOff, const SrcKey& sk,
+  ProfTransRec(TransID id, TransKind kind, Offset lastBcOff, SrcKey sk,
                RegionDescPtr region);
-  ProfTransRec(TransID id, TransKind kind, const SrcKey& sk);
-  ProfTransRec(TransID id, TransKind kind, const SrcKey& sk, int nArgs);
+  ProfTransRec(TransID id, TransKind kind, SrcKey sk);
+  ProfTransRec(TransID id, TransKind kind, SrcKey sk, int nArgs);
 
   TransID              transId()    const;
   TransKind            kind()       const;
@@ -166,6 +166,8 @@ class ProfTransRec {
 typedef std::unique_ptr<ProfTransRec> ProfTransRecPtr;
 typedef std::unordered_map<FuncId, TransIDVec> FuncProfTransMap;
 
+using FuncIdSet = hphp_hash_set<FuncId>;
+
 /**
  * ProfData encapsulates the profiling data kept by the JIT.
  */
@@ -176,7 +178,7 @@ public:
   ProfData(const ProfData&)            = delete;
   ProfData& operator=(const ProfData&) = delete;
 
-  TransID                 numTrans()                  const;
+  uint32_t                numTrans()                  const;
   TransID                 curTransID()                const;
 
   bool                    hasTransRec(TransID id)     const;
@@ -192,7 +194,10 @@ public:
   RegionDescPtr           transRegion(TransID id)     const;
   TransKind               transKind(TransID id)       const;
   bool                    isKindProfile(TransID id)   const;
+  // The actual counter value, which starts at JitPGOThreshold and goes down.
   int64_t                 transCounter(TransID id)    const;
+  // The absolute number of times that a translation executed.
+  int64_t                 absTransCounter(TransID id) const;
   int64_t*                transCounterAddr(TransID id);
   TransID                 prologueTransId(const Func* func,
                                           int nArgs)  const;
@@ -204,9 +209,8 @@ public:
 
   TransID                 addTransProfile(const RegionDescPtr&  region,
                                           const PostConditions& pconds);
-  TransID                 addTransNonProf(TransKind kind,
-                                          const SrcKey& sk);
-  TransID                 addTransPrologue(TransKind kind, const SrcKey& sk,
+  TransID                 addTransNonProf(TransKind kind, SrcKey sk);
+  TransID                 addTransPrologue(TransKind kind, SrcKey sk,
                                            int nArgs);
   PrologueCallersRec*     findPrologueCallersRec(const Func* func,
                                                  int nArgs) const;
@@ -214,9 +218,9 @@ public:
                                                 TCA caller);
   void                    addPrologueGuardCaller(const Func* func, int nArgs,
                                                  TCA caller);
-  bool                    optimized(const SrcKey& sk) const;
+  bool                    optimized(SrcKey sk) const;
   bool                    optimized(FuncId funcId) const;
-  void                    setOptimized(const SrcKey& sk);
+  void                    setOptimized(SrcKey sk);
   void                    setOptimized(FuncId funcId);
   bool                    profiling(FuncId funcId) const;
   void                    setProfiling(FuncId funcId);

@@ -8,10 +8,11 @@
  *
  *)
 
-include Sys_utils
-
 let () = Random.self_init ()
 let debug = ref false
+let profile = ref false
+
+let log = ref (fun (_ : string)  -> ())
 
 let d s =
   if !debug
@@ -27,6 +28,11 @@ let dn s =
     print_newline();
     flush stdout;
   end
+
+module String = struct
+  include String
+  let to_string x = x
+end
 
 module type MapSig = sig
   type +'a t
@@ -52,6 +58,7 @@ module type MapSig = sig
   val merge : (key -> 'a option -> 'b option -> 'c option)
     -> 'a t -> 'b t -> 'c t
   val choose : 'a t -> key * 'a
+  val split: key -> 'a t -> 'a t * 'a option * 'a t
   val keys: 'a t -> key list
   val values: 'a t -> 'a list
 
@@ -132,15 +139,8 @@ module HashSet = (struct
 end : HashSetSig)
 
 let spf = Printf.sprintf
-
-let fst3 = function x, _, _ -> x
-let snd3 = function _, x, _ -> x
-let thd3 = function _, _, x -> x
-
-let internal_error s =
-  Printf.fprintf stderr
-    "You just found a bug!\nShoot me an email: julien.verlaguet@fb.com";
-  exit 2
+let print_endlinef fmt = Printf.ksprintf print_endline fmt
+let prerr_endlinef fmt = Printf.ksprintf prerr_endline fmt
 
 let opt f env = function
   | None -> env, None
@@ -150,10 +150,20 @@ let opt_map f = function
   | None -> None
   | Some x -> Some (f x)
 
+let opt_map_default f default x =
+  match x with
+  | None -> default
+  | Some x -> f x
+
 let opt_fold_left f x y =
   match y with
   | None -> x
   | Some y -> f x y
+
+let rec cat_opts = function
+  | [] -> []
+  | Some x :: xs -> x :: cat_opts xs
+  | None :: xs -> cat_opts xs
 
 let rec lmap f env l =
   match l with
@@ -257,9 +267,13 @@ let maybe f env = function
   | None -> ()
   | Some x -> f env x
 
-let unsafe_opt = function
-  | None -> assert false
+(* Since OCaml usually runs w/o backtraces enabled, the note makes errors
+ * easier to debug. *)
+let unsafe_opt_note note = function
+  | None -> raise (Invalid_argument note)
   | Some x -> x
+
+let unsafe_opt x = unsafe_opt_note "unsafe_opt got None" x
 
 let liter f env l = List.iter (f env) l
 
@@ -320,9 +334,17 @@ let iter_n_acc n f acc =
 let set_of_list list =
   List.fold_right SSet.add list SSet.empty
 
+(* \A\B\C -> A\B\C *)
 let strip_ns s =
   if String.length s == 0 || s.[0] <> '\\' then s
   else String.sub s 1 ((String.length s) - 1)
+
+(* \A\B\C -> C *)
+let strip_all_ns s =
+  try
+    let base_name_start = String.rindex s '\\' + 1 in
+    String.sub s base_name_start ((String.length s) - base_name_start)
+  with Not_found -> s
 
 let str_starts_with long short =
   try
@@ -353,3 +375,16 @@ let rec iter2_shortest f l1 l2 =
 (* We may want to replace this with a tail-recursive map at some point,
  * factoring here so we have a clean way to grep. *)
 let rev_rev_map f l = List.rev (List.rev_map f l)
+
+let fold_fun_list acc fl =
+  List.fold_left (|>) acc fl
+
+let compose f g x = f (g x)
+
+let with_context ~enter ~exit ~do_ =
+  enter ();
+  let result = try do_ () with e ->
+    exit ();
+    raise e in
+  exit ();
+  result

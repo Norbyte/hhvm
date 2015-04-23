@@ -18,9 +18,9 @@
 #include "hphp/runtime/ext/asio/ext_asio.h"
 
 #include "hphp/runtime/ext/ext_closure.h"
-#include "hphp/runtime/ext/asio/asio_context.h"
-#include "hphp/runtime/ext/asio/asio_session.h"
-#include "hphp/runtime/ext/asio/resumable_wait_handle.h"
+#include "hphp/runtime/ext/asio/asio-context.h"
+#include "hphp/runtime/ext/asio/asio-session.h"
+#include "hphp/runtime/ext/asio/resumable-wait-handle.h"
 #include "hphp/runtime/vm/vm-regs.h"
 #include "hphp/system/systemlib.h"
 
@@ -29,7 +29,7 @@ namespace HPHP {
 
 namespace {
 
-int HHVM_FUNCTION(asio_get_current_context_idx) {
+int64_t HHVM_FUNCTION(asio_get_current_context_idx) {
   return AsioSession::Get()->getCurrentContextIdx();
 }
 
@@ -63,7 +63,7 @@ Object HHVM_FUNCTION(asio_get_running) {
   return c_ResumableWaitHandle::getRunning(vmfp());
 }
 
-class AsioExtension : public Extension {
+class AsioExtension final : public Extension {
   public:
    AsioExtension() : Extension("asio", "0.1") {}
 

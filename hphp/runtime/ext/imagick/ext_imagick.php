@@ -1365,6 +1365,9 @@ class Imagick implements Countable, Iterator {
   <<__Native>>
   function getImageMatteColor(): ImagickPixel;
 
+  <<__Native>>
+  function getImageMimeType(): string;
+
   /**
    * Gets the image orientation
    *
@@ -2904,7 +2907,7 @@ class Imagick implements Countable, Iterator {
    */
   <<__Native>>
   function setImageColormapColor(int $index,
-                                 mixed $color): bool;
+                                 ImagickPixel $color): bool;
 
   /**
    * Sets the image colorspace

@@ -21,7 +21,7 @@
 #include <vector>
 #include <stdarg.h>
 
-#include "folly/Format.h"
+#include <folly/Format.h>
 
 #include "hphp/util/assertions.h"
 #include "hphp/util/portability.h"
@@ -96,7 +96,6 @@ namespace Trace {
       TM(debuggerflow)  \
       TM(debuginfo)     \
       TM(dispatchBB)    \
-      TM(emitter)       \
       TM(fixup)         \
       TM(fr)            \
       TM(gc)            \
@@ -110,11 +109,19 @@ namespace Trace {
       TM(hhbbc_time)    \
       TM(hhbc)          \
       TM(vasm)          \
+      TM(vasm_copy)     \
       TM(hhir)          \
       TM(hhirTracelets) \
+      TM(hhir_cfg)      \
       TM(hhir_dce)      \
-      TM(llvm)          \
+      TM(hhir_store)    \
+      TM(hhir_alias)    \
+      TM(hhir_load)     \
+      TM(hhir_refineTmps) \
+      TM(hhir_gvn)      \
       TM(hhir_refcount) \
+      TM(llvm)          \
+      TM(llvm_count)    \
       TM(inlining)      \
       TM(instancebits)  \
       TM(intercept)     \
@@ -133,7 +140,9 @@ namespace Trace {
       TM(ringbuffer)    \
       TM(runtime)       \
       TM(servicereq)    \
+      TM(simplify)      \
       TM(smartalloc)    \
+      TM(heaptrace)     \
       TM(stat)          \
       TM(statgroups)    \
       TM(stats)         \
@@ -224,10 +233,9 @@ void ftraceRelease(Args&&... args) {
   traceRelease("%s", folly::format(std::forward<Args>(args)...).str().c_str());
 }
 
-// Trace to the global ring buffer in all builds, and also trace normally
-// via the standard TRACE(n, ...) macro.
-#define TRACE_RB(n, ...)                            \
-  HPHP::Trace::traceRingBufferRelease(__VA_ARGS__); \
+// Trace to the global ring buffer and the normal TRACE destination.
+#define TRACE_RB(n, ...)                                        \
+  ONTRACE(n, HPHP::Trace::traceRingBufferRelease(__VA_ARGS__)); \
   TRACE(n, __VA_ARGS__);
 void traceRingBufferRelease(const char* fmt, ...) ATTRIBUTE_PRINTF(1,2);
 

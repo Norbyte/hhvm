@@ -16,12 +16,13 @@
 */
 
 #include "hphp/runtime/ext/std/ext_std_classobj.h"
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/class-info.h"
 #include "hphp/runtime/vm/jit/translator.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/vm/unit.h"
 #include "hphp/runtime/ext/array/ext_array.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 
 namespace HPHP {
 
@@ -94,6 +95,12 @@ bool HHVM_FUNCTION(trait_exists, const String& trait_name,
   return Unit::classExists(trait_name.get(), autoload, ClassKind::Trait);
 }
 
+bool HHVM_FUNCTION(enum_exists, const String& enum_name,
+                   bool autoload /* = true */) {
+  Class* cls = Unit::getClass(enum_name.get(), autoload);
+  return cls && isEnum(cls);
+}
+
 Variant HHVM_FUNCTION(get_class_methods, const Variant& class_or_object) {
   auto const cls = get_cls(class_or_object);
   if (!cls) return init_null();
@@ -121,7 +128,8 @@ Array HHVM_FUNCTION(get_class_constants, const String& className) {
   for (size_t i = 0; i < numConstants; i++) {
     // Note: hphpc doesn't include inherited constants in
     // get_class_constants(), so mimic that behavior
-    if (consts[i].m_class == cls) {
+    if (consts[i].m_class == cls && !consts[i].isAbstract() &&
+        !consts[i].isType()) {
       auto const name  = const_cast<StringData*>(consts[i].m_name.get());
       Cell value = consts[i].m_val;
       // Handle dynamically set constants
@@ -174,11 +182,12 @@ Variant HHVM_FUNCTION(get_class_vars, const String& className) {
   }
 
   for (size_t i = 0; i < numSProps; ++i) {
-    bool vis, access;
-    TypedValue* value = cls->getSProp(ctx, sPropInfo[i].m_name, vis, access);
-    if (access) {
-      arr.set(const_cast<StringData*>(sPropInfo[i].m_name.get()),
-        tvAsCVarRef(value));
+    auto const lookup = cls->getSProp(ctx, sPropInfo[i].m_name);
+    if (lookup.accessible) {
+      arr.set(
+        const_cast<StringData*>(sPropInfo[i].m_name.get()),
+        tvAsCVarRef(lookup.prop)
+      );
     }
   }
 
@@ -204,7 +213,7 @@ Variant HHVM_FUNCTION(get_class, const Variant& object /* = null_variant */) {
     return ret;
   }
   if (!object.isObject()) return false;
-  return VarNR(object.toObject()->o_getClassName());
+  return VarNR(object.toObject()->getClassName());
 }
 
 Variant HHVM_FUNCTION(get_called_class) {
@@ -212,7 +221,7 @@ Variant HHVM_FUNCTION(get_called_class) {
   ActRec* ar = cf();
   if (ar) {
     if (ar->hasThis()) {
-      return Variant(ar->getThis()->o_getClassName());
+      return Variant(ar->getThis()->getClassName());
     }
     if (ar->hasClass()) {
       return Variant(ar->getClass()->preClass()->name(),
@@ -257,6 +266,9 @@ Variant HHVM_FUNCTION(get_parent_class,
 static bool is_a_impl(const Variant& class_or_object, const String& class_name,
                       bool allow_string, bool subclass_only) {
   if (class_or_object.isString() && !allow_string) {
+    return false;
+  }
+  if (!(class_or_object.isString() || class_or_object.isObject())) {
     return false;
   }
 
@@ -315,18 +327,16 @@ Variant HHVM_FUNCTION(property_exists, const Variant& class_or_object,
     return Variant(Variant::NullInit());
   }
 
-  bool accessible;
-  auto propInd = cls->getDeclPropIndex(cls, property.get(), accessible);
-  if (propInd != kInvalidSlot) {
-    return true;
-  }
+  auto const lookup = cls->getDeclPropIndex(cls, property.get());
+  if (lookup.prop != kInvalidSlot) return true;
+
   if (obj &&
       UNLIKELY(obj->getAttribute(ObjectData::HasDynPropArr)) &&
       obj->dynPropArray()->nvGet(property.get())) {
     return true;
   }
-  propInd = cls->lookupSProp(property.get());
-  return (propInd != kInvalidSlot);
+  auto const propInd = cls->lookupSProp(property.get());
+  return propInd != kInvalidSlot;
 }
 
 Array HHVM_FUNCTION(get_object_vars, const Object& object) {
@@ -351,6 +361,7 @@ void StandardExtension::initClassobj() {
   HHVM_FE(class_exists);
   HHVM_FE(interface_exists);
   HHVM_FE(trait_exists);
+  HHVM_FE(enum_exists);
   HHVM_FE(get_class_methods);
   HHVM_FE(get_class_constants);
   HHVM_FE(get_class_vars);

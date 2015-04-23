@@ -16,6 +16,7 @@
 #ifndef incl_HPHP_RUNTIME_VM_SERVICE_REQUESTS_H_
 #define incl_HPHP_RUNTIME_VM_SERVICE_REQUESTS_H_
 
+#include "hphp/runtime/base/rds.h"
 #include "hphp/runtime/vm/jit/containers.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/vm/jit/types.h"
@@ -26,24 +27,13 @@ namespace HPHP { namespace jit {
 
 #define SERVICE_REQUESTS \
   /*
-   * Return from this nested VM invocation to the previous invocation.
-   * (Ending the program if there is no previous invocation.)
+   * BIND_* all are requests for the first time a jump is needed.  This
+   * generally involves translating new code and then patching an address
+   * supplied as a service request argument.
    */ \
-  REQ(EXIT) \
-  \
-  /*
-   * BIND_* all are requests for the first time a call, jump, or
-   * whatever is needed.  This generally involves translating new code
-   * and then patching an address supplied as a service request
-   * argument.
-   */ \
-  REQ(BIND_CALL)         \
   REQ(BIND_JMP)          \
-  REQ(BIND_JCC)          \
   REQ(BIND_ADDR)         \
-  REQ(BIND_SIDE_EXIT)    \
   REQ(BIND_JMPCC_FIRST)  \
-  REQ(BIND_JMPCC_SECOND) \
   \
   /*
    * When all translations don't support the incoming types, a
@@ -58,33 +48,18 @@ namespace HPHP { namespace jit {
   REQ(RETRANSLATE_OPT) \
   \
   /*
-   * If the max translations is reached for a SrcKey, the last
-   * translation in the chain will jump to an interpret request stub.
-   * This instructs enterTC to punt to the interpreter.
-   */ \
-  REQ(INTERPRET) \
-  \
-  /*
    * When the interpreter pushes an ActRec, the return address for
    * this ActRec will be set to a stub that raises POST_INTERP_RET,
    * since it doesn't have a TCA to return to.
    *
-   * This request is raised in the case that translated machine code
-   * executes the RetC for a frame that was pushed by the interpreter.
+   * REQ_POST_INTERP_RET is raised in the case that translated machine code
+   * executes the RetC for a frame that was pushed by the
+   * interpreter. REQ_POST_DEBUGGER_RET is a similar request that is used when
+   * translated code returns from a frame that had its saved return address
+   * smashed by the debugger.
    */ \
   REQ(POST_INTERP_RET) \
-  \
-  /*
-   * Raised when the execution stack overflowed.
-   */ \
-  REQ(STACK_OVERFLOW) \
-  \
-  /*
-   * Resume restarts execution at the current PC.  This is used after
-   * an interpOne of an instruction that changes the PC, and in some
-   * cases with FCall.
-   */ \
-  REQ(RESUME)
+  REQ(POST_DEBUGGER_RET)
 
 enum ServiceRequest {
 #define REQ(nm) REQ_##nm,
@@ -112,22 +87,10 @@ enum class SRFlags {
   None = 0,
 
   /*
-   * Indicates the service request should be aligned.
-   */
-  Align = 1 << 0,
-
-  /*
-   * For some service requests (returning from interpreted frames),
-   * using a ret instruction to get back to enterTCHelper will
-   * unbalance the return stack buffer---in these cases use a jmp.
-   */
-  JmpInsteadOfRet = 1 << 1,
-
-  /*
    * Indicates if the service request is persistent. For non-persistent
    * requests, the service request stub may be reused.
    */
-  Persist = 1 << 2,
+  Persist = 1 << 0,
 };
 
 inline bool operator&(SRFlags a, SRFlags b) {
@@ -144,15 +107,6 @@ inline SRFlags operator|(SRFlags a, SRFlags b) {
  * unknown. We leave one of these request arg blobs in m_data, and point
  * to it at callout-time.
  */
-
-// REQ_BIND_CALL
-struct ReqBindCall {
-  SrcKey m_sourceInstr;
-  jit::TCA m_toSmash;
-  int m_nArgs;
-  bool m_isImmutable; // call was to known func.
-};
-
 
 struct ServiceReqArgInfo {
   enum {
@@ -173,7 +127,42 @@ inline ServiceReqArgInfo RipRelative(TCA addr) {
   };
 }
 
-typedef jit::vector<ServiceReqArgInfo> ServiceReqArgVec;
+using ServiceReqArgVec = jit::vector<ServiceReqArgInfo>;
+
+union ServiceReqArg {
+  TCA tca;
+  Offset offset;
+  SrcKey::AtomicInt sk;
+  TransFlags trflags;
+  TransID transID;
+  bool boolVal;
+  ActRec* ar;
+};
+
+/*
+ * Any changes to the size or layout of this struct must be reflected in
+ * handleSRHelper() in translator-asm-helpers.S.
+ */
+struct ServiceReqInfo {
+  ServiceRequest req;
+  TCA stub;
+  ServiceReqArg args[4];
+};
+static_assert(sizeof(ServiceReqInfo) == 0x30,
+              "rsp adjustments in handleSRHelper");
+
+/*
+ * Assembly stub called by translated code to pack argument registers into a
+ * ServiceReqInfo, along with some other bookkeeping tasks before a service
+ * request.
+ */
+extern "C" void handleSRHelper();
+
+/*
+ * Assembly stub used by the unwinder to reload vmsp() and vmfp() into their
+ * ABI registers then jump somewhere in the TC.
+ */
+extern "C" void handleSRResumeTC();
 
 }}
 

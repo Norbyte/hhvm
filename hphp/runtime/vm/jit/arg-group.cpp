@@ -21,28 +21,41 @@ namespace HPHP { namespace jit {
 
 TRACE_SET_MOD(hhir);
 
+const char* destTypeName(DestType dt) {
+  switch (dt) {
+    case DestType::None: return "None";
+    case DestType::SSA:  return "SSA";
+    case DestType::Byte: return "Byte";
+    case DestType::TV:   return "TV";
+    case DestType::Dbl:  return "Dbl";
+    case DestType::SIMD: return "SIMD";
+  }
+  not_reached();
+}
+
 ArgDesc::ArgDesc(SSATmp* tmp, Vloc loc, bool val) {
-  if (tmp->isConst()) {
+  if (tmp->hasConstVal()) {
     // tmp is a constant
     if (val) {
       m_imm64 = tmp->rawVal();
     } else {
-      m_imm64 = toDataTypeForCall(tmp->type());
+      static_assert(offsetof(TypedValue, m_type) % 8 == 0, "");
+      m_imm64 = uint64_t(tmp->type().toDataType());
     }
     m_kind = Kind::Imm;
     return;
   }
   if (val) {
-    assert(loc.reg(0) != InvalidReg);
+    assertx(loc.reg(0) != InvalidReg);
     m_srcReg = loc.reg(0);
     m_kind = Kind::Reg;
     // zero extend any boolean value that we pass to the helper in case
     // the helper expects it (e.g., as TypedValue)
-    if (tmp->isA(Type::Bool)) m_zeroExtend = true;
+    if (tmp->isA(TBool)) m_zeroExtend = true;
     return;
   }
   if (tmp->numWords() > 1) {
-    assert(loc.reg(1) != InvalidReg);
+    assertx(loc.reg(1) != InvalidReg);
     m_srcReg = loc.reg(1);
     // Since val is false then we're passing tmp's type. TypeReg lets
     // CodeGenerator know that the value might require some massaging
@@ -51,7 +64,8 @@ ArgDesc::ArgDesc(SSATmp* tmp, Vloc loc, bool val) {
     return;
   }
   // arg is the (constant) type of a known-typed value.
-  m_imm64 = toDataTypeForCall(tmp->type());
+  static_assert(offsetof(TypedValue, m_type) % 8 == 0, "");
+  m_imm64 = uint64_t(tmp->type().toDataType());
   m_kind = Kind::Imm;
 }
 

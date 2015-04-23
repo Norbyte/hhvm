@@ -13,15 +13,17 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #include "hphp/runtime/debugger/cmd/cmd_variable.h"
 
-#include "hphp/runtime/base/hphp-system.h"
-#include "hphp/runtime/vm/runtime.h"
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/debugger/cmd/cmd_where.h"
-#include "hphp/runtime/ext/ext_generator.h"
-#include "hphp/runtime/ext/asio/async_function_wait_handle.h"
+#include "hphp/runtime/debugger/debugger_client.h"
+#include "hphp/runtime/ext/asio/async-function-wait-handle.h"
 #include "hphp/runtime/ext/asio/ext_asio.h"
-#include "hphp/runtime/ext/asio/waitable_wait_handle.h"
+#include "hphp/runtime/ext/asio/waitable-wait-handle.h"
+#include "hphp/runtime/ext/ext_generator.h"
+#include "hphp/runtime/vm/runtime.h"
 
 namespace HPHP { namespace Eval {
 ///////////////////////////////////////////////////////////////////////////////
@@ -243,6 +245,7 @@ void CmdVariable::onClient(DebuggerClient &client) {
 }
 
 const StaticString s_GLOBALS("GLOBALS");
+const StaticString s_this("this");
 
 Array CmdVariable::GetGlobalVariables() {
   Array ret = g_context->m_globalVarEnv->getDefinedVariables();
@@ -317,6 +320,16 @@ bool CmdVariable::onServer(DebuggerProxy &proxy) {
   } else {
     m_variables = g_context->getLocalDefinedVariables(m_frame);
     m_global = g_context->getVarEnv(m_frame) == g_context->m_globalVarEnv;
+    auto oThis = g_context->getThis();
+    if (nullptr != oThis) {
+      TypedValue tvThis;
+
+      tvThis.m_type = KindOfObject;
+      tvThis.m_data.pobj = oThis;
+
+      Variant thisName(s_this);
+      m_variables.add(thisName, tvAsVariant(&tvThis));
+    }
   }
 
   if (m_global) {

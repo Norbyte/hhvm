@@ -22,11 +22,13 @@
 #include "hphp/util/alloc.h"
 #include "hphp/util/word-mem.h"
 
+#include "hphp/runtime/base/datatype.h"
 #include "hphp/runtime/base/types.h"
+#include "hphp/runtime/base/memory-manager.h"
 #include "hphp/runtime/base/countable.h"
-#include "hphp/runtime/base/macros.h"
 #include "hphp/runtime/base/bstring.h"
 #include "hphp/runtime/base/exceptions.h"
+#include "hphp/runtime/base/cap-code.h"
 
 namespace HPHP {
 
@@ -77,7 +79,6 @@ struct StringData {
    *   ... = size + 1; // oops, wraparound.
    */
   static constexpr uint32_t MaxSize = 0x7ffffffe; // 2^31-2
-  static constexpr uint32_t MaxCap = MaxSize + 1;
 
   /*
    * Creates an empty request-local string with an unspecified amount
@@ -143,9 +144,9 @@ struct StringData {
   static StringData* MakeStatic(StringSlice);
 
   /*
-   * Same as MakeStatic but the string alloated will *not* be in the static
-   * string table, will not be in low-memory, and will be deleted once the
-   * root goes out of scope. Currently only used by APC.
+   * Same as MakeStatic but the string allocated will *not* be in the static
+   * string table, will not be in low-memory, and should be deleted using
+   * destructUncounted once the root goes out of scope.
    */
   static StringData* MakeUncounted(StringSlice);
 
@@ -156,8 +157,9 @@ struct StringData {
   static StringData* MakeEmpty();
 
   /*
-   * Offset accessor for the JIT compiler.
+   * Offset accessors for the JIT compiler.
    */
+  static constexpr ptrdiff_t dataOff() { return offsetof(StringData, m_data); }
   static constexpr ptrdiff_t sizeOff() { return offsetof(StringData, m_len); }
 
   /*
@@ -165,14 +167,15 @@ struct StringData {
    * decrefing the APCString they are fronting.  This function
    * must be called at request cleanup time to handle this.
    */
-  static void sweepAll();
+  static unsigned sweepAll();
 
   /*
    * Called to return a StringData to the smart allocator.  This is
    * normally called when the reference count goes to zero (e.g. with
    * a helper like decRefStr).
    */
-  void release();
+  void release() noexcept;
+  size_t heapSize() const;
 
   /*
    * StringData objects allocated with MakeStatic should be freed
@@ -287,7 +290,7 @@ struct StringData {
    * Accessor for the length of a string.
    *
    * Note: size() returns a signed int for historical reasons.  It is
-   * guaranteed to be greater than zero and less than MaxSize.
+   * guaranteed to be in the range (0 <= size() <= MaxSize)
    */
   int size() const;
 
@@ -297,10 +300,8 @@ struct StringData {
   bool empty() const;
 
   /*
-   * Return the capacity of this string's buffer, including the space
+   * Return the capacity of this string's buffer, not including the space
    * for the null terminator.
-   *
-   * For shared strings, returns zero.
    */
   uint32_t capacity() const;
 
@@ -311,12 +312,17 @@ struct StringData {
    * The allow_errors flag is a boolean that does something currently
    * undocumented.
    *
+   * If overflow is set its value is initialized to either zero to
+   * indicate that no overflow occurred or 1/-1 to inidicate the direction
+   * of overflow.
+   *
    * Returns: KindOfNull, KindOfInt64 or KindOfDouble.  The int64_t or
    * double out reference params are populated in the latter two cases
    * with the numeric value of the string.  The KindOfNull case
    * indicates the string is not numeric.
    */
-  DataType isNumericWithVal(int64_t&, double&, int allowErrors) const;
+  DataType isNumericWithVal(int64_t&, double&, int allowErrors,
+                            int* overflow = nullptr) const;
 
   /*
    * Returns true if this string is numeric.
@@ -389,6 +395,7 @@ struct StringData {
    * Returns: case insensitive hash value for this string.
    */
   strhash_t hash() const;
+  NEVER_INLINE strhash_t hashHelper() const;
 
   /*
    * Equality comparison, in the sense of php's string == operator.
@@ -424,15 +431,23 @@ struct StringData {
    */
   void dump() const;
 
+  static StringData* node2str(StringDataNode* node) {
+    return reinterpret_cast<StringData*>(
+      uintptr_t(node) - offsetof(SharedPayload, node)
+                   - sizeof(StringData)
+    );
+  }
+  bool isShared() const;
+
 private:
   struct SharedPayload {
-    SweepNode node;
+    StringDataNode node;
     const APCString* shared;
   };
 
 private:
   static StringData* MakeShared(StringSlice sl, bool trueStatic);
-  static StringData* MakeSharedSlowPath(const APCString*, uint32_t len);
+  static StringData* MakeAPCSlowPath(const APCString*);
 
   StringData(const StringData&) = delete;
   StringData& operator=(const StringData&) = delete;
@@ -444,7 +459,6 @@ private:
   const SharedPayload* sharedPayload() const;
   SharedPayload* sharedPayload();
 
-  bool isShared() const;
   bool isFlat() const;
   bool isImmutable() const;
 
@@ -454,11 +468,10 @@ private:
   void enlist();
   void delist();
   void incrementHelper();
-  strhash_t hashHelper() const NEVER_INLINE;
   bool checkSane() const;
-  void preCompute() const;
-  void setStatic() const;
-  void setUncounted() const;
+  void preCompute();
+  void setStatic();
+  void setUncounted();
 
 private:
   char* m_data;
@@ -468,17 +481,24 @@ private:
   // fields.  (gcc does not combine the stores itself.)
   union {
     struct {
-      uint32_t m_len;
+      union {
+        struct {
+          CapCode m_cap;
+          char m_pad;
+          HeaderKind m_kind;
+        };
+        uint32_t m_cap_kind;
+      };
       mutable RefCount m_count;
     };
-    uint64_t m_lenAndCount;
+    uint64_t m_capAndCount;
   };
   union {
     struct {
-      int32_t m_cap;
+      uint32_t m_len;
       mutable strhash_t m_hash;   // precompute hash codes for static strings
     };
-    uint64_t m_capAndHash;
+    uint64_t m_lenAndHash;
   };
 
   friend class APCString;

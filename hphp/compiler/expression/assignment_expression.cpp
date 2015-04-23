@@ -33,8 +33,8 @@
 #include "hphp/compiler/expression/scalar_expression.h"
 #include "hphp/compiler/expression/expression_list.h"
 #include "hphp/compiler/expression/simple_function_call.h"
-#include "hphp/runtime/base/complex-types.h"
-#include "hphp/runtime/base/builtin-functions.h"
+
+#include "hphp/runtime/base/execution-context.h"
 
 using namespace HPHP;
 
@@ -56,9 +56,6 @@ AssignmentExpression::AssignmentExpression
   if (ref) {
     m_variable->setContext(Expression::RefAssignmentLHS);
     m_value->setContext(Expression::RefValue);
-
-    // we have &new special case that's handled in this class
-    m_value->setContext(Expression::NoRefWrapper);
   }
 }
 

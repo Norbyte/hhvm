@@ -16,7 +16,7 @@
 
 #include "hphp/compiler/analysis/analysis_result.h"
 
-#include "folly/Conv.h"
+#include <folly/Conv.h>
 
 #include <iomanip>
 #include <algorithm>
@@ -137,9 +137,6 @@ void AnalysisResult::addFileScope(FileScopePtr fileScope) {
   FileScopePtr &res = m_files[fileScope->getName()];
   assert(!res);
   res = fileScope;
-  vertex_descriptor vertex = add_vertex(m_depGraph);
-  fileScope->setVertex(vertex);
-  m_fileVertMap[vertex] = fileScope;
   m_fileScopes.push_back(fileScope);
 }
 
@@ -300,41 +297,7 @@ ClassScopePtr AnalysisResult::findExactClass(ConstructPtr cs,
       return currentCls;
     }
   }
-  if (FileScopePtr currentFile = cs->getFileScope()) {
-    return currentFile->resolveClass(cls);
-  }
   return ClassScopePtr();
-}
-
-bool AnalysisResult::checkClassPresent(ConstructPtr cs,
-                                       const std::string &name) const {
-  if (name == "self" || name == "parent") return true;
-  std::string lowerName = toLower(name);
-  if (ClassScopePtr currentCls = cs->getClassScope()) {
-    if (lowerName == currentCls->getName() ||
-        currentCls->derivesFrom(shared_from_this(), lowerName,
-                                true, false)) {
-      return true;
-    }
-  }
-  if (FileScopePtr currentFile = cs->getFileScope()) {
-    StatementList &stmts = *currentFile->getStmt();
-    for (int i = stmts.getCount(); i--; ) {
-      StatementPtr s = stmts[i];
-      if (s && s->is(Statement::KindOfClassStatement)) {
-        ClassScopePtr scope =
-          static_pointer_cast<ClassStatement>(s)->getClassScope();
-        if (lowerName == scope->getName()) {
-          return true;
-        }
-        if (scope->derivesFrom(shared_from_this(), lowerName,
-                               true, false)) {
-          return true;
-        }
-      }
-    }
-  }
-  return false;
 }
 
 int AnalysisResult::getFunctionCount() const {
@@ -498,75 +461,6 @@ void AnalysisResult::markRedeclaringClasses() {
 ///////////////////////////////////////////////////////////////////////////////
 // Dependencies
 
-void AnalysisResult::link(FileScopePtr user, FileScopePtr provider) {
-  if (user != provider) {
-    bool needsLock = getPhase() != AnalyzeAll &&
-                     getPhase() != AnalyzeFinal;
-    ConditionalLock lock(m_depGraphMutex, needsLock);
-    add_edge(user->vertex(), provider->vertex(), m_depGraph);
-  }
-}
-
-bool AnalysisResult::addClassDependency(FileScopePtr usingFile,
-                                        const std::string &className) {
-  if (m_systemClasses.find(className) != m_systemClasses.end())
-    return true;
-
-  StringToClassScopePtrVecMap::const_iterator iter =
-    m_classDecs.find(className);
-  if (iter == m_classDecs.end() || !iter->second.size()) return false;
-  ClassScopePtr classScope = iter->second[0];
-  if (iter->second.size() != 1) {
-    classScope = usingFile->resolveClass(classScope);
-    if (!classScope) return false;
-  }
-  FileScopePtr fileScope = classScope->getContainingFile();
-  link(usingFile, fileScope);
-  return true;
-}
-
-bool AnalysisResult::addFunctionDependency(FileScopePtr usingFile,
-                                           const std::string &functionName) {
-  if (m_functions.find(functionName) != m_functions.end())
-    return true;
-  StringToFunctionScopePtrMap::const_iterator iter =
-    m_functionDecs.find(functionName);
-  if (iter == m_functionDecs.end()) return false;
-  FunctionScopePtr functionScope = iter->second;
-  if (functionScope->isRedeclaring()) {
-    functionScope = usingFile->resolveFunction(functionScope);
-    if (!functionScope) return false;
-  }
-  FileScopePtr fileScope = functionScope->getContainingFile();
-  link(usingFile, fileScope);
-  return true;
-}
-
-bool AnalysisResult::addIncludeDependency(FileScopePtr usingFile,
-                                          const std::string &includeFilename) {
-  assert(!includeFilename.empty());
-  FileScopePtr fileScope = findFileScope(includeFilename);
-  if (fileScope) {
-    link(usingFile, fileScope);
-    return true;
-  } else {
-    return false;
-  }
-}
-
-bool AnalysisResult::addConstantDependency(FileScopePtr usingFile,
-                                           const std::string &constantName) {
-  if (m_constants->isPresent(constantName))
-    return true;
-
-  StringToFileScopePtrMap::const_iterator iter =
-    m_constDecs.find(constantName);
-  if (iter == m_constDecs.end()) return false;
-  FileScopePtr fileScope = iter->second;
-  link(usingFile, fileScope);
-  return true;
-}
-
 bool AnalysisResult::isConstantDeclared(const std::string &constName) const {
   if (m_constants->isPresent(constName)) return true;
   StringToFileScopePtrMap::const_iterator iter = m_constDecs.find(constName);
@@ -605,7 +499,7 @@ void AnalysisResult::checkClassDerivations() {
   AnalysisResultPtr ar = shared_from_this();
   for (StringToClassScopePtrVecMap::const_iterator iter = m_classDecs.begin();
        iter != m_classDecs.end(); ++iter) {
-    for (ClassScopePtr cls: iter->second) {
+    for (ClassScopePtr cls : iter->second) {
       if (Option::WholeProgram) {
         try {
           cls->importUsedTraits(ar);
@@ -781,97 +675,6 @@ void AnalysisResult::analyzeProgram(bool system /* = false */) {
     for (StringToFunctionScopePtrMap::const_iterator iterMethod =
            methods.begin(); iterMethod != methods.end(); ++iterMethod) {
       m_methodToClassDecs[iterMethod->first].push_back(cls);
-    }
-  }
-
-  // Analyze perfect virtuals
-  if (Option::AnalyzePerfectVirtuals && !system) {
-    analyzePerfectVirtuals();
-  }
-}
-
-void AnalysisResult::analyzeIncludes() {
-  AnalysisResultPtr ar = shared_from_this();
-  for (unsigned i = 0; i < m_fileScopes.size(); i++) {
-    m_fileScopes[i]->analyzeIncludes(ar);
-  }
-}
-
-static void addClassRootMethods(AnalysisResultPtr ar, ClassScopePtr cls,
-                                hphp_string_set &methods) {
-  const StringToFunctionScopePtrMap &funcs = cls->getFunctions();
-  for (StringToFunctionScopePtrMap::const_iterator iter =
-         funcs.begin(); iter != funcs.end(); ++iter) {
-    ClassScopePtrVec roots;
-    cls->getRootParents(ar, iter->first, roots, cls);
-    for (unsigned int i = 0; i < roots.size(); i++) {
-      methods.insert(roots[i]->getName() + "::" + iter->first);
-    }
-  }
-}
-
-static void addClassRootMethods(AnalysisResultPtr ar, ClassScopePtr cls,
-                                StringToFunctionScopePtrVecMap &methods) {
-  const StringToFunctionScopePtrMap &funcs = cls->getFunctions();
-  for (StringToFunctionScopePtrMap::const_iterator iter =
-         funcs.begin(); iter != funcs.end(); ++iter) {
-    ClassScopePtr root = cls->getRootParent(ar, iter->first);
-    string cluster = root->getName() + "::" + iter->first;
-    FunctionScopePtrVec &fs = methods[cluster];
-    fs.push_back(iter->second);
-  }
-}
-
-void AnalysisResult::analyzePerfectVirtuals() {
-  AnalysisResultPtr ar = shared_from_this();
-
-  StringToFunctionScopePtrVecMap methods;
-  hphp_string_set redeclaringMethods;
-  for (StringToClassScopePtrVecMap::const_iterator iter = m_classDecs.begin();
-       iter != m_classDecs.end(); ++iter) {
-    for (unsigned int i = 0; i < iter->second.size(); i++) {
-      ClassScopePtr cls = iter->second[i];
-
-      // being conservative, not to do redeclaring classes at all
-      if (cls->derivesFromRedeclaring() == Derivation::Redeclaring) {
-        addClassRootMethods(ar, cls, redeclaringMethods);
-        continue;
-      }
-
-      // classes derived from system or extension classes can be complicated
-      ClassScopePtr root = cls->getRootParent(ar);
-      if (!root->isUserClass() || root->isExtensionClass()) continue;
-
-      // cluster virtual methods by a root parent that also defined the method
-      addClassRootMethods(ar, cls, methods);
-    }
-  }
-    // if ANY class in the hierarchy is a reclaring one, ignore
-  for (hphp_string_set::const_iterator iter = redeclaringMethods.begin();
-       iter != redeclaringMethods.end(); ++iter) {
-    methods.erase(*iter);
-  }
-  for (StringToFunctionScopePtrVecMap::const_iterator iter = methods.begin();
-       iter != methods.end(); ++iter) {
-    // if it's unique, ignore
-    const FunctionScopePtrVec &funcs = iter->second;
-    if (funcs.size() < 2) {
-      continue;
-    }
-
-    if (!funcs[0]->isPrivate()) {
-      bool perfect = true;
-      for (unsigned int i = 1; i < funcs.size(); i++) {
-        if (funcs[i]->isPrivate() || !funcs[0]->matchParams(funcs[i])) {
-          perfect = false;
-          break;
-        }
-      }
-      if (perfect) {
-        for (unsigned int i = 0; i < funcs.size(); i++) {
-          funcs[i]->setPerfectVirtual();
-        }
-      }
     }
   }
 }
@@ -1182,10 +985,12 @@ typedef   OptWorker<Pre>           PreOptWorker;
 template<>
 void OptWorker<Pre>::onThreadEnter() {
   hphp_session_init();
+  hphp_context_init();
 }
 
 template<>
 void OptWorker<Pre>::onThreadExit() {
+  hphp_context_exit();
   hphp_session_exit();
 }
 
@@ -1419,7 +1224,7 @@ int DepthFirstVisitor<Pre, OptVisitor>::visitScope(BlockScopeRawPtr scope) {
     do {
       scope->clearUpdated();
       if (Option::LocalCopyProp || Option::EliminateDeadCode) {
-        AliasManager am(-1);
+        AliasManager am;
         if (am.optimize(this->m_data.m_ar, m)) {
           scope->addUpdates(BlockScope::UseKindCaller);
         }
@@ -1430,8 +1235,7 @@ int DepthFirstVisitor<Pre, OptVisitor>::visitScope(BlockScopeRawPtr scope) {
       updates = scope->getUpdated();
       all_updates |= updates;
     } while (updates);
-    if (all_updates & BlockScope::UseKindCaller &&
-        !m->getFunctionScope()->getInlineAsExpr()) {
+    if (all_updates & BlockScope::UseKindCaller) {
       all_updates &= ~BlockScope::UseKindCaller;
     }
     return all_updates;

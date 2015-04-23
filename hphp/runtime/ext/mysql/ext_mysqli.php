@@ -13,68 +13,6 @@ class mysqli {
   <<__Native>>
   private function hh_get_connection(int $state = 0): ?resource;
 
-  public function __get(string $name): mixed {
-    switch ($name) {
-      case 'client_info':
-        return mysqli_get_client_info();
-      case 'client_version':
-        return mysqli_get_client_version();
-      case 'connect_errno':
-        return self::$__connection_errno;
-      case 'connect_error':
-        return self::$__connection_error;
-    }
-
-    // The following properties only work if we are connected
-    $conn = $this->hh_get_connection(1);
-    if (!$conn) {
-      return null;
-    }
-
-    switch ($name) {
-      case 'affected_rows':
-        return mysql_affected_rows($conn);
-      case 'error':
-        return mysql_error($conn);
-      case 'errno':
-        return mysql_errno($conn);
-      case 'field_count':
-        return $this->hh_field_count();
-      case 'host_info':
-        return mysql_get_host_info($conn);
-      case 'info':
-        return mysql_info($conn);
-      case 'insert_id':
-        return mysql_insert_id($conn);
-      case 'protocol_version':
-        return mysql_get_proto_info($conn);
-      case 'server_info':
-        return mysql_get_server_info($conn);
-      case 'server_version':
-        return $this->hh_server_version();
-      case 'sqlstate':
-        return $this->hh_sqlstate();
-      case 'thread_id':
-        return mysql_thread_id($conn);
-      case 'warning_count':
-        return mysql_warning_count($conn);
-      case 'error_list':
-        return $this->__get_error_list();
-    }
-
-    trigger_error('Undefined property: mysqli::$'. $name, E_NOTICE);
-    return null;
-  }
-
-  <<__Native>>
-  private function hh_field_count(): mixed;
-
-  <<__Native>>
-  private function hh_server_version(): mixed;
-
-  <<__Native>>
-  private function hh_sqlstate(): mixed;
-
   /**
    * Open a new connection to the MySQL server
    *
@@ -111,8 +49,24 @@ class mysqli {
       return;
     }
 
+    // If any of the necessary mysqli properties come in as null, then we can
+    // use our default ini options.
+    $host = $this->get_ini_default_if_null($host, "host");
+    $username = $this->get_ini_default_if_null($username, "user");
+    $passwd = $this->get_ini_default_if_null($passwd, "pw");
+    $port = $this->get_ini_default_if_null($port, "port");
+    $socket = $this->get_ini_default_if_null($socket, "socket");
+
     // Connect
     $this->real_connect($host, $username, $passwd, $dbname, $port, $socket);
+  }
+
+  private function get_ini_default_if_null(mixed $connect_option,
+                                           string $name) {
+    if ($connect_option === null) {
+      $connect_option = ini_get("mysqli.default_" . $name);
+    }
+    return $connect_option;
   }
 
   public function __clone(): void {
@@ -326,19 +280,6 @@ class mysqli {
     return mysqli_get_client_info();
   }
 
-  // The implementation of the getter for $error_list
-  private function __get_error_list(): array {
-    $result = array();
-    if ($this->errno) {
-      $result[] = array(
-        'errno' => $this->errno,
-        'sqlstate' => $this->sqlstate,
-        'error' => $this->error,
-      );
-    }
-    return $result;
-  }
-
   /**
    * Returns statistics about the client connection
    *
@@ -477,7 +418,7 @@ class mysqli {
    *
    * @param array $read - List of connections to check for outstanding
    *   results that can be read.
-   * @param array $error - List of connections on which an error occured,
+   * @param array $error - List of connections on which an error occurred,
    *   for example, query failure or lost connection.
    * @param array $reject - List of connections rejected because no
    *   asynchronous query has been run on for which the function could poll
@@ -922,42 +863,8 @@ class mysqli_driver {
   private bool $__reconnect = false;
   private int $__report_mode = 0;
 
-  public function __get(string $name): mixed {
-    switch ($name) {
-      case 'client_info':
-        return mysqli_get_client_info();
-      case 'client_version':
-        return mysqli_get_client_version();
-      case 'driver_version':
-        // Lets pretend we are the same version as PHP. Taken from here
-        // http://git.io/wY2WPw
-        return 101009;
-      case 'embedded':
-        return false;
-      case 'reconnect':
-        return $this->__reconnect;
-      case 'report_mode':
-        return $this->__report_mode;
-    }
-
-    trigger_error('Undefined property: mysqli_driver::$'. $name, E_NOTICE);
-    return null;
-  }
-
-  public function __set(string $name, mixed $value): void {
-    switch ($name) {
-      case 'reconnect':
-        $this->__reconnect = (bool)$value;
-        break;
-      case 'report_mode':
-        $this->__report_mode = (int)$value;
-        break;
-      default:
-        trigger_error(
-          'Undefined property: mysqli_driver::$'. $name,
-          E_NOTICE
-        );
-    }
+  public function __construct() {
+    $this->__reconnect = ini_get("mysqli.reconnect") === "1" ? true : false;
   }
 
   public function __clone(): void {
@@ -974,43 +881,30 @@ class mysqli_driver {
  */
 class mysqli_result {
 
-  private ?resource $__result = null;
+  // Not typing this since we are setting it as a mixed to comply with
+  // GitHub issue 2082. As it is, even with invariants and various ifs
+  // to guarantee the type, HHHBC is not able to infer the property type.
+  // Anyway, the typehint is currently only for optimization purposes at this
+  // point in time. See D1663326
+  private $__result = null;
   private ?int $__resulttype = null;
   private bool $__done = false;
 
-  public function __get(string $name): mixed {
-    if ($this->__result === null) {
-      trigger_error("supplied argument is not a valid MySQL result resource",
-                    E_WARNING);
-      return null;
-    }
-
-    switch ($name) {
-      case 'current_field':
-        return $this->hh_field_tell();
-      case 'field_count':
-        return mysql_num_fields($this->__result);
-      case 'lengths':
-        return mysql_fetch_lengths($this->__result);
-      case 'num_rows':
-        if ($this->__resulttype == MYSQLI_USE_RESULT && !$this->__done) {
-          trigger_error("Function can not be used with MYSQL_USE_RESULT",
-                        E_WARNING);
-          return 0;
-        }
-        return mysql_num_rows($this->__result);
-    }
-
-    trigger_error('Undefined property: mysqli_result::$'. $name, E_NOTICE);
-    return null;
-  }
-
   <<__Native>>
-  private function hh_field_tell(): mixed;
+  private function get_mysqli_conn_resource(mysqli $connection): ?resource;
 
-  public function __construct(resource $result,
+  public function __construct(mixed $result,
                               int $resulttype = MYSQLI_STORE_RESULT) {
-    $this->__result = $result;
+    if (!is_resource($result) && !($result instanceof mysqli)) {
+      $msg = "Argument to mysqli_result::__construct must be of type "
+           . "resource or mysqli";
+      throw new Exception($msg);
+    }
+   if ($result instanceof mysqli) {
+      $this->__result = $this->get_mysqli_conn_resource($result);
+    } else {
+      $this->__result = is_resource($result) ? $result : null;
+    }
     $this->__resulttype = $resulttype;
   }
 
@@ -1283,32 +1177,6 @@ class mysqli_stmt {
   private ?resource $__stmt = null;
   private ?mysqli $__link = null;
 
-  public function __get(string $name): mixed {
-    switch ($name) {
-      case 'affected_rows':
-        return $this->hh_affected_rows();
-      case 'errno':
-        return $this->hh_errno();
-      case 'error_list':
-        return $this->__get_error_list();
-      case 'error':
-        return $this->hh_error();
-      case 'field_count':
-        return $this->hh_field_count();
-      case 'insert_id':
-        return $this->hh_insert_id();
-      case 'num_rows':
-        return $this->hh_num_rows();
-      case 'param_count':
-        return $this->hh_param_count();
-      case 'sqlstate':
-        return $this->hh_sqlstate();
-    }
-
-    trigger_error('Undefined property: mysqli_stmt::$'. $name, E_NOTICE);
-    return null;
-  }
-
   public function __construct(mysqli $link, string $query = null) {
     $this->__link = $link;
     $this->hh_init($link);
@@ -1323,46 +1191,8 @@ class mysqli_stmt {
     );
   }
 
-  // The implementation of the getter for $error_list
-  private function __get_error_list(): array {
-    $result = array();
-    if ($this->errno) {
-      $result[] = array(
-        'errno' => $this->errno,
-        'sqlstate' => $this->sqlstate,
-        'error' => $this->error,
-      );
-    }
-    return $result;
-  }
-
-
-  <<__Native>>
-  private function hh_affected_rows(): mixed;
-
-  <<__Native>>
-  private function hh_errno(): mixed;
-
-  <<__Native>>
-  private function hh_error(): mixed;
-
-  <<__Native>>
-  private function hh_field_count(): mixed;
-
-  <<__Native>>
-  private function hh_insert_id(): mixed;
-
   <<__Native>>
   private function hh_init(mysqli $connection): void;
-
-  <<__Native>>
-  private function hh_num_rows(): mixed;
-
-  <<__Native>>
-  private function hh_param_count(): mixed;
-
-  <<__Native>>
-  private function hh_sqlstate(): mixed;
 
   /**
    * Used to get the current value of a statement attribute
@@ -1687,8 +1517,8 @@ function mysqli_autocommit(mysqli $link, bool $mode): bool {
  * @return bool -
  */
 function mysqli_begin_transaction(mysqli $link,
-                                  int $flags,
-                                  string $name): bool {
+                                  int $flags = 0,
+                                  ?string $name = null): bool {
   return $link->begin_transaction($flags, $name);
 }
 
@@ -1745,9 +1575,8 @@ function mysqli_character_set_name(mysqli $link): string {
  * @return string - A string that represents the MySQL client library
  *   version
  */
-function mysqli_get_client_info(): string {
-  return mysql_get_client_info();
-}
+<<__Native>>
+function mysqli_get_client_info(): string;
 
 /**
  * Returns the MySQL client version as an integer
@@ -2102,7 +1931,7 @@ function mysqli_ping(mysqli $link): ?bool {
  *
  * @param array $read - List of connections to check for outstanding
  *   results that can be read.
- * @param array $error - List of connections on which an error occured,
+ * @param array $error - List of connections on which an error occurred,
  *   for example, query failure or lost connection.
  * @param array $reject - List of connections rejected because no
  *   asynchronous query has been run on for which the function could poll

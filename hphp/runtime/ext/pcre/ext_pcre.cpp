@@ -21,8 +21,8 @@
 #include <pcre.h>
 
 #include "hphp/runtime/ext/mbstring/ext_mbstring.h"
-#include "hphp/runtime/ext/ext_string.h"
-#include "hphp/runtime/ext/ext_function.h"
+#include "hphp/runtime/ext/std/ext_std_function.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/runtime/base/ini-setting.h"
 #include "hphp/runtime/base/request-local.h"
 
@@ -75,7 +75,7 @@ Variant HHVM_FUNCTION(preg_replace_callback, const Variant& pattern, const Varia
                                              const Variant& subject,
                                              int limit /* = -1 */,
                                              VRefParam count /* = null */) {
-  if (!f_is_callable(callback)) {
+  if (!HHVM_FN(is_callable)(callback)) {
     raise_warning("Not a valid callback function %s",
         callback.toString().data());
     return empty_string_variant();
@@ -172,13 +172,13 @@ String HHVM_FUNCTION(sql_regcase, const String& str) {
 
 const StaticString s_PCRE_VERSION("PCRE_VERSION");
 
-extern IMPLEMENT_THREAD_LOCAL(PCREglobals, s_pcre_globals);
+extern IMPLEMENT_THREAD_LOCAL(PCREglobals, tl_pcre_globals);
 
-class PcreExtension : public Extension {
+class PcreExtension final : public Extension {
 public:
   PcreExtension() : Extension("pcre", NO_EXTENSION_VERSION_YET) {}
 
-  virtual void moduleInit() {
+  void moduleInit() override {
     Native::registerConstant<KindOfString>(
       s_PCRE_VERSION.get(), makeStaticString(pcre_version())
     );
@@ -230,15 +230,15 @@ public:
                      &s_pcre_has_jit);
   }
 
-  virtual void threadInit() {
+  void threadInit() override {
     IniSetting::Bind(this, IniSetting::PHP_INI_ALL,
                      "pcre.backtrack_limit",
                      std::to_string(RuntimeOption::PregBacktraceLimit).c_str(),
-                     &s_pcre_globals->m_preg_backtrace_limit);
+                     &tl_pcre_globals->preg_backtrace_limit);
     IniSetting::Bind(this, IniSetting::PHP_INI_ALL,
                      "pcre.recursion_limit",
                      std::to_string(RuntimeOption::PregRecursionLimit).c_str(),
-                     &s_pcre_globals->m_preg_recursion_limit);
+                     &tl_pcre_globals->preg_recursion_limit);
   }
 
 } s_pcre_extension;

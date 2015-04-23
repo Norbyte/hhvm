@@ -34,13 +34,12 @@
 #include "hphp/runtime/server/warmup-request-handler.h"
 #include "hphp/runtime/server/xbox-server.h"
 
-#include "hphp/util/db-conn.h"
 #include "hphp/util/logger.h"
 #include "hphp/util/process.h"
 #include "hphp/util/ssl-init.h"
 
-#include "folly/Conv.h"
-#include "folly/Format.h"
+#include <folly/Conv.h>
+#include <folly/Format.h>
 
 #include <sys/types.h>
 #include <signal.h>
@@ -141,7 +140,7 @@ HttpServer::HttpServer()
   }
 
   if (RuntimeOption::XboxServerPort != 0) {
-    std::shared_ptr<SatelliteServerInfo> xboxInfo(new XboxServerInfo());
+    auto xboxInfo = std::make_shared<XboxServerInfo>();
     auto satellite = SatelliteServer::Create(xboxInfo);
     if (satellite) {
       m_satellites.push_back(std::move(satellite));
@@ -230,6 +229,11 @@ void HttpServer::serverStopped(HPHP::Server* server) {
   Logger::Info("Page server stopped");
   assert(server == m_pageServer.get());
   removePid();
+
+  auto sockFile = RuntimeOption::ServerFileSocket;
+  if (!sockFile.empty()) {
+    unlink(sockFile.c_str());
+  }
 }
 
 HttpServer::~HttpServer() {
@@ -380,18 +384,6 @@ void HttpServer::stop(const char* stopReason) {
   notify();
 }
 
-void HttpServer::abortServers() {
-  for (unsigned int i = 0; i < m_satellites.size(); i++) {
-    m_satellites[i]->stop();
-  }
-  if (RuntimeOption::AdminServerPort) {
-    m_adminServer->stop();
-  }
-  if (RuntimeOption::ServerPort) {
-    m_pageServer->stop();
-  }
-}
-
 void HttpServer::stopOnSignal(int sig) {
   // Signal to the main server thread to exit immediately if
   // we want to die on SIGTERM
@@ -416,6 +408,8 @@ void HttpServer::stopOnSignal(int sig) {
   if (m_adminServer) {
     m_adminServer->stop();
   }
+
+  waitForServers();
 }
 
 void HttpServer::createPid() {

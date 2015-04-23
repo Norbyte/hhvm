@@ -21,14 +21,17 @@
 #include "hphp/util/ringbuffer.h"
 
 #include "hphp/runtime/base/types.h"
-#include "hphp/runtime/vm/jit/phys-reg.h"
-#include "hphp/runtime/vm/jit/translator.h"
-#include "hphp/runtime/vm/jit/code-gen-helpers.h"
-#include "hphp/runtime/vm/jit/service-requests.h"
-#include "hphp/runtime/vm/jit/service-requests-x64.h"
 #include "hphp/runtime/vm/jit/abi-x64.h"
+#include "hphp/runtime/vm/jit/code-gen-helpers.h"
+#include "hphp/runtime/vm/jit/cpp-call.h"
 #include "hphp/runtime/vm/jit/ir-opcode.h"
-#include "hphp/runtime/vm/jit/vasm-x64.h"
+#include "hphp/runtime/vm/jit/phys-reg.h"
+#include "hphp/runtime/vm/jit/service-requests-x64.h"
+#include "hphp/runtime/vm/jit/service-requests.h"
+#include "hphp/runtime/vm/jit/translator.h"
+#include "hphp/runtime/vm/jit/vasm-emit.h"
+#include "hphp/runtime/vm/jit/vasm-instr.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 
 namespace HPHP {
 //////////////////////////////////////////////////////////////////////
@@ -50,54 +53,58 @@ constexpr size_t kJmpTargetAlign = 16;
 
 void moveToAlign(CodeBlock& cb, size_t alignment = kJmpTargetAlign);
 
-void emitEagerSyncPoint(Asm& as, const Op* pc);
-void emitEagerSyncPoint(Vout&, const Op* pc);
-void emitEagerVMRegSave(Asm& as, RegSaveFlags flags);
+void emitEagerSyncPoint(Vout& v, const Op* pc, Vreg rds, Vreg vmfp, Vreg vmsp);
 void emitGetGContext(Asm& as, PhysReg dest);
 void emitGetGContext(Vout& as, Vreg dest);
 
 void emitTransCounterInc(Asm& a);
 void emitTransCounterInc(Vout&);
 
+/*
+ * Emit a decrement on the m_count field of `base', which must contain a
+ * reference counted heap object.  This helper also conditionally makes some
+ * sanity checks on the reference count of the object.
+ *
+ * Returns: the status flags register for the decrement instruction.
+ */
+Vreg emitDecRef(Vout& v, Vreg base);
+
 void emitIncRef(Asm& as, PhysReg base);
-void emitIncRef(Vout&, Vreg base);
+void emitIncRef(Vout& v, Vreg base);
 void emitIncRefCheckNonStatic(Asm& as, PhysReg base, DataType dtype);
 void emitIncRefGenericRegSafe(Asm& as, PhysReg base, int disp, PhysReg tmpReg);
 
-void emitAssertFlagsNonNegative(Vout&);
-void emitAssertRefCount(Vout&, Vreg base);
+void emitAssertFlagsNonNegative(Vout& v, Vreg sf);
+void emitAssertRefCount(Vout& v, Vreg base);
 
 void emitMovRegReg(Asm& as, PhysReg srcReg, PhysReg dstReg);
 void emitLea(Asm& as, MemoryRef mr, PhysReg dst);
 
-Vreg emitLdObjClass(Vout&, Vreg objReg, Vreg dstReg);
-Vreg emitLdClsCctx(Vout&, Vreg srcReg, Vreg dstReg);
+Vreg emitLdObjClass(Vout& v, Vreg objReg, Vreg dstReg);
+Vreg emitLdClsCctx(Vout& v, Vreg srcReg, Vreg dstReg);
 
 void emitCall(Asm& as, TCA dest, RegSet args);
 void emitCall(Asm& as, CppCall call, RegSet args);
-void emitCall(Vout&, CppCall call, RegSet args);
+void emitCall(Vout& v, CppCall call, RegSet args);
 
 // store imm to the 8-byte memory location at ref. Warning: don't use this
 // if you wanted an atomic store; large imms cause two stores.
 void emitImmStoreq(Vout& v, Immed64 imm, Vptr ref);
 void emitImmStoreq(Asm& as, Immed64 imm, MemoryRef ref);
 
-void emitJmpOrJcc(Asm& as, ConditionCode cc, TCA dest);
-
-void emitRB(Asm& a, Trace::RingBufferType t, const char* msgm);
-
-void emitTraceCall(CodeBlock& cb, Offset pcOff);
+void emitRB(Vout& v, Trace::RingBufferType t, const char* msg);
 
 /*
  * Tests the surprise flags for the current thread. Should be used
  * before a jnz to surprise handling code.
  */
-void emitTestSurpriseFlags(Asm& as);
-void emitTestSurpriseFlags(Vout&);
+void emitTestSurpriseFlags(Asm& as, PhysReg rds);
+Vreg emitTestSurpriseFlags(Vout& v, Vreg rds);
 
-void emitCheckSurpriseFlagsEnter(Vout& main, Vout& cold, Fixup fixup);
+void emitCheckSurpriseFlagsEnter(Vout& main, Vout& cold, Vreg rds,
+                                 Fixup fixup, Vlabel catchBlock);
 void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& coldCode,
-                                 Fixup fixup);
+                                 PhysReg rds, Fixup fixup);
 
 #ifdef USE_GCC_FAST_TLS
 
@@ -121,11 +128,15 @@ void emitCheckSurpriseFlagsEnter(CodeBlock& mainCode, CodeBlock& coldCode,
  * address where TLS starts.
  */
 template<typename T>
+inline Vptr getTLSPtr(const T& data) {
+  uintptr_t virtualAddress = uintptr_t(&data) - tlsBase();
+  return Vptr{baseless(virtualAddress), Vptr::FS};
+}
+
+template<typename T>
 inline void
 emitTLSLoad(Vout& v, const ThreadLocalNoCheck<T>& datum, Vreg reg) {
-  uintptr_t virtualAddress = uintptr_t(&datum.m_node.m_p) - tlsBase();
-  Vptr addr{baseless(virtualAddress), Vptr::FS};
-  v << load{addr, reg};
+  v << load{getTLSPtr(datum.m_node.m_p), reg};
 }
 
 template<typename T>
@@ -141,16 +152,16 @@ template<typename T>
 inline void
 emitTLSLoad(Vout& v, const ThreadLocalNoCheck<T>& datum, Vreg dest) {
   PhysRegSaver(v, kGPCallerSaved); // we don't know for sure what's alive
-  v << ldimm{datum.m_key, argNumToRegName[0]};
+  v << ldimmq{datum.m_key, argNumToRegName[0]};
   const CodeAddress addr = (CodeAddress)pthread_getspecific;
   if (deltaFits((uintptr_t)addr, sz::dword)) {
     v << call{addr, argSet(1)};
   } else {
-    v << ldimm{addr, reg::rax};
+    v << ldimmq{addr, reg::rax};
     v << callr{reg::rax, argSet(1)};
   }
   if (dest != Vreg(reg::rax)) {
-    v << movq{reg::rax, dest};
+    v << copy{reg::rax, dest};
   }
 }
 
@@ -174,18 +185,16 @@ emitTLSLoad(X64Assembler& a, const ThreadLocalNoCheck<T>& datum, Reg64 dest) {
 #endif // USE_GCC_FAST_TLS
 
 // Emit a load of a low pointer.
-void emitLdLowPtr(Vout&, Vptr mem, Vreg reg, size_t size);
+void emitLdLowPtr(Vout& v, Vptr mem, Vreg reg, size_t size);
 
-void emitCmpClass(Vout&, const Class* c, Vptr mem);
-void emitCmpClass(Vout&, Vreg reg, Vptr mem);
-void emitCmpClass(Vout&, Vreg reg1, Vreg reg2);
+void emitCmpClass(Vout& v, Vreg sf, const Class* c, Vptr mem);
+void emitCmpClass(Vout& v, Vreg sf, Vreg reg, Vptr mem);
+void emitCmpClass(Vout& v, Vreg sf, Vreg reg1, Vreg reg2);
 
-void copyTV(Vout&, Vloc src, Vloc dst);
-void pack2(Vout&, Vreg s0, Vreg s1, Vreg d0);
+void copyTV(Vout& v, Vloc src, Vloc dst, Type destType);
+void pack2(Vout& v, Vreg s0, Vreg s1, Vreg d0);
 
-Vreg zeroExtendIfBool(Vout&, const SSATmp* src, Vreg reg);
-
-ConditionCode opToConditionCode(Opcode opc);
+Vreg zeroExtendIfBool(Vout& v, const SSATmp* src, Vreg reg);
 
 template<ConditionCode Jcc, class Lambda>
 void jccBlock(Asm& a, Lambda body) {
@@ -196,19 +205,9 @@ void jccBlock(Asm& a, Lambda body) {
 }
 
 /*
- * callDestructor/jumpDestructor --
+ * lookupDestructor --
  *
- * Emit a call or jump to the appropriate destructor for a dynamically
- * typed value.
- *
- * No registers are saved; most translated code should be using
- * emitDecRefGeneric{Reg,} instead of this.
- *
- *   Inputs:
- *
- *     - typeReg is destroyed and may not be argNumToRegName[0].
- *     - argNumToRegName[0] should contain the m_data for this value.
- *     - scratch is destoyed.
+ * Return a MemoryRef pointer to the destructor for the type in typeReg.
  */
 
 inline MemoryRef lookupDestructor(X64Assembler& a, PhysReg typeReg) {
@@ -227,7 +226,7 @@ inline MemoryRef lookupDestructor(X64Assembler& a, PhysReg typeReg) {
   return baseless(typeReg*8 + table);
 }
 
-inline MemoryRef lookupDestructor(Vout& v, PhysReg typeReg) {
+inline Vptr lookupDestructor(Vout& v, Vreg typeReg) {
   auto const table = reinterpret_cast<intptr_t>(g_destructors);
   always_assert_flog(deltaFits(table, sz::dword),
     "Destructor function table is expected to be in the data "
@@ -239,8 +238,9 @@ inline MemoryRef lookupDestructor(Vout& v, PhysReg typeReg) {
                 (KindOfResource      >> kShiftDataTypeToDestrIndex == 4) &&
                 (KindOfRef           >> kShiftDataTypeToDestrIndex == 5),
                 "lookup of destructors depends on KindOf* values");
-  v << shrli{kShiftDataTypeToDestrIndex, typeReg, typeReg};
-  return baseless(typeReg*8 + table);
+  auto shiftedType = v.makeReg();
+  v << shrli{kShiftDataTypeToDestrIndex, typeReg, shiftedType, v.makeReg()};
+  return Vptr{Vreg{}, shiftedType, 8, safe_cast<int>(table)};
 }
 
 //////////////////////////////////////////////////////////////////////

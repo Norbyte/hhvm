@@ -8,6 +8,7 @@
  *
  *)
 
+external realpath: string -> string option = "hh_realpath"
 
 let open_in_no_fail fn = 
   try open_in fn
@@ -59,6 +60,34 @@ let split_lines = Str.split nl_regexp
 let exec_read cmd =
   let ic = Unix.open_process_in cmd in
   let result = input_line ic in
-  assert (result <> "");
   assert (Unix.close_process_in ic = Unix.WEXITED 0);
   result
+
+let restart () =
+  let cmd = Sys.argv.(0) in
+  let argv = Sys.argv in
+  Unix.execv cmd argv
+
+let logname =
+  try Sys.getenv "USER" with Not_found ->
+  try Sys.getenv "LOGNAME" with Not_found ->
+  exec_read "logname"
+
+let with_umask umask f =
+  let old_umask = ref 0 in
+  Utils.with_context
+    ~enter:(fun () -> old_umask := Unix.umask umask)
+    ~exit:(fun () -> Unix.umask !old_umask)
+    ~do_:f
+
+let with_timeout timeout ~on_timeout ~do_ =
+  let old_handler = ref Sys.Signal_default in
+  let old_timeout = ref 0 in
+  Utils.with_context
+    ~enter:(fun () ->
+      old_handler := Sys.signal Sys.sigalrm (Sys.Signal_handle on_timeout);
+      old_timeout := Unix.alarm timeout)
+    ~exit:(fun () ->
+      ignore (Unix.alarm !old_timeout);
+      Sys.set_signal Sys.sigalrm !old_handler)
+    ~do_

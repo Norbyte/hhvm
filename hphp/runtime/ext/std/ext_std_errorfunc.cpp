@@ -18,18 +18,24 @@
 
 #include <iostream>
 
+#include <folly/Likely.h>
+#include <folly/Format.h>
+
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/exceptions.h"
+#include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/string-buffer.h"
 #include "hphp/runtime/base/thread-info.h"
 #include "hphp/runtime/base/backtrace.h"
-#include "hphp/runtime/ext/ext_file.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 #include "hphp/util/logger.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
-const int64_t k_DEBUG_BACKTRACE_PROVIDE_OBJECT = 1;
-const int64_t k_DEBUG_BACKTRACE_IGNORE_ARGS = 2;
+const int64_t k_DEBUG_BACKTRACE_PROVIDE_OBJECT = (1 << 0);
+const int64_t k_DEBUG_BACKTRACE_IGNORE_ARGS = (1 << 1);
+const int64_t k_DEBUG_BACKTRACE_PROVIDE_METADATA = (1 << 16);
 
 const int64_t k_E_ERROR = (1 << 0);
 const int64_t k_E_WARNING = (1 << 1);
@@ -56,9 +62,11 @@ const int64_t k_E_ALL = k_E_ERROR | k_E_WARNING | k_E_PARSE | k_E_NOTICE |
 Array HHVM_FUNCTION(debug_backtrace, int64_t options /* = 1 */,
                                      int64_t limit /* = 0 */) {
   bool provide_object = options & k_DEBUG_BACKTRACE_PROVIDE_OBJECT;
+  bool provide_metadata = options & k_DEBUG_BACKTRACE_PROVIDE_METADATA;
   bool ignore_args = options & k_DEBUG_BACKTRACE_IGNORE_ARGS;
   return createBacktrace(BacktraceArgs()
                          .withThis(provide_object)
+                         .withMetadata(provide_metadata)
                          .ignoreArgs(ignore_args)
                          .setLimit(limit));
 }
@@ -156,8 +164,8 @@ Array HHVM_FUNCTION(error_get_last) {
 }
 
 bool HHVM_FUNCTION(error_log, const String& message, int message_type /* = 0 */,
-                              const String& destination /* = null_string */,
-                              const String& extra_headers /* = null_string */) {
+                              const Variant& destination /* = null */,
+                              const Variant& extra_headers /* = null */) {
   // error_log() should not invoke the user error handler,
   // so we use Logger::Error() instead of raise_warning() or raise_error()
   switch (message_type) {
@@ -171,13 +179,14 @@ bool HHVM_FUNCTION(error_log, const String& message, int message_type /* = 0 */,
   }
   case 3:
   {
-    Variant outfile = f_fopen(destination, "a"); // open for append only
+    // open for append only
+    auto outfile = HHVM_FN(fopen)(destination.toString(), "a");
     if (outfile.isNull()) {
       Logger::Error("can't open error_log file!\n");
       return false;
     }
-    f_fwrite(outfile.toResource(), message);
-    f_fclose(outfile.toResource());
+    HHVM_FN(fwrite)(outfile.toResource(), message);
+    HHVM_FN(fclose)(outfile.toResource());
     return true;
   }
   case 2: // not used per PHP
@@ -234,7 +243,9 @@ void HHVM_FUNCTION(hphp_clear_unflushed) {
 bool HHVM_FUNCTION(trigger_error, const String& error_msg,
                                   int error_type /* = k_E_USER_NOTICE */) {
   std::string msg = error_msg.data();
-  if (g_context->getThrowAllErrors()) throw error_type;
+  if (UNLIKELY(g_context->getThrowAllErrors())) {
+    throw Exception(folly::sformat("throwAllErrors: {}", error_type));
+  }
   if (error_type == k_E_USER_ERROR) {
     g_context->handleError(msg, error_type, true,
                        ExecutionContext::ErrorThrowMode::IfUnhandled,
@@ -299,6 +310,7 @@ void StandardExtension::initErrorFunc() {
                   (makeStaticString(#v), k_##v);
   INTCONST(DEBUG_BACKTRACE_PROVIDE_OBJECT);
   INTCONST(DEBUG_BACKTRACE_IGNORE_ARGS);
+  INTCONST(DEBUG_BACKTRACE_PROVIDE_METADATA);
   INTCONST(E_ERROR);
   INTCONST(E_WARNING);
   INTCONST(E_PARSE);

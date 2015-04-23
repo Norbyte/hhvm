@@ -107,10 +107,15 @@ public:
    * Convenience wrapper around {setup,handle,teardown}Request().
    */
   void run(Transport* transport) {
+    SCOPE_EXIT { teardownRequest(transport); };
     setupRequest(transport);
     handleRequest(transport);
-    teardownRequest(transport);
   }
+
+  /**
+   * Write an entry to the handler's access log.
+   */
+  virtual void logToAccessLog(Transport* transport) {}
 
   int getDefaultTimeout() const { return m_timeout; }
 

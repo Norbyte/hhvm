@@ -25,12 +25,10 @@ namespace HPHP {
 
 class File;
 
-class StringBufferLimitException : public FatalErrorException {
-public:
+struct StringBufferLimitException : FatalErrorException {
   StringBufferLimitException(int size, const String& partialResult)
     : FatalErrorException(0, "StringBuffer exceeded %d bytes of memory", size),
       m_result(partialResult) {}
-  virtual ~StringBufferLimitException() throw() {}
 
   String m_result;
 };
@@ -42,7 +40,7 @@ public:
  * per-request smart allocated memory) based on sweeping-related assumptions.
  */
 struct StringBuffer {
-  static const int kDefaultOutputLimit = StringData::MaxSize;
+  static constexpr int kDefaultOutputLimit = StringData::MaxSize;
 
   /*
    * Construct a string buffer with some initial size, subsequent allocation
@@ -167,6 +165,7 @@ struct StringBuffer {
   void append(const String& s) { append(s.data(), s.size()); }
   void append(const std::string& s) { append(s.data(), s.size()); }
   void append(const StringData* s) { append(s->data(), s->size()); }
+  void append(StringSlice s) { append(s.ptr, s.len); }
   void append(const char* s, int len) {
     assert(len >= 0);
     if (m_buffer && len <= m_cap - m_len) {
@@ -198,6 +197,10 @@ struct StringBuffer {
    */
   void read(FILE *in, int page_size = 1024);
   void read(File *in, int page_size = 1024);
+
+  template<class F> void scan(F& mark) const {
+    mark(m_str);
+  }
 
 private:
   void appendHelper(const char* s, int len);

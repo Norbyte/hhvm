@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_PHP_MAILPARSE_MIME_H_
 #define incl_HPHP_PHP_MAILPARSE_MIME_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/ext/mailparse/rfc822.h"
 #include "hphp/runtime/base/string-buffer.h"
 
@@ -39,7 +39,7 @@ public:
     DecodeNoBody    = 4,  /* don't include the body */
   };
 
-  static bool ProcessLine(MimePart *workpart, const String& line);
+  static bool ProcessLine(SmartPtr<MimePart> workpart, const String& line);
 
 public:
   DECLARE_RESOURCE_ALLOCATION_NO_SWEEP(MimePart);
@@ -83,10 +83,10 @@ private:
   };
 
 private:
-  static void UpdatePositions(MimePart *part, int newendpos,
+  static void UpdatePositions(SmartPtr<MimePart> part, int newendpos,
                               int newbodyend, int deltanlines);
 
-  Resource m_parent;
+  SmartPtr<MimePart> m_parent;
   Array  m_children;   /* child parts */
 
   int m_startpos, m_endpos;   /* offsets of this part in the message */
@@ -119,13 +119,13 @@ private:
 
     String workbuf;
     String headerbuf;
-    Resource lastpart;
+    SmartPtr<MimePart> lastpart;
   } m_parsedata;
 
-  int extractImpl(int decode, File *src);
-  MimePart *createChild(int startpos, bool inherit);
+  int extractImpl(int decode, SmartPtr<File> src);
+  SmartPtr<MimePart> createChild(int startpos, bool inherit);
   bool processHeader();
-  MimePart *getParent();
+  const SmartPtr<MimePart>& getParent() { return m_parent; }
 
   void decoderPrepare(bool do_decode);
   void decoderFeed(const String& str);

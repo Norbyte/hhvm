@@ -18,13 +18,9 @@
 #include <sys/mman.h>
 #include <stdlib.h>
 
-#include "folly/Exception.h"
+#include <folly/Exception.h>
 
 #include "hphp/util/assertions.h"
-
-#ifndef MAP_ANONYMOUS
-#define MAP_ANONYMOUS MAP_ANON
-#endif
 
 namespace HPHP {
 

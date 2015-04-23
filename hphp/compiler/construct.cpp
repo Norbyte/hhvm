@@ -24,6 +24,7 @@
 #include "hphp/compiler/analysis/analysis_result.h"
 #include "hphp/compiler/analysis/ast_walker.h"
 #include "hphp/compiler/analysis/exceptions.h"
+#include "hphp/parser/parse-time-fatal-exception.h"
 
 #include "hphp/compiler/statement/function_statement.h"
 
@@ -137,28 +138,6 @@ void Construct::serialize(JSON::CodeError::OutputStream &out) const {
   ls.done();
 }
 
-void Construct::addUserFunction(AnalysisResultPtr ar,
-                                const std::string &name) {
-  if (!name.empty()) {
-    if (ar->getPhase() == AnalysisResult::AnalyzeAll ||
-        ar->getPhase() == AnalysisResult::AnalyzeFinal) {
-      FunctionScopePtr func = getFunctionScope();
-      getFileScope()->addFunctionDependency(ar, name, func &&
-                                            func->isInlined());
-    }
-  }
-}
-
-void Construct::addUserClass(AnalysisResultPtr ar,
-                             const std::string &name) {
-  if (!name.empty()) {
-    if (ar->getPhase() == AnalysisResult::AnalyzeAll ||
-        ar->getPhase() == AnalysisResult::AnalyzeFinal) {
-      getFileScope()->addClassDependency(ar, name);
-    }
-  }
-}
-
 void Construct::printSource(CodeGenerator &cg) {
   if (m_loc) {
     cg_printf("/* SRC: %s line %d */\n", m_loc->file, m_loc->line0);
@@ -183,7 +162,6 @@ void Construct::dumpNode(int spc) {
   std::string type_info = "";
   unsigned id = 0;
   ExpressionPtr idPtr = ExpressionPtr();
-  ExpressionPtr idCsePtr = ExpressionPtr();
   int ef = 0;
 
   if (Statement *s = dynamic_cast<Statement*>(this)) {
@@ -194,7 +172,6 @@ void Construct::dumpNode(int spc) {
   } else if (Expression *e = dynamic_cast<Expression*>(this)) {
     id = e->getCanonID();
     idPtr = e->getCanonLVal();
-    idCsePtr = e->getCanonCsePtr();
 
     ef = e->getLocalEffects();
 
@@ -233,9 +210,6 @@ void Construct::dumpNode(int spc) {
     }
     if (c & Expression::DeepReference) {
       scontext += "|DeepReference";
-    }
-    if (c & Expression::NoRefWrapper) {
-      scontext += "|NoRefWrapper";
     }
     if (c & Expression::ObjectContext) {
       scontext += "|ObjectContext";
@@ -290,16 +264,6 @@ void Construct::dumpNode(int spc) {
       } else {
         type_info += ":";
       }
-      if (e->getImplementedType()) {
-        type_info += ";" + e->getImplementedType()->toString();
-      } else {
-        type_info += ";";
-      }
-      if (e->getAssertedType()) {
-        type_info += "!" + e->getAssertedType()->toString();
-      } else {
-        type_info += "!";
-      }
       type_info = "{" + type_info + "} ";
     }
   } else {
@@ -324,11 +288,6 @@ void Construct::dumpNode(int spc) {
     std::cout << "idp=0x" <<
       std::hex << std::setfill('0') << std::setw(10) <<
       (int64_t)idPtr.get() << " ";
-  }
-  if (idCsePtr) {
-    std::cout << "idcsep=0x" <<
-      std::hex << std::setfill('0') << std::setw(10) <<
-      (int64_t)idCsePtr.get() << " ";
   }
 
   if (value != "") {
@@ -382,17 +341,8 @@ void Construct::dumpNode(int spc) {
 
   string objstr;
   if (dynamic_cast<SimpleVariable*>(this) != nullptr) {
-    if (isNeededValid()) {
-      if (isNeeded()) {
-        objstr += "Object";
-      } else {
-        objstr += "NotObject";
-      }
-    } else {
-      objstr = "NoObjInfo";
-    }
+    objstr = " (NoObjInfo)";
   }
-  if (objstr != "") objstr = " (" + objstr + ")";
 
   string noremoved;
   if (isNoRemove()) {
@@ -402,8 +352,9 @@ void Construct::dumpNode(int spc) {
   std::cout << type_info << nkid << scontext << sef
     << localtered << refstr << objstr << noremoved;
   if (m_loc) {
-    std::cout << " " << m_loc->file << ":" <<
-      m_loc->line1 << "@" << m_loc->char1;
+    std::cout << " " << m_loc->file << ":"
+      << "[" << m_loc->line0 << "@" << m_loc->char0 << ", "
+      << m_loc->line1 << "@" << m_loc->char1 << "]";
   }
   std::cout << "\n";
 }

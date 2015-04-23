@@ -14,34 +14,38 @@ trait DynamicYield {
   }
 }
 
+function prep<T>(Awaitable<T> $awaitable): T {
+  // UNSAFE
+}
+
 class A {}
 class B extends A {}
 
 class Foo {
   use DynamicYield;
 
-  public async function yieldA(): Awaitable<A> {
+  public async function genA(): Awaitable<A> {
     return new A();
   }
 
-  public async function yieldB(): Awaitable<B> {
+  public async function genB(): Awaitable<B> {
     return new B();
   }
 
-  protected async function yieldSomeInt(): Awaitable<int> {
+  protected async function genSomeInt(): Awaitable<int> {
     return 123;
   }
 
-  private async function yieldSomeString(): Awaitable<string> {
+  private async function genSomeString(): Awaitable<string> {
     return 'hello';
   }
 
   public function someInt(): int {
-    return $this->getSomeInt();
+    return prep($this->genSomeInt());
   }
 
   public function someString(): string {
-    return $this->getSomeString();
+    return prep($this->genSomeString());
   }
 
   public function getAnotherString(): string {
@@ -58,7 +62,7 @@ class Foo {
 
 class Bar extends Foo {
   public function anotherInt(): int {
-    return $this->getSomeInt();
+    return prep($this->genSomeInt());
   }
 }
 
@@ -70,10 +74,7 @@ function buck(): int {
   return (new Foo())->getA();
 }
 
-function donkey(): A {
-  return (new Foo())->getB();
-}
-
 function goose(): Awaitable<string> {
+  /* HH_FIXME[4128]: gen-via-get */
   return (new Foo())->genAnotherString();
 }

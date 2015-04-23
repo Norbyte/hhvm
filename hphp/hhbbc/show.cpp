@@ -20,12 +20,12 @@
 #include <memory>
 #include <vector>
 
-#include "folly/Conv.h"
-#include "folly/Format.h"
-#include "folly/String.h"
-#include "folly/Range.h"
-#include "folly/gen/Base.h"
-#include "folly/gen/String.h"
+#include <folly/Conv.h>
+#include <folly/Format.h>
+#include <folly/String.h>
+#include <folly/Range.h>
+#include <folly/gen/Base.h>
+#include <folly/gen/String.h>
 
 #include "hphp/hhbbc/cfg.h"
 #include "hphp/hhbbc/type-system.h"
@@ -300,7 +300,7 @@ std::string show(const Bytecode& bc) {
         folly::toAppend(":", m.immInt, &ret);
         break;
       case MCodeImm::Local:
-        folly::toAppend(":$", m.immLoc->name->data(), &ret);
+        folly::toAppend(":$", local_string(m.immLoc), &ret);
         break;
       }
     }

@@ -26,7 +26,8 @@
  */
 
 #include "hphp/runtime/base/types.h"
-#include "hphp/runtime/vm/name-value-table-wrapper.h"
+#include "hphp/runtime/base/type-variant.h"
+#include "hphp/runtime/vm/globals-array.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -63,7 +64,7 @@ extern const char *g_class_map[];
 /**
  * Returns a thread local global variable class pointer.
  */
-typedef GlobalNameValueTableWrapper GlobalVariables;
+typedef GlobalsArray GlobalVariables;
 extern GlobalVariables *get_global_variables();
 extern void free_global_variables();
 extern void free_global_variables_after_sweep();

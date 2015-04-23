@@ -18,6 +18,7 @@
 #define incl_HPHP_VM_GUARD_CONSTRAINTS_H_
 
 #include "hphp/runtime/vm/jit/containers.h"
+#include "hphp/runtime/vm/jit/type-constraint.h"
 #include "hphp/runtime/vm/jit/type-source.h"
 #include "hphp/runtime/vm/jit/type.h"
 
@@ -31,9 +32,9 @@ struct IRInstruction;
  */
 struct GuardConstraints {
   /*
-   * Maps guard instructions (GuardLoc, CheckLoc, GuardStk, etc...)  to
-   * TypeConstraints. The TypeConstraints for a guard start out fully generic
-   * and are tightened appropriately when a value's type is used.
+   * Maps guard instructions (CheckLoc, CheckStk, etc.) to TypeConstraints. The
+   * TypeConstraints for a guard start out fully generic and are tightened
+   * appropriately when a value's type is used.
    */
   jit::hash_map<const IRInstruction*, TypeConstraint> guards;
 

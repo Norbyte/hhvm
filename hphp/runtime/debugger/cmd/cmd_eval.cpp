@@ -15,8 +15,10 @@
 */
 
 #include "hphp/runtime/debugger/cmd/cmd_eval.h"
-#include "hphp/runtime/vm/debugger-hook.h"
+
 #include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/debugger/debugger_client.h"
+#include "hphp/runtime/vm/debugger-hook.h"
 
 namespace HPHP { namespace Eval {
 ///////////////////////////////////////////////////////////////////////////////
@@ -51,10 +53,11 @@ void CmdEval::onClient(DebuggerClient &client) {
   m_body = client.getCode();
   m_frame = client.getFrame();
   m_bypassAccessCheck = client.getDebuggerClientBypassCheck();
-  auto res =
-     client.xendWithNestedExecution<CmdEval>(this);
-  res->handleReply(client);
-  m_failed = res->m_failed;
+  auto res = client.xendWithNestedExecution<CmdEval>(this);
+  assert(res->is(DebuggerCommand::KindOfEval));
+  auto eval = std::static_pointer_cast<CmdEval>(res);
+  eval->handleReply(client);
+  m_failed = eval->m_failed;
 }
 
 void CmdEval::handleReply(DebuggerClient &client) {
@@ -70,14 +73,15 @@ void CmdEval::handleReply(DebuggerClient &client) {
 // can occur while we're doing the server-side work for an eval.
 bool CmdEval::onServer(DebuggerProxy &proxy) {
   PCFilter locSave;
-  locSave.swap(g_context->m_flowFilter);
+  RequestInjectionData &rid = ThreadInfo::s_threadInfo->m_reqInjectionData;
+  locSave.swap(rid.m_flowFilter);
   g_context->debuggerSettings.bypassCheck = m_bypassAccessCheck;
   proxy.ExecutePHP(m_body, m_output, m_frame, m_failed,
                    DebuggerProxy::ExecutePHPFlagsAtInterrupt |
                    (!proxy.isLocal() ? DebuggerProxy::ExecutePHPFlagsLog :
                     DebuggerProxy::ExecutePHPFlagsNone));
   g_context->debuggerSettings.bypassCheck = false;
-  locSave.swap(g_context->m_flowFilter);
+  locSave.swap(rid.m_flowFilter);
   return proxy.sendToClient(this);
 }
 

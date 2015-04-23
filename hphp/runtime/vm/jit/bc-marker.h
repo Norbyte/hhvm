@@ -20,47 +20,54 @@
 #include <string>
 
 #include "hphp/runtime/base/types.h"
+#include "hphp/runtime/vm/jit/stack-offsets.h"
 #include "hphp/runtime/vm/srckey.h"
 
 namespace HPHP { namespace jit {
 
+struct SSATmp;
+
+//////////////////////////////////////////////////////////////////////
+
 /*
- * BCMarker holds the location of a specific bytecode instruction,
- * along with the offset from vmfp to vmsp at the beginning of the
- * instruction.  Every IRInstruction has a marker to keep track of
- * which bytecode instruction it came from.  If we're doing an
- * optimized translation, it also holds the TransID for the profiling
- * translation associated with this piece of code.
+ * BCMarker holds the location of a specific bytecode instruction, along with
+ * the offset from vmfp to vmsp at the beginning of the instruction.  Every
+ * IRInstruction has a marker to keep track of which bytecode instruction it
+ * came from.  If we're doing an optimized translation, it also holds the
+ * TransID for the profiling translation associated with this piece of code.
  */
 struct BCMarker {
-  SrcKey  m_sk;
-  int32_t m_spOff{0};
-  TransID m_profTransID{kInvalidTransID};
-
   /*
    * This is for use by test code that needs to provide BCMarkers but is not
    * deriving them from an actual bytecode region. It is always valid().
    */
   static BCMarker Dummy() {
-    return BCMarker{SrcKey(DummyFuncId, 0, false), 0, kInvalidTransID};
+    return BCMarker {
+      SrcKey(DummyFuncId, 0, false),
+      FPAbsOffset{0},
+      kInvalidTransID,
+      nullptr
+    };
   }
 
   explicit BCMarker() = default;
 
-  explicit BCMarker(SrcKey sk, int32_t sp, TransID tid)
+  BCMarker(SrcKey sk, FPAbsOffset sp, TransID tid, SSATmp* fp)
     : m_sk(sk)
-    , m_spOff{sp}
+    , m_spOff(sp)
     , m_profTransID{tid}
+    , m_fp{fp}
   {
-    assert(valid());
+    assertx(valid());
   }
 
-  bool operator==(BCMarker b) const {
+  bool operator==(const BCMarker& b) const {
     return b.m_sk == m_sk &&
            b.m_spOff == m_spOff &&
-           b.m_profTransID == m_profTransID;
+           b.m_profTransID == m_profTransID &&
+           b.m_fp == m_fp;
   }
-  bool operator!=(BCMarker b) const { return !operator==(b); }
+  bool operator!=(const BCMarker& b) const { return !operator==(b); }
 
   std::string show() const;
   bool valid() const;
@@ -68,15 +75,30 @@ struct BCMarker {
                                 m_sk.getFuncId() == DummyFuncId; }
   bool hasFunc() const { return valid() && !isDummy(); }
 
-  SrcKey      sk()          const { assert(valid());   return m_sk;           }
-  const Func* func()        const { assert(hasFunc()); return m_sk.func();    }
-  Offset      bcOff()       const { assert(valid());   return m_sk.offset();  }
-  bool        resumed()     const { assert(valid());   return m_sk.resumed(); }
-  int32_t     spOff()       const { assert(valid());   return m_spOff;        }
-  TransID     profTransId() const { assert(valid());   return m_profTransID;  }
+  SrcKey      sk()          const { assertx(valid());   return m_sk;           }
+  const Func* func()        const { assertx(hasFunc()); return m_sk.func();    }
+  Offset      bcOff()       const { assertx(valid());   return m_sk.offset();  }
+  bool        resumed()     const { assertx(valid());   return m_sk.resumed(); }
+  FPAbsOffset spOff()       const { assertx(valid());   return m_spOff;        }
+  TransID     profTransID() const { assertx(valid());   return m_profTransID;  }
+  SSATmp*     fp()          const { assertx(valid());   return m_fp;           }
 
-  void setSpOff(int32_t sp) { assert(valid()); m_spOff = sp; }
+  // Return a copy of this marker with an updated sp or fp.
+  BCMarker adjustSP(FPAbsOffset sp) const {
+    return BCMarker { m_sk, sp, m_profTransID, m_fp };
+  }
+  BCMarker adjustFP(SSATmp* fp) const {
+    return BCMarker { m_sk, m_spOff, m_profTransID, fp };
+  }
+
+private:
+  SrcKey m_sk;
+  FPAbsOffset m_spOff{0};
+  TransID m_profTransID{kInvalidTransID};
+  SSATmp* m_fp{nullptr};
 };
+
+//////////////////////////////////////////////////////////////////////
 
 }}
 

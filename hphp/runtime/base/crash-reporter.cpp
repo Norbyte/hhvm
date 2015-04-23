@@ -31,6 +31,17 @@ namespace HPHP {
 bool IsCrashing = false;
 
 static void bt_handler(int sig) {
+  if (RuntimeOption::StackTraceTimeout > 0) {
+    if (IsCrashing && sig == SIGALRM) {
+      // Raising the previous signal does not terminate the program.
+      signal(SIGABRT, SIG_DFL);
+      abort();
+    } else {
+      signal(SIGALRM, bt_handler);
+      alarm(RuntimeOption::StackTraceTimeout);
+    }
+  }
+
   // In case we crash again in the signal hander or something
   signal(sig, SIG_DFL);
   IsCrashing = true;
@@ -41,7 +52,7 @@ static void bt_handler(int sig) {
                   O_CREAT|O_TRUNC|O_WRONLY, S_IRUSR|S_IWUSR);
 
   if (RuntimeOption::EvalDumpRingBufferOnCrash) {
-    Trace::dumpRingBuffer(RuntimeOption::EvalDumpRingBufferOnCrash);
+    Trace::dumpRingBuffer(RuntimeOption::EvalDumpRingBufferOnCrash, 0);
   }
 
   if (RuntimeOption::EvalSpinOnCrash) {
@@ -99,6 +110,7 @@ static void bt_handler(int sig) {
   // Do it last just in case
 
   Logger::Error("Core dumped: %s", strsignal(sig));
+  Logger::Error("Stack trace in %s", RuntimeOption::StackTraceFilename.c_str());
 
   // Give the debugger a chance to do extra logging if there are any attached
   // debugger clients.

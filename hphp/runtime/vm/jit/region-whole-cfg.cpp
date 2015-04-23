@@ -33,6 +33,7 @@ struct DFS {
       , m_cfg(c)
       , m_selectedSet(ts)
       , m_selectedVec(tv)
+      , m_numBCInstrs(0)
     {}
 
   RegionDescPtr formRegion(TransID head) {
@@ -46,23 +47,30 @@ struct DFS {
     for (auto& arc : m_arcs) {
       m_region->addArc(arc.src, arc.dst);
     }
+    FTRACE(3, "selectWholeCFG: before chainRetransBlocks:\n{}\n",
+           show(*m_region));
+    m_region->chainRetransBlocks();
+    FTRACE(3, "selectWholeCFG: after chainRetransBlocks:\n{}\n",
+           show(*m_region));
     return m_region;
   }
 
  private:
 
   void visit(TransID tid) {
-    if (m_visited.count(tid)) return;
-    m_visited.insert(tid);
-    m_visiting.insert(tid);
+    auto tidRegion = m_profData->transRegion(tid);
+    auto tidInstrs = tidRegion->instrSize();
+    if (m_numBCInstrs + tidInstrs > RuntimeOption::EvalJitMaxRegionInstrs) {
+      return;
+    }
 
-    auto sk = m_profData->transSrcKey(tid);
-    m_srcKeyToTransID[sk] = tid;
+    if (!m_visited.insert(tid).second) return;
+    m_visiting.insert(tid);
+    m_numBCInstrs += tidInstrs;
 
     if (!breaksRegion(*(m_profData->transLastInstr(tid)))) {
 
-      auto srcBlockId =
-        m_profData->transRegion(tid)->blocks().back().get()->id();
+      auto srcBlockId = tidRegion->blocks().back().get()->id();
 
       for (auto const arc : m_cfg.outArcs(tid)) {
         auto dst = arc->dst();
@@ -71,40 +79,45 @@ struct DFS {
         // include it unless we've asked for loops.
         if (!RuntimeOption::EvalJitLoops && m_visiting.count(dst)) continue;
 
-        // Skip dst if region already has another block with the same SrcKey.
-        // Task #4157613: add support for regions with multiple blocks with
-        // the same SrcKey.
+        // Skip dst if we already generated a region starting at that SrcKey.
         auto dstSK = m_profData->transSrcKey(dst);
-        if (folly::get_default(m_srcKeyToTransID, dstSK, dst) != dst) continue;
+        if (m_profData->optimized(dstSK)) continue;
 
         auto dstBlockId = m_profData->transRegion(dst)->entry()->id();
-        m_arcs.push_back({srcBlockId, dstBlockId});
 
         visit(dst);
+
+        // Record the arc if dstBlockId was included in the region.
+        // (Note that it may not be included in the region due to
+        // the EvalJitMaxRegionInstrs limit.)
+        if (m_visited.count(dstBlockId)) {
+          m_arcs.push_back({srcBlockId, dstBlockId});
+        }
       }
     }
 
     // Now insert the region for tid in the front of m_region.  We do
     // this last so that the region ends up in (quasi-)topological order
     // (it'll be in topological order for acyclic regions).
-    m_region->prepend(*m_profData->transRegion(tid));
+    m_region->prepend(*tidRegion);
     m_selectedSet.insert(tid);
     if (m_selectedVec) m_selectedVec->push_back(tid);
+    always_assert(m_numBCInstrs <= RuntimeOption::EvalJitMaxRegionInstrs);
 
     m_visiting.erase(tid);
   }
 
 
  private:
-  const ProfData*                m_profData;
-  const TransCFG&                m_cfg;
-  TransIDSet&                    m_selectedSet;
-  TransIDVec*                    m_selectedVec;
-  RegionDescPtr                  m_region;
-  jit::hash_set<TransID>         m_visiting;
-  jit::hash_set<TransID>         m_visited;
-  jit::flat_map<SrcKey, TransID> m_srcKeyToTransID;
-  jit::vector<RegionDesc::Arc>   m_arcs;
+  const ProfData*              m_profData;
+  const TransCFG&              m_cfg;
+  TransIDSet&                  m_selectedSet;
+  TransIDVec*                  m_selectedVec;
+  RegionDescPtr                m_region;
+  uint32_t                     m_numBCInstrs;
+  jit::hash_set<TransID>       m_visiting;
+  jit::hash_set<TransID>       m_visited;
+  jit::vector<RegionDesc::Arc> m_arcs;
 };
 
 /*

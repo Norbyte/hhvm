@@ -18,7 +18,9 @@
 
 #include <algorithm>
 
-#include "folly/Optional.h"
+#include <folly/Optional.h>
+
+#include "hphp/runtime/base/type-string.h"
 
 #include "hphp/hhbbc/interp-state.h"
 #include "hphp/hhbbc/interp.h"
@@ -34,15 +36,14 @@ TRACE_SET_MOD(hhbbc);
 
 const StaticString s_extract("extract");
 const StaticString s_extract_sl("__SystemLib\\extract");
+const StaticString s_assert("assert");
+const StaticString s_assert_sl("__SystemLib\\assert");
 const StaticString s_parse_str("parse_str");
 const StaticString s_parse_str_sl("__SystemLib\\parse_str");
 const StaticString s_compact("compact");
 const StaticString s_compact_sl("__SystemLib\\compact_sl");
 const StaticString s_get_defined_vars("get_defined_vars");
 const StaticString s_get_defined_vars_sl("__SystemLib\\get_defined_vars");
-
-const StaticString s_http_response_header("http_response_header");
-const StaticString s_php_errormsg("php_errormsg");
 
 //////////////////////////////////////////////////////////////////////
 
@@ -85,14 +86,16 @@ void nothrow(ISS& env) {
   env.flags.wasPEI = false;
 }
 
-void calledNoReturn(ISS& env)    { env.flags.calledNoReturn = true; }
-void constprop(ISS& env)         { env.flags.canConstProp = true; }
-void nofallthrough(ISS& env)     {
+void unreachable(ISS& env)    { env.state.unreachable = true; }
+void constprop(ISS& env)      { env.flags.canConstProp = true; }
+
+void jmp_nofallthrough(ISS& env) {
   env.flags.jmpFlag = StepFlags::JmpFlags::Taken;
 }
-void never_taken(ISS& env)       {
+void jmp_nevertaken(ISS& env) {
   env.flags.jmpFlag = StepFlags::JmpFlags::Fallthrough;
 }
+
 void readUnknownLocals(ISS& env) { env.flags.mayReadLocalSet.set(); }
 void readAllLocals(ISS& env)     { env.flags.mayReadLocalSet.set(); }
 
@@ -121,11 +124,12 @@ void specialFunctionEffects(ISS& env, SString name) {
     killLocals(env);
     return;
   }
-  // compact() and get_defined_vars() read the local variable
+  // assert(), compact() and get_defined_vars() read the local variable
   // environment.  We could check which locals for compact, but for
   // now we just include them all.
   if (special_fn(s_get_defined_vars_sl, s_get_defined_vars) ||
-      special_fn(s_compact_sl, s_compact)) {
+      special_fn(s_compact_sl, s_compact) ||
+      special_fn(s_assert_sl, s_assert)) {
     readUnknownLocals(env);
     return;
   }
@@ -188,17 +192,6 @@ Type popF(ISS& env)  { return popT(env); }
 Type popCV(ISS& env) { return popT(env); }
 Type popU(ISS& env)  { return popT(env); }
 
-void popFlav(ISS& env, Flavor flav) {
-  switch (flav) {
-  case Flavor::C: popC(env); break;
-  case Flavor::V: popV(env); break;
-  case Flavor::U: popU(env); break;
-  case Flavor::F: popF(env); break;
-  case Flavor::R: popR(env); break;
-  case Flavor::A: popA(env); break;
-  }
-}
-
 Type topT(ISS& env, uint32_t idx = 0) {
   assert(idx < env.state.stack.size());
   return env.state.stack[env.state.stack.size() - idx - 1];
@@ -256,22 +249,6 @@ PrepKind prepKind(ISS& env, uint32_t paramId) {
 //////////////////////////////////////////////////////////////////////
 // locals
 
-/*
- * Locals with certain special names can be set in the enclosing scope by
- * various php routines.  We don't attempt to track their types.  Furthermore,
- * in a pseudomain effectively all 'locals' are volatile, because any re-entry
- * could modify them through $GLOBALS, so in a pseudomain we don't track any
- * local types.
- */
-bool isVolatileLocal(ISS& env, borrowed_ptr<const php::Local> l) {
-  if (is_pseudomain(env.ctx.func)) return true;
-  // Note: unnamed locals in a pseudomain probably are safe (i.e. can't be
-  // changed through $GLOBALS), but for now we don't bother.
-  if (!l->name) return false;
-  return l->name->same(s_http_response_header.get()) ||
-         l->name->same(s_php_errormsg.get());
-}
-
 void mayReadLocal(ISS& env, uint32_t id) {
   if (id < env.flags.mayReadLocalSet.size()) {
     env.flags.mayReadLocalSet.set(id);
@@ -281,7 +258,7 @@ void mayReadLocal(ISS& env, uint32_t id) {
 Type locRaw(ISS& env, borrowed_ptr<const php::Local> l) {
   mayReadLocal(env, l->id);
   auto ret = env.state.locals[l->id];
-  if (isVolatileLocal(env, l)) {
+  if (is_volatile_local(env.ctx.func, l)) {
     always_assert_flog(ret == TGen, "volatile local was not TGen");
   }
   return ret;
@@ -289,7 +266,7 @@ Type locRaw(ISS& env, borrowed_ptr<const php::Local> l) {
 
 void setLocRaw(ISS& env, borrowed_ptr<const php::Local> l, Type t) {
   mayReadLocal(env, l->id);
-  if (isVolatileLocal(env, l)) {
+  if (is_volatile_local(env.ctx.func, l)) {
     auto current = env.state.locals[l->id];
     always_assert_flog(current == TGen, "volatile local was not TGen");
     return;
@@ -317,7 +294,7 @@ Type derefLoc(ISS& env, borrowed_ptr<const php::Local> l) {
 
 void ensureInit(ISS& env, borrowed_ptr<const php::Local> l) {
   auto t = locRaw(env, l);
-  if (isVolatileLocal(env, l)) {
+  if (is_volatile_local(env.ctx.func, l)) {
     always_assert_flog(t == TGen, "volatile local was not TGen");
     return;
   }
@@ -339,7 +316,7 @@ bool locCouldBeUninit(ISS& env, borrowed_ptr<const php::Local> l) {
  */
 void setLoc(ISS& env, borrowed_ptr<const php::Local> l, Type t) {
   auto v = locRaw(env, l);
-  if (isVolatileLocal(env, l)) {
+  if (is_volatile_local(env.ctx.func, l)) {
     always_assert_flog(v == TGen, "volatile local was not TGen");
     return;
   }

@@ -9,9 +9,8 @@
  *
  */
 
-class A {
-  public function f(): void {
-  }
+class A extends \Exception {
+  public function f(): void {}
 }
 
 function test(): void {

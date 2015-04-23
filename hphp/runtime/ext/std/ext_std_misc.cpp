@@ -18,21 +18,23 @@
 #include "hphp/runtime/ext/std/ext_std_misc.h"
 #include <limits>
 
-#include "hphp/runtime/server/server-stats.h"
+#include "hphp/parser/scanner.h"
+#include "hphp/runtime/base/actrec-args.h"
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/class-info.h"
 #include "hphp/runtime/base/exceptions.h"
-#include "hphp/runtime/base/zend-pack.h"
-#include "hphp/runtime/base/hphp-system.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/strings.h"
-#include "hphp/runtime/ext/ext_math.h"
+#include "hphp/runtime/base/zend-pack.h"
+#include "hphp/runtime/ext/std/ext_std_math.h"
+#include "hphp/runtime/server/server-stats.h"
 #include "hphp/runtime/vm/bytecode.h"
-#include "hphp/runtime/vm/type-profile.h"
-#include "hphp/parser/scanner.h"
-#include "hphp/runtime/base/class-info.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
 #include "hphp/runtime/vm/jit/timer.h"
-#include "hphp/runtime/vm/jit/translator.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
+#include "hphp/runtime/vm/jit/translator.h"
+#include "hphp/runtime/vm/type-profile.h"
 #include "hphp/system/constants.h"
 #include "hphp/util/logger.h"
 #include <sys/param.h> // MAXPATHLEN is here
@@ -74,6 +76,12 @@ static String HHVM_FUNCTION(server_warmup_status) {
 
   if (requestCount() <= RuntimeOption::EvalJitProfileRequests) {
     return "PGO profiling translations are still enabled.";
+  }
+
+  auto tpc_diff = jit::s_perfCounters[jit::tpc_interp_bb] -
+    jit::s_perfCounters[jit::tpc_interp_bb_force];
+  if (tpc_diff) {
+    return folly::sformat("Interpreted {} non-forced basic blocks.", tpc_diff);
   }
 
   return empty_string();
@@ -127,6 +135,10 @@ void StandardExtension::threadInitMisc() {
     );
   }
 
+static void bindTokenConstants();
+static int get_user_token_id(int internal_id);
+const StaticString s_T_PAAMAYIM_NEKUDOTAYIM("T_PAAMAYIM_NEKUDOTAYIM");
+
 void StandardExtension::initMisc() {
     HHVM_FALIAS(HH\\server_warmup_status, server_warmup_status);
     HHVM_FE(connection_aborted);
@@ -158,6 +170,10 @@ void StandardExtension::initMisc() {
         false
       #endif
      );
+    bindTokenConstants();
+    Native::registerConstant<KindOfInt64>(s_T_PAAMAYIM_NEKUDOTAYIM.get(),
+                                          get_user_token_id(T_DOUBLE_COLON));
+
     loadSystemlib("std_misc");
   }
 
@@ -280,7 +296,7 @@ TypedValue* HHVM_FUNCTION(pack, ActRec* ar) {
   String format(getArg<KindOfString>(ar,0));
   Array extra = Array::Create();
   for (int i = 1; i<num; i++) {
-    extra.append(getArg<KindOfAny>(ar,i));
+    extra.append(getArgVariant(ar,i));
   }
   Variant result = ZendPack().pack(format, extra);
   // pack() returns false if there was an error
@@ -412,8 +428,12 @@ String HHVM_FUNCTION(uniqid, const String& prefix /* = null_string */,
   int usec = (int)(tv.tv_usec % 0x100000);
 
   String uniqid(prefix.size() + 64, ReserveString);
-  auto ptr = uniqid.bufferSlice().ptr;
-  auto capacity = uniqid.get()->capacity();
+  auto ptr = uniqid.mutableData();
+  // StringData::capacity() returns the buffer size without the null
+  // terminator. snprintf expects a the buffer capacity including room
+  // for the null terminator, writes the null termintor, and returns
+  // the full length not counting the null terminator.
+  auto capacity = uniqid.capacity() + 1;
   int64_t len;
   if (more_entropy) {
     len = snprintf(ptr, capacity, "%s%08x%05x%.8F",
@@ -620,11 +640,10 @@ const int UserTokenId_T_CALLABLE = 430;
 const int UserTokenId_T_ONUMBER = 431;
 const int UserTokenId_T_POW = 432;
 const int UserTokenId_T_POW_EQUAL = 433;
-const int UserTokenId_T_MIARRAY = 434;
-const int UserTokenId_T_MSARRAY = 435;
-const int UserTokenId_T_VARRAY = 436;
-const int UserTokenId_T_NULLSAFE_OBJECT_OPERATOR = 437;
-const int MaxUserTokenId = 438; // Marker, not a real user token ID
+const int UserTokenId_T_NULLSAFE_OBJECT_OPERATOR = 434;
+const int UserTokenId_T_HASHBANG = 435;
+const int UserTokenId_T_SUPER = 436;
+const int MaxUserTokenId = 437; // Marker, not a real user token ID
 
 #undef YYTOKENTYPE
 #undef YYTOKEN_MAP
@@ -647,6 +666,59 @@ static int get_user_token_id(int internal_id) {
   return MaxUserTokenId;
 }
 
+/**
+ * We cheat slightly in the lexer by turning
+ * T_ELSE T_WHITESPACE T_IF into T_ELSEIF
+ *
+ * This makes the AST flatter and avoids bugs like
+ * https://github.com/facebook/hhvm/issues/2699
+ */
+static String token_get_all_fix_elseif(Array& res,
+                                       int& tokVal,
+                                       const std::string& tokText,
+                                       Location& loc) {
+  if (!strcasecmp(tokText.c_str(), "elseif")) {
+    // Actual T_ELSEIF, continue on.
+    return String(tokText);
+  }
+
+  // Otherwise, it's a fake elseif made from "else\s+if"
+  auto tokCStr = tokText.c_str();
+  auto tokCEnd = tokCStr + tokText.size();
+
+  const auto DEBUG_ONLY checkWhitespace =
+  [](const char* s, const char* e) {
+    while (s < e) { if (!isspace(*(s++))) return false; }
+    return true;
+  };
+
+  assert(tokText.size() > strlen("elseif"));
+  assert(!strncasecmp(tokCStr, "else", strlen("else")));
+  assert(checkWhitespace(tokCStr + strlen("else"), tokCEnd - strlen("if")));
+  assert(!strcasecmp(tokCEnd - strlen("if"), "if"));
+
+  // Shove in the T_ELSE and T_WHITESPACE, then return the remaining T_IF
+  res.append(make_packed_array(
+    UserTokenId_T_ELSE,
+    String(tokCStr, strlen("else"), CopyString),
+    loc.line0
+  ));
+
+  res.append(make_packed_array(
+    UserTokenId_T_WHITESPACE,
+    String(tokCStr + strlen("else"), tokText.size() - strlen("elseif"),
+           CopyString),
+    loc.line0
+  ));
+
+  tokVal = UserTokenId_T_IF;
+
+  // To account for newlines in the T_WHITESPACE
+  loc.line0 = loc.line1;
+
+  return String(tokCEnd - strlen("if"), CopyString);
+}
+
 Array HHVM_FUNCTION(token_get_all, const String& source) {
   Scanner scanner(source.data(), source.size(),
                   RuntimeOption::GetScannerType() | Scanner::ReturnAllTokens);
@@ -660,43 +732,57 @@ loop_start: // For after seeing a T_INLINE_HTML, see below
       res.append(String::FromChar((char)tokid));
     } else {
       String value;
-      const int tokVal = get_user_token_id(tokid);
-      if (tokVal == UserTokenId_T_XHP_LABEL) {
-        value = String(":" + tok.text());
-      } else if (tokVal == UserTokenId_T_XHP_CATEGORY_LABEL) {
-        value = String("%" + tok.text());
-      } else if (tokVal == UserTokenId_T_INLINE_HTML) {
-        // Consecutive T_INLINE_HTML tokens should be merged together to
-        // match Zend behaviour.
-        value = String(tok.text());
-        int line = loc.line0;
-        tokid = scanner.getNextToken(tok, loc);
-        while (tokid == T_INLINE_HTML) {
+      int tokVal = get_user_token_id(tokid);
+      switch (tokVal) {
+        case UserTokenId_T_XHP_LABEL:
+          value = String(":" + tok.text());
+          break;
+        case UserTokenId_T_XHP_CATEGORY_LABEL:
+          value = String("%" + tok.text());
+          break;
+        case UserTokenId_T_ELSEIF:
+          value = token_get_all_fix_elseif(res, tokVal, tok.text(), loc);
+          break;
+        case UserTokenId_T_HASHBANG:
+          // Convert T_HASHBANG to T_INLINE_HTML for Zend compatibility
+          tokVal = UserTokenId_T_INLINE_HTML;
+          // Fall through to merge it with following T_INLINE_HTML tokens
+        case UserTokenId_T_INLINE_HTML:
+        {
+          // Consecutive T_INLINE_HTML tokens should be merged together to
+          // match Zend behaviour.
+          value = String(tok.text());
+          int line = loc.line0;
+          tokid = scanner.getNextToken(tok, loc);
+          while (tokid == T_INLINE_HTML) {
             value += String(tok.text());
             tokid = scanner.getNextToken(tok, loc);
-        }
-        Array p = make_packed_array(
-          tokVal,
-          value,
-          line
-        );
-        res.append(p);
+          }
+          Array p = make_packed_array(
+            tokVal,
+            value,
+            line
+          );
+          res.append(p);
 
-        if (tokid) {
+          if (tokid) {
             // We have a new token to deal with, jump to the beginning
             // of the loop, but don't fetch the next token, hence the
             // goto.
             goto loop_start;
-        } else {
+          } else {
             // Break out otherwise we end up appending an empty token to
             // the end of the array
-            break;
+            return res;
+          }
+          break;
         }
-      } else {
-        value = String(tok.text());
+        default:
+          value = String(tok.text());
+          break;
       }
+
       Array p = make_packed_array(
-        // Convert the internal token ID to a user token ID
         tokVal,
         value,
         loc.line0
@@ -737,21 +823,17 @@ String HHVM_FUNCTION(hphp_to_string, const Variant& v) {
   return v.toString();
 }
 
-///////////////////////////////////////////////////////////////////////////////
-}
-
 #undef YYTOKENTYPE
 #undef YYTOKEN_MAP
 #undef YYTOKEN
-#define YYTOKEN(num, name)                      \
-  extern const int64_t k_##name = get_user_token_id(num);
-#define YYTOKEN_MAP namespace HPHP
+#define YYTOKEN_MAP static void bindTokenConstants()
+#define YYTOKEN(num, name) Native::registerConstant<KindOfInt64> \
+  (makeStaticString(#name), get_user_token_id(num));
 
 #include "hphp/parser/hphp.tab.hpp" // nolint
 
-namespace HPHP {
-extern const int64_t k_T_PAAMAYIM_NEKUDOTAYIM = k_T_DOUBLE_COLON;
-}
-
 #undef YYTOKEN_MAP
 #undef YYTOKEN
+
+///////////////////////////////////////////////////////////////////////////////
+}

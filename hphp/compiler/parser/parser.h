@@ -29,7 +29,9 @@
 #include "hphp/compiler/expression/scalar_expression.h"
 #include "hphp/compiler/statement/statement.h"
 #include "hphp/compiler/statement/statement_list.h"
+#include "hphp/compiler/expression/object_property_expression.h"
 #include "hphp/util/logger.h"
+#include "hphp/parser/parse-time-fatal-exception.h"
 
 #ifdef HPHP_PARSER_NS
 #undef HPHP_PARSER_NS
@@ -55,6 +57,12 @@ DECLARE_BOOST_TYPES(BlockScope);
 DECLARE_BOOST_TYPES(TypeAnnotation);
 
 namespace Compiler {
+
+enum class ThisContextError {
+  Assign,
+  NullSafeBase
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // scanner
 
@@ -106,6 +114,7 @@ public:
 ///////////////////////////////////////////////////////////////////////////////
 
 DECLARE_BOOST_TYPES(Parser);
+
 class Parser : public ParserBase {
 public:
   static StatementListPtr ParseString(const String& input, AnalysisResultPtr ar,
@@ -140,9 +149,12 @@ public:
   void onStaticVariable(Token &out, Token *exprs, Token &var, Token *value);
   void onClassVariableModifer(Token &mod) {}
   void onClassVariableStart(Token &out, Token *modifiers, Token &decl,
-                            Token *type);
+                            Token *type, bool abstract = false,
+                            bool typeconst = false);
   void onClassVariable(Token &out, Token *exprs, Token &var, Token *value);
   void onClassConstant(Token &out, Token *exprs, Token &var, Token &value);
+  void onClassAbstractConstant(Token &out, Token *exprs, Token &var);
+  void onClassTypeConstant(Token &out, Token &var, Token &value);
   void onSimpleVariable(Token &out, Token &var);
   void onSynthesizedVariable(Token &out, Token &var) {
     onSimpleVariable(out, var);
@@ -157,16 +169,21 @@ public:
   void onEncapsList(Token &out, int type, Token &list);
   void addEncap(Token &out, Token *list, Token &expr, int type);
   void encapRefDim(Token &out, Token &var, Token &offset);
-  void encapObjProp(Token &out, Token &var, bool nullsafe, Token &name);
+  void encapObjProp(Token &out, Token &var,
+                    PropAccessType propAccessType, Token &name);
   void encapArray(Token &out, Token &var, Token &expr);
   void onConst(Token &out, Token &name, Token &value);
   void onConstantValue(Token &out, Token &constant);
   void onScalar(Token &out, int type, Token &scalar);
   void onExprListElem(Token &out, Token *exprs, Token &expr);
 
-  void onObjectProperty(Token &out, Token &base, bool nullsafe, Token &prop);
+  void onObjectProperty(Token &out, Token &base,
+                        PropAccessType propAccessType, Token &prop);
   void onObjectMethodCall(Token &out, Token &base, bool nullsafe, Token &prop,
                           Token &params);
+
+  void checkClassDeclName(const std::string& name);
+  void checkAllowedInWriteContext(ExpressionPtr e);
 
   void onListAssignment(Token &out, Token &vars, Token *expr,
                         bool rhsFirst = false);
@@ -184,9 +201,6 @@ public:
                    bool ref);
   void onEmptyCollection(Token &out);
   void onCollectionPair(Token &out, Token *pairs, Token *name, Token &value);
-  void onEmptyCheckedArray(Token &out);
-  void onCheckedArrayPair(Token &out, Token *pairs, Token *name, Token &value);
-  void onCheckedArray(Token &out, Token &pairs, int op);
   void onUserAttribute(Token &out, Token *attrList, Token &name, Token &value);
   void onClassConst(Token &out, Token &cls, Token &name, bool text);
   void onClassClass(Token &out, Token &cls, Token &name, bool text);
@@ -248,6 +262,7 @@ public:
   void onGlobal(Token &out, Token &expr);
   void onGlobalVar(Token &out, Token *exprs, Token &expr);
   void onStatic(Token &out, Token &expr);
+  void onHashBang(Token &out, Token &text);
   void onEcho(Token &out, Token &expr, bool html);
   void onUnset(Token &out, Token &expr);
   void onExpStatement(Token &out, Token &expr);
@@ -268,7 +283,8 @@ public:
                   Token& ref,
                   Token& params,
                   Token& cparams,
-                  Token& stmts);
+                  Token& stmts,
+                  Token& ret);
   Token onExprForLambda(const Token& expr);
   void onClosureParam(Token &out, Token *params, Token &param, bool ref);
 
@@ -302,6 +318,7 @@ public:
   void onNamespaceStart(const std::string &ns, bool file_scope = false);
   void onNamespaceEnd();
   void nns(int token = 0, const std::string& text = std::string());
+  std::string nsClassDecl(const std::string &name);
   std::string nsDecl(const std::string &name);
   std::string resolve(const std::string &ns, bool cls);
 
@@ -423,9 +440,10 @@ private:
   ExpressionPtr getDynamicVariable(ExpressionPtr exp, bool encap);
   ExpressionPtr createDynamicVariable(ExpressionPtr exp);
 
-  bool hasType(Token &type);
-
-  void checkAssignThis(Token &var);
+  void checkThisContext(string var, ThisContextError error);
+  void checkThisContext(Token &var, ThisContextError error);
+  void checkThisContext(ExpressionPtr e, ThisContextError error);
+  void checkThisContext(ExpressionListPtr params, ThisContextError error);
 
   void addStatement(StatementPtr stmt, StatementPtr new_stmt);
 
@@ -450,27 +468,28 @@ private:
     };
 
     enum class AliasType {
+      NONE,
       USE,
+      AUTO_USE,
       DEF
     };
 
     AliasTable(const hphp_string_imap<std::string>& autoAliases,
                std::function<bool ()> autoOracle);
 
-    std::string getName(std::string alias);
-    std::string getDefName(std::string alias);
-    std::string getUseName(std::string alias);
+    std::string getName(std::string alias, int line_no);
+    std::string getNameRaw(std::string alias);
+    AliasType getType(std::string alias);
+    int getLine(std::string alias);
     bool isAliased(std::string alias);
-    bool isAutoType(std::string alias);
-    bool isUseType(std::string alias);
-    bool isDefType(std::string alias);
-    void set(std::string alias, std::string name, AliasType type);
+    void set(std::string alias, std::string name, AliasType type, int line_no);
     void clear();
 
   private:
     struct NameEntry {
       std::string name;
       AliasType type;
+      int line_no;
     };
 
     hphp_string_imap<NameEntry> m_aliases;
@@ -480,10 +499,13 @@ private:
     void setFalseOracle();
   };
 
+  using AliasType = AliasTable::AliasType;
+
   NamespaceState m_nsState;
   bool m_nsFileScope;
   std::string m_namespace; // current namespace
   AliasTable m_nsAliasTable;
+  std::vector<uint32_t> m_nsStack;
 
   // Function aliases
   hphp_string_iset m_fnTable;

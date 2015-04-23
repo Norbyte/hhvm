@@ -30,10 +30,19 @@
 namespace HPHP { namespace jit {
 
 struct CodeGenFixups;
+struct RelocationInfo;
 
 template<typename T>
 struct GrowableVector {
   GrowableVector() {}
+  GrowableVector(GrowableVector&& other) noexcept : m_vec(other.m_vec) {
+    other.m_vec = nullptr;
+  }
+  GrowableVector& operator=(GrowableVector&& other) {
+    m_vec = other.m_vec;
+    other.m_vec = nullptr;
+    return *this;
+  }
   GrowableVector(const GrowableVector&) = delete;
   GrowableVector& operator=(const GrowableVector&) = delete;
 
@@ -41,11 +50,11 @@ struct GrowableVector {
     return m_vec ? m_vec->m_size : 0;
   }
   T& operator[](const size_t idx) {
-    assert(idx < size());
+    assertx(idx < size());
     return m_vec->m_data[idx];
   }
   const T& operator[](const size_t idx) const {
-    assert(idx < size());
+    assertx(idx < size());
     return m_vec->m_data[idx];
   }
   void push_back(const T& datum) {
@@ -116,6 +125,8 @@ struct IncomingBranch {
     ADDR,
   };
 
+  using Opaque = CompactTaggedPtr<void>::Opaque;
+
   static IncomingBranch jmpFrom(TCA from) {
     return IncomingBranch(Tag::JMP, from);
   }
@@ -126,12 +137,19 @@ struct IncomingBranch {
     return IncomingBranch(Tag::ADDR, TCA(from));
   }
 
+  Opaque getOpaque() const {
+    return m_ptr.getOpaque();
+  }
+  explicit IncomingBranch(CompactTaggedPtr<void>::Opaque v) : m_ptr(v) {}
+
   Tag type()        const { return m_ptr.tag(); }
   TCA toSmash()     const { return TCA(m_ptr.ptr()); }
+  void relocate(RelocationInfo& rel);
   void adjust(TCA addr) {
     m_ptr.set(m_ptr.tag(), addr);
   }
-
+  void patch(TCA dest);
+  TCA target() const;
 private:
   explicit IncomingBranch(Tag type, TCA toSmash) {
     m_ptr.set(type, toSmash);
@@ -175,8 +193,10 @@ struct SrcRec {
   void setFuncInfo(const Func* f);
   void chainFrom(IncomingBranch br);
   void emitFallbackJump(CodeBlock& cb, ConditionCode cc = CC_None);
+  void registerFallbackJump(TCA from, ConditionCode cc = CC_None);
   void emitFallbackJumpCustom(CodeBlock& cb, CodeBlock& frozen, SrcKey sk,
                               TransFlags trflags, ConditionCode cc = CC_None);
+  TCA getFallbackTranslation() const;
   void newTranslation(TCA newStart,
                       GrowableVector<IncomingBranch>& inProgressTailBranches);
   void replaceOldTranslations();
@@ -188,19 +208,25 @@ struct SrcRec {
     return m_translations;
   }
 
+  const GrowableVector<IncomingBranch>& tailFallbackJumps() {
+    return m_tailFallbackJumps;
+  }
+
   /*
    * The anchor translation is a retranslate request for the current
    * SrcKey that will continue the tracelet chain.
    */
   void setAnchorTranslation(TCA anc) {
-    assert(!m_anchorTranslation);
-    assert(m_tailFallbackJumps.empty());
+    assertx(!m_anchorTranslation);
+    assertx(m_tailFallbackJumps.empty());
     m_anchorTranslation = anc;
   }
 
   const GrowableVector<IncomingBranch>& incomingBranches() const {
     return m_incomingBranches;
   }
+
+  void relocate(RelocationInfo& rel);
 
   /*
    * There is an unlikely race in retranslate, where two threads
@@ -221,14 +247,12 @@ struct SrcRec {
   }
 
 private:
-  TCA getFallbackTranslation() const;
-  void patch(IncomingBranch branch, TCA dest);
   void patchIncomingBranches(TCA newStart);
 
 private:
   // This either points to the most recent translation in the
   // translations vector, or if hasDebuggerGuard() it points to the
-  // debug guard.  Read/write with atomic primitives only.
+  // debug guard.
   std::atomic<TCA> m_topTranslation;
 
   /*
@@ -270,12 +294,12 @@ public:
   const_iterator begin() const { return m_map.begin(); }
   const_iterator end()   const { return m_map.end(); }
 
-  SrcRec* find(const SrcKey& sk) const {
+  SrcRec* find(SrcKey sk) const {
     SrcRec* const* p = m_map.find(sk.toAtomicInt());
     return p ? *p : 0;
   }
 
-  SrcRec* insert(const SrcKey& sk) {
+  SrcRec* insert(SrcKey sk) {
     return *m_map.insert(sk.toAtomicInt(), new SrcRec);
   }
 

@@ -32,13 +32,13 @@ hphp.log
 /hphp/runtime/tmp/libtest.so
 
 /hphp/hhvm/gen
-/hphp/hhvm/hhvm
-/hphp/hhvm/php
 
 *.ext_hhvm.cpp
 *.ext_hhvm.h
 
 /hphp/tools/shmw/shmw
+/hphp/tools/version/version
+/hphp/tools/gdb/hhvm-gdb
 
 /hphp/ffi/java/classes
 /hphp/ffi/java/hphp_ffi_java.h

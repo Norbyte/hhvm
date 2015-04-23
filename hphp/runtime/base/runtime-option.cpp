@@ -27,11 +27,12 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 
-#include "folly/String.h"
+#include <folly/String.h>
 
 #include "hphp/util/hdf.h"
 #include "hphp/util/text-util.h"
 #include "hphp/util/network.h"
+#include "hphp/util/hardware-counter.h"
 #include "hphp/util/logger.h"
 #include "hphp/util/stack-trace.h"
 #include "hphp/util/process.h"
@@ -48,16 +49,18 @@
 
 #include "hphp/runtime/base/type-conversions.h"
 #include "hphp/runtime/base/builtin-functions.h"
-#include "hphp/runtime/base/shared-store-base.h"
+#include "hphp/runtime/base/apc-file-storage.h"
 #include "hphp/runtime/base/extended-logger.h"
 #include "hphp/runtime/base/simple-counter.h"
 #include "hphp/runtime/base/memory-manager.h"
-#include "hphp/runtime/base/hardware-counter.h"
 #include "hphp/runtime/base/preg.h"
 #include "hphp/runtime/base/crash-reporter.h"
 #include "hphp/runtime/base/static-string-table.h"
 #include "hphp/runtime/base/config.h"
 #include "hphp/runtime/base/ini-setting.h"
+#include "hphp/runtime/base/hphp-system.h"
+#include "hphp/runtime/base/zend-url.h"
+#include "hphp/runtime/ext/extension-registry.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -67,18 +70,37 @@ std::string RuntimeOption::BuildId;
 std::string RuntimeOption::InstanceId;
 std::string RuntimeOption::PidFile = "www.pid";
 
+bool RuntimeOption::EnableHipHopSyntax = false;
+bool RuntimeOption::EnableHipHopExperimentalSyntax = false;
+bool RuntimeOption::EnableShortTags = true;
+bool RuntimeOption::EnableAspTags = false;
+bool RuntimeOption::EnableXHP = false;
+bool RuntimeOption::EnableObjDestructCall = true;
+bool RuntimeOption::EnableEmitSwitch = true;
+bool RuntimeOption::EnableEmitterStats = true;
+bool RuntimeOption::EnableIntrinsicsExtension = false;
+bool RuntimeOption::CheckSymLink = true;
+bool RuntimeOption::EnableArgsInBacktraces = true;
+bool RuntimeOption::EnableZendCompat = false;
+bool RuntimeOption::EnableZendSorting = false;
+bool RuntimeOption::TimeoutsUseWallTime = true;
+bool RuntimeOption::CheckFlushOnUserClose = true;
+bool RuntimeOption::EvalAuthoritativeMode = false;
+bool RuntimeOption::IntsOverflowToInts = false;
+
 std::string RuntimeOption::LogFile;
 std::string RuntimeOption::LogFileSymLink;
 int RuntimeOption::LogHeaderMangle = 0;
-bool RuntimeOption::AlwaysEscapeLog = false;
-bool RuntimeOption::AlwaysLogUnhandledExceptions = true;
+bool RuntimeOption::AlwaysLogUnhandledExceptions =
+  RuntimeOption::EnableHipHopSyntax;
+bool RuntimeOption::AlwaysEscapeLog = true;
 bool RuntimeOption::NoSilencer = false;
 int RuntimeOption::ErrorUpgradeLevel = 0;
-bool RuntimeOption::CallUserHandlerOnFatals = true;
+bool RuntimeOption::CallUserHandlerOnFatals = false;
 bool RuntimeOption::ThrowExceptionOnBadMethodCall = true;
 bool RuntimeOption::LogNativeStackOnOOM = true;
 int RuntimeOption::RuntimeErrorReportingLevel =
-  static_cast<int>(ErrorConstants::ErrorModes::HPHP_ALL);
+  static_cast<int>(ErrorMode::HPHP_ALL);
 int RuntimeOption::ForceErrorReportingLevel = 0;
 
 std::string RuntimeOption::ServerUser;
@@ -97,12 +119,13 @@ int64_t RuntimeOption::SerializationSizeLimit = StringData::MaxSize;
 int64_t RuntimeOption::StringOffsetLimit = 10 * 1024 * 1024; // 10MB
 
 std::string RuntimeOption::AccessLogDefaultFormat = "%h %l %u %t \"%r\" %>s %b";
-std::vector<AccessLogFileData> RuntimeOption::AccessLogs;
+std::map<std::string, AccessLogFileData> RuntimeOption::AccessLogs;
 
 std::string RuntimeOption::AdminLogFormat = "%h %t %s %U";
 std::string RuntimeOption::AdminLogFile;
 std::string RuntimeOption::AdminLogSymLink;
 
+std::map<std::string, AccessLogFileData> RuntimeOption::RPCLogs;
 
 std::string RuntimeOption::Tier;
 std::string RuntimeOption::Host;
@@ -110,13 +133,11 @@ std::string RuntimeOption::DefaultServerNameSuffix;
 std::string RuntimeOption::ServerType = "libevent";
 std::string RuntimeOption::ServerIP;
 std::string RuntimeOption::ServerFileSocket;
-std::string RuntimeOption::ServerPrimaryIP;
 int RuntimeOption::ServerPort = 80;
 int RuntimeOption::ServerPortFd = -1;
 int RuntimeOption::ServerBacklog = 128;
 int RuntimeOption::ServerConnectionLimit = 0;
 int RuntimeOption::ServerThreadCount = 50;
-int RuntimeOption::ProdServerPort = 80;
 int RuntimeOption::QueuedJobsReleaseRate = 3;
 bool RuntimeOption::ServerThreadRoundRobin = false;
 int RuntimeOption::ServerWarmupThrottleRequestCount = 0;
@@ -127,6 +148,7 @@ bool RuntimeOption::ServerThreadDropStack = false;
 bool RuntimeOption::ServerHttpSafeMode = false;
 bool RuntimeOption::ServerStatCache = false;
 bool RuntimeOption::ServerFixPathInfo = false;
+bool RuntimeOption::ServerAddVaryEncoding = true;
 std::vector<std::string> RuntimeOption::ServerWarmupRequests;
 boost::container::flat_set<std::string>
 RuntimeOption::ServerHighPriorityEndPoints;
@@ -138,6 +160,7 @@ int RuntimeOption::PageletServerQueueLimit = 0;
 bool RuntimeOption::PageletServerThreadDropStack = false;
 int RuntimeOption::RequestTimeoutSeconds = 0;
 int RuntimeOption::PspTimeoutSeconds = 0;
+int RuntimeOption::PspCpuTimeoutSeconds = 0;
 int64_t RuntimeOption::MaxRequestAgeFactor = 0;
 int64_t RuntimeOption::ServerMemoryHeadRoom = 0;
 int64_t RuntimeOption::RequestMemoryMaxBytes =
@@ -157,7 +180,6 @@ int RuntimeOption::GzipMaxCompressionLevel = 9;
 std::string RuntimeOption::ForceCompressionURL;
 std::string RuntimeOption::ForceCompressionCookie;
 std::string RuntimeOption::ForceCompressionParam;
-bool RuntimeOption::EnableMagicQuotesGpc = false;
 bool RuntimeOption::EnableKeepAlive = true;
 bool RuntimeOption::ExposeHPHP = true;
 bool RuntimeOption::ExposeXFBServer = false;
@@ -170,7 +192,7 @@ bool RuntimeOption::ImplicitFlush = false;
 bool RuntimeOption::EnableEarlyFlush = true;
 bool RuntimeOption::ForceChunkedEncoding = false;
 int64_t RuntimeOption::MaxPostSize = 100;
-bool RuntimeOption::AlwaysPopulateRawPostData = true;
+bool RuntimeOption::AlwaysPopulateRawPostData = false;
 int64_t RuntimeOption::UploadMaxFileSize = 100;
 std::string RuntimeOption::UploadTmpDir = "/tmp";
 bool RuntimeOption::EnableFileUploads = true;
@@ -182,7 +204,7 @@ std::string RuntimeOption::Rfc1867Name = "video_ptoken";
 bool RuntimeOption::LibEventSyncSend = true;
 bool RuntimeOption::ExpiresActive = true;
 int RuntimeOption::ExpiresDefault = 2592000;
-std::string RuntimeOption::DefaultCharsetName = "utf-8";
+std::string RuntimeOption::DefaultCharsetName = "";
 bool RuntimeOption::ForceServerNameToHeader = false;
 bool RuntimeOption::EnableCufAsync = false;
 bool RuntimeOption::PathDebug = false;
@@ -263,12 +285,12 @@ int RuntimeOption::AdminThreadCount = 1;
 std::string RuntimeOption::AdminPassword;
 std::set<std::string> RuntimeOption::AdminPasswords;
 
-std::string RuntimeOption::ProxyOrigin;
+std::string RuntimeOption::ProxyOriginRaw;
+int RuntimeOption::ProxyPercentageRaw = 0;
 int RuntimeOption::ProxyRetry = 3;
 bool RuntimeOption::UseServeURLs;
 std::set<std::string> RuntimeOption::ServeURLs;
 bool RuntimeOption::UseProxyURLs;
-int RuntimeOption::ProxyPercentage = 0;
 std::set<std::string> RuntimeOption::ProxyURLs;
 std::vector<std::string> RuntimeOption::ProxyPatterns;
 bool RuntimeOption::AlwaysUseRelativePath = false;
@@ -289,6 +311,7 @@ bool RuntimeOption::CoreDumpReport = true;
 std::string RuntimeOption::StackTraceFilename;
 bool RuntimeOption::LocalMemcache = false;
 bool RuntimeOption::MemcacheReadOnly = false;
+int RuntimeOption::StackTraceTimeout = 0; // seconds; 0 means unlimited
 
 bool RuntimeOption::EnableStats = false;
 bool RuntimeOption::EnableAPCStats = false;
@@ -309,11 +332,17 @@ int64_t RuntimeOption::MaxRSSPollingCycle = 0;
 int64_t RuntimeOption::DropCacheCycle = 0;
 int64_t RuntimeOption::MaxSQLRowCount = 0;
 int64_t RuntimeOption::MaxMemcacheKeyCount = 0;
-int64_t RuntimeOption::SocketDefaultTimeout = 5;
+int64_t RuntimeOption::SocketDefaultTimeout = 60;
 bool RuntimeOption::LockCodeMemory = false;
 int RuntimeOption::MaxArrayChain = INT_MAX;
 bool RuntimeOption::WarnOnCollectionToArray = false;
 bool RuntimeOption::UseDirectCopy = false;
+
+#ifdef FOLLY_SANITIZE_ADDRESS
+bool RuntimeOption::DisableSmartAllocator = true;
+#else
+bool RuntimeOption::DisableSmartAllocator = false;
+#endif
 
 std::map<std::string, std::string> RuntimeOption::ServerVariables;
 std::map<std::string, std::string> RuntimeOption::EnvVariables;
@@ -321,23 +350,11 @@ std::map<std::string, std::string> RuntimeOption::EnvVariables;
 std::string RuntimeOption::LightProcessFilePrefix = "./lightprocess";
 int RuntimeOption::LightProcessCount = 0;
 
-bool RuntimeOption::EnableHipHopSyntax = false;
-bool RuntimeOption::EnableHipHopExperimentalSyntax = false;
-bool RuntimeOption::EnableShortTags = true;
-bool RuntimeOption::EnableAspTags = false;
-bool RuntimeOption::EnableXHP = false;
-bool RuntimeOption::EnableObjDestructCall = true;
-bool RuntimeOption::EnableEmitSwitch = true;
-bool RuntimeOption::EnableEmitterStats = true;
-bool RuntimeOption::CheckSymLink = true;
-int RuntimeOption::MaxUserFunctionId = (2 * 65536);
-bool RuntimeOption::EnableArgsInBacktraces = true;
-bool RuntimeOption::EnableZendCompat = false;
-bool RuntimeOption::EnableZendSorting = false;
-bool RuntimeOption::TimeoutsUseWallTime = true;
-bool RuntimeOption::CheckFlushOnUserClose = true;
-bool RuntimeOption::EvalAuthoritativeMode = false;
-bool RuntimeOption::IntsOverflowToInts = false;
+int64_t RuntimeOption::HeapSizeMB = 4096; // 4gb
+int64_t RuntimeOption::HeapResetCountBase = 1;
+int64_t RuntimeOption::HeapResetCountMultiple = 2;
+int64_t RuntimeOption::HeapLowWaterMark = 16;
+int64_t RuntimeOption::HeapHighWaterMark = 1024;
 
 #ifdef HHVM_DYNAMIC_EXTENSION_DIR
 std::string RuntimeOption::ExtensionDir = HHVM_DYNAMIC_EXTENSION_DIR;
@@ -349,22 +366,11 @@ std::vector<std::string> RuntimeOption::Extensions;
 std::vector<std::string> RuntimeOption::DynamicExtensions;
 std::string RuntimeOption::DynamicExtensionPath = ".";
 
-std::vector<void(*)(const IniSettingMap&, const Hdf&)>*
-  RuntimeOption::OptionHooks = nullptr;
-
-void RuntimeOption::AddOptionHook(
-  void(*optionHook)(const IniSettingMap&, const Hdf&)) {
-  // assuming no concurrent call to this function
-  if (RuntimeOption::OptionHooks == nullptr) {
-    RuntimeOption::OptionHooks =
-      new std::vector<void(*)(const IniSettingMap&, const Hdf&)>();
-  }
-  RuntimeOption::OptionHooks->push_back(optionHook);
-}
-
 HackStrictOption
   RuntimeOption::StrictArrayFillKeys = HackStrictOption::OFF,
-  RuntimeOption::DisallowDynamicVarEnvFuncs = HackStrictOption::OFF;
+  RuntimeOption::DisallowDynamicVarEnvFuncs = HackStrictOption::OFF,
+  RuntimeOption::IconvIgnoreCorrect = HackStrictOption::OFF,
+  RuntimeOption::MinMaxAllowDegenerate = HackStrictOption::OFF;
 bool RuntimeOption::LookForTypechecker = true;
 
 int RuntimeOption::GetScannerType() {
@@ -376,16 +382,14 @@ int RuntimeOption::GetScannerType() {
   return type;
 }
 
-bool RuntimeOption::GetServerCustomBoolSetting(const std::string &settingName,
-                                               bool &val) {
-  auto it = RuntimeOption::CustomSettings.find(settingName);
-  if (it == RuntimeOption::CustomSettings.end()) {
-    // The value isn't present in the CustomSettings section
-    return false;
-  }
+const std::string& RuntimeOption::GetServerPrimaryIPv4() {
+   static std::string serverPrimaryIPv4 = GetPrimaryIPv4();
+   return serverPrimaryIPv4;
+}
 
-  val = Hdf::convertRawConfigToBool(it->second.data());
-  return true;
+const std::string& RuntimeOption::GetServerPrimaryIPv6() {
+   static std::string serverPrimaryIPv6 = GetPrimaryIPv6();
+   return serverPrimaryIPv6;
 }
 
 static inline std::string regionSelectorDefault() {
@@ -397,19 +401,27 @@ static inline bool pgoDefault() {
   return !RuntimeOption::EvalSimulateARM;
 }
 
+static inline uint64_t pgoThresholdDefault() {
+#ifdef HHVM_WHOLE_CFG
+  return 100;
+#else
+  return debug ? 2 : 100;
+#endif
+}
+
+static inline std::string pgoRegionSelectorDefault() {
+#ifdef HHVM_WHOLE_CFG
+  return "wholecfg";
+#else
+  return "hottrace";
+#endif
+}
+
 static inline bool loopsDefault() {
 #ifdef HHVM_JIT_LOOPS_BY_DEFAULT
   return true;
 #else
-  return false;
-#endif
-}
-
-static inline bool controlFlowDefault() {
-#if defined(HHVM_JIT_LOOPS_BY_DEFAULT) || defined(HHVM_CONTROL_FLOW)
-  return true;
-#else
-  return false;
+  return RuntimeOption::EvalJitPGORegionSelector == "wholecfg";
 #endif
 }
 
@@ -447,12 +459,21 @@ static inline uint32_t jitLLVMDefault() {
 #endif
 }
 
+static inline bool jitLLVMSLPVectorizeDefault() {
+  return RuntimeOption::EvalJitLLVMOptLevel > 1 &&
+         RuntimeOption::EvalJitLLVMSizeLevel < 2;
+}
+
 static inline bool hugePagesSoundNice() {
   return RuntimeOption::ServerExecutionMode();
 }
 
 static inline int nsjrDefault() {
   return RuntimeOption::ServerExecutionMode() ? 5 : 0;
+}
+
+uint64_t ahotDefault() {
+  return RuntimeOption::RepoAuthoritative ? 4 << 20 : 0;
 }
 
 const uint64_t kEvalVMStackElmsDefault =
@@ -464,10 +485,9 @@ const uint64_t kEvalVMStackElmsDefault =
  ;
 const uint32_t kEvalVMInitialGlobalTableSizeDefault = 512;
 static const int kDefaultProfileInterpRequests = debug ? 1 : 11;
-static const int kDefaultJitPGOThreshold = debug ? 2 : 10;
 static const uint32_t kDefaultProfileRequests = debug ? 1 << 31 : 500;
 static const size_t kJitGlobalDataDef = RuntimeOption::EvalJitASize >> 2;
-static const uint64_t kJitRelocationSizeDefault = debug ? 1 << 20 : 0;
+static const uint64_t kJitRelocationSizeDefault = 1 << 20;
 
 static const bool kJitTimerDefault =
 #ifdef ENABLE_JIT_TIMER_DEFAULT
@@ -525,6 +545,8 @@ std::string RuntimeOption::DebuggerDefaultSandboxPath;
 std::string RuntimeOption::DebuggerStartupDocument;
 int RuntimeOption::DebuggerSignalTimeout = 1;
 
+bool RuntimeOption::XDebugChrome = false;
+
 std::string RuntimeOption::SendmailPath = "sendmail -t -i";
 std::string RuntimeOption::MailForceExtraParameters;
 
@@ -551,7 +573,7 @@ double RuntimeOption::ProfilerTraceExpansion = 1.2;
 int RuntimeOption::ProfilerMaxTraceBuffer = 0;
 
 #ifdef FACEBOOK
-bool RuntimeOption::EnableFb303Server = true;
+bool RuntimeOption::EnableFb303Server = false;
 int RuntimeOption::Fb303ServerPort = 0;
 int RuntimeOption::Fb303ServerThreadStackSizeMb = 8;
 int RuntimeOption::Fb303ServerWorkerThreads = 1;
@@ -666,6 +688,10 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
   const std::vector<std::string>& iniClis /* = std::vector<std::string>() */,
   const std::vector<std::string>& hdfClis /* = std::vector<std::string>() */) {
 
+  // Intialize the memory manager here because various settings and
+  // initializations that we do here need it
+  MemoryManager::TlsWrapper::getCheck();
+
   // Get the ini (-d) and hdf (-v) strings, which may override some
   // of options that were set from config files. We also do these
   // now so we can override Tier.*.[machine | tier | cpu] on the
@@ -675,7 +701,7 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::ParseIniString(istr, ini);
   }
   for (auto& hstr : hdfClis) {
-    Config::ParseHdfString(hstr, config, ini);
+    Config::ParseHdfString(hstr, config);
   }
   // See if there are any Tier-based overrides
   getTierOverwrites(ini, config);
@@ -688,12 +714,12 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::ParseIniString(istr, ini);
   }
   for (auto& hstr : hdfClis) {
-    Config::ParseHdfString(hstr, config, ini);
+    Config::ParseHdfString(hstr, config);
   }
 
   Config::Bind(PidFile, ini, config["PidFile"], "www.pid");
 
-  Config::Get(ini, config["DynamicInvokeFunctions"], DynamicInvokeFunctions);
+  Config::Bind(DynamicInvokeFunctions, ini, config["DynamicInvokeFunctions"]);
 
   {
     Hdf logger = config["Log"];
@@ -711,7 +737,8 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     IniSetting::Bind(IniSetting::CORE, IniSetting::PHP_INI_SYSTEM,
                      "hhvm.log.level", IniSetting::SetAndGet<std::string>(
       [](const std::string& value) {
-        if (value == "None") {
+        // ini parsing treats "None" as ""
+        if (value == "None" || value == "") {
           Logger::LogLevel = Logger::LogNone;
         } else if (value == "Error") {
           Logger::LogLevel = Logger::LogError;
@@ -744,6 +771,10 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     ));
 
     Config::Bind(Logger::LogHeader, ini, logger["Header"]);
+    if (Config::GetBool(ini, logger["AlwaysPrintStackTraces"])) {
+      Logger::SetTheLogger(new ExtendedLogger());
+      ExtendedLogger::EnabledByDefault = true;
+    }
     Config::Bind(Logger::LogNativeStackTrace, ini, logger["NativeStackTrace"],
                  true);
     Config::Bind(Logger::MaxMessagesPerRequest, ini,
@@ -763,34 +794,41 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     }
     Config::Bind(LogFileFlusher::DropCacheChunkSize, ini,
                  logger["DropCacheChunkSize"], 1 << 20);
-    Config::Bind(AlwaysEscapeLog, ini, logger["AlwaysEscapeLog"], false);
+    Config::Bind(Logger::AlwaysEscapeLog, ini, logger["AlwaysEscapeLog"], true);
     Config::Bind(RuntimeOption::LogHeaderMangle, ini, logger["HeaderMangle"],
                  0);
 
     Config::Bind(AlwaysLogUnhandledExceptions, ini,
-                 logger["AlwaysLogUnhandledExceptions"], true);
+                 logger["AlwaysLogUnhandledExceptions"],
+                 RuntimeOption::EnableHipHopSyntax);
     Config::Bind(NoSilencer, ini, logger["NoSilencer"]);
     Config::Bind(RuntimeErrorReportingLevel, ini,
                  logger["RuntimeErrorReportingLevel"],
-                 static_cast<int>(ErrorConstants::ErrorModes::HPHP_ALL));
+                 static_cast<int>(ErrorMode::HPHP_ALL));
     Config::Bind(ForceErrorReportingLevel, ini,
                  logger["ForceErrorReportingLevel"], 0);
     Config::Bind(AccessLogDefaultFormat, ini, logger["AccessLogDefaultFormat"],
                  "%h %l %u %t \"%r\" %>s %b");
 
-    {
-      Hdf access = logger["Access"];
-      for (Hdf hdf = access.firstChild(); hdf.exists();
-           hdf = hdf.next()) {
+    auto parseLogs = [](Hdf root, IniSetting::Map& ini,
+                        std::map<std::string, AccessLogFileData>& logs) {
+      for (Hdf hdf = root.firstChild(); hdf.exists(); hdf = hdf.next()) {
+        string logName = hdf.getName();
         string fname = Config::GetString(ini, hdf["File"]);
         if (fname.empty()) {
           continue;
         }
         string symLink = Config::GetString(ini, hdf["SymLink"]);
-        AccessLogs.push_back(AccessLogFileData(fname, symLink,
-          Config::GetString(ini, hdf["Format"], AccessLogDefaultFormat)));
+        string format = Config::GetString(ini, hdf["Format"],
+          AccessLogDefaultFormat);
+
+        logs[logName] = AccessLogFileData(fname, symLink, format);
       }
-    }
+    };
+
+    parseLogs(logger["Access"], ini, AccessLogs);
+    RPCLogs = AccessLogs;
+    parseLogs(logger["RPC"], ini, RPCLogs);
 
     Config::Bind(AdminLogFormat, ini, logger["AdminLog.Format"], "%h %t %s %U");
     Config::Bind(AdminLogFile, ini, logger["AdminLog.File"]);
@@ -799,14 +837,11 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
   {
     Hdf error = config["ErrorHandling"];
 
-    /* Remove this, once its removed from production configs */
-    (void)Config::GetBool(ini, error["NoInfiniteLoopDetection"]);
-
     Config::Bind(ErrorUpgradeLevel, ini, error["UpgradeLevel"], 0);
     Config::Bind(MaxSerializedStringSize, ini,
                  error["MaxSerializedStringSize"], 64 * 1024 * 1024);
     Config::Bind(CallUserHandlerOnFatals, ini,
-                 error["CallUserHandlerOnFatals"], true);
+                 error["CallUserHandlerOnFatals"], false);
     Config::Bind(ThrowExceptionOnBadMethodCall, ini,
                  error["ThrowExceptionOnBadMethodCall"], true);
     Config::Bind(LogNativeStackOnOOM, ini,
@@ -842,7 +877,7 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::Bind(s_rss, ini, rlimit["RSS"], 0);
 
     Config::Bind(MaxRSS, ini, rlimit["MaxRSS"], 0);
-    Config::Bind(SocketDefaultTimeout, ini, rlimit["SocketDefaultTimeout"], 5);
+    Config::Bind(SocketDefaultTimeout, ini, rlimit["SocketDefaultTimeout"], 60);
     Config::Bind(MaxRSSPollingCycle, ini, rlimit["MaxRSSPollingCycle"], 0);
     Config::Bind(DropCacheCycle, ini, rlimit["DropCacheCycle"], 0);
     Config::Bind(MaxSQLRowCount, ini, rlimit["MaxSQLRowCount"], 0);
@@ -851,6 +886,74 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
                  StringData::MaxSize);
     Config::Bind(StringOffsetLimit, ini, rlimit["StringOffsetLimit"],
                  10 * 1024 * 1024);
+    Config::Bind(HeapSizeMB, ini, rlimit["HeapSizeMB"],
+                 HeapSizeMB);
+    Config::Bind(HeapResetCountBase, ini,
+                 rlimit["HeapResetCountBase"],
+                 HeapResetCountBase);
+    Config::Bind(HeapResetCountMultiple, ini,
+                 rlimit["HeapResetCountMultiple"],
+                 HeapResetCountMultiple);
+    Config::Bind(HeapLowWaterMark , ini,
+                 rlimit["HeapLowWaterMark"],
+                 HeapLowWaterMark);
+    Config::Bind(HeapHighWaterMark , ini,
+                 rlimit["HeapHighWaterMark"],
+                 HeapHighWaterMark);
+  }
+  {
+    Hdf repo = config["Repo"];
+    {
+      Hdf repoLocal = repo["Local"];
+      // Repo.Local.Mode.
+      Config::Bind(RepoLocalMode, ini, repoLocal["Mode"]);
+      if (RepoLocalMode.empty()) {
+        const char* HHVM_REPO_LOCAL_MODE = getenv("HHVM_REPO_LOCAL_MODE");
+        if (HHVM_REPO_LOCAL_MODE != nullptr) {
+          RepoLocalMode = HHVM_REPO_LOCAL_MODE;
+        }
+        RepoLocalMode = "r-";
+      }
+      if (RepoLocalMode.compare("rw")
+          && RepoLocalMode.compare("r-")
+          && RepoLocalMode.compare("--")) {
+        Logger::Error("Bad config setting: Repo.Local.Mode=%s",
+                      RepoLocalMode.c_str());
+        RepoLocalMode = "rw";
+      }
+      // Repo.Local.Path.
+      Config::Bind(RepoLocalPath, ini, repoLocal["Path"]);
+      if (RepoLocalPath.empty()) {
+        const char* HHVM_REPO_LOCAL_PATH = getenv("HHVM_REPO_LOCAL_PATH");
+        if (HHVM_REPO_LOCAL_PATH != nullptr) {
+          RepoLocalPath = HHVM_REPO_LOCAL_PATH;
+        }
+      }
+    }
+    {
+      Hdf repoCentral = repo["Central"];
+      // Repo.Central.Path.
+      Config::Bind(RepoCentralPath, ini, repoCentral["Path"]);
+    }
+    {
+      Hdf repoEval = repo["Eval"];
+      // Repo.Eval.Mode.
+      Config::Bind(RepoEvalMode, ini, repoEval["Mode"]);
+      if (RepoEvalMode.empty()) {
+        RepoEvalMode = "readonly";
+      } else if (RepoEvalMode.compare("local")
+                 && RepoEvalMode.compare("central")
+                 && RepoEvalMode.compare("readonly")) {
+        Logger::Error("Bad config setting: Repo.Eval.Mode=%s",
+                      RepoEvalMode.c_str());
+        RepoEvalMode = "readonly";
+      }
+    }
+    Config::Bind(RepoJournal, ini, repo["Journal"], "delete");
+    Config::Bind(RepoCommit, ini, repo["Commit"], true);
+    Config::Bind(RepoDebugInfo, ini, repo["DebugInfo"], true);
+    Config::Bind(RepoAuthoritative, ini, repo["Authoritative"], false);
+    Config::Bind(RepoPreload, ini, repo["Preload"], false);
   }
   {
     Hdf eval = config["Eval"];
@@ -874,7 +977,6 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
 
     Config::Bind(EnableObjDestructCall, ini, eval["EnableObjDestructCall"],
                  true);
-    Config::Bind(MaxUserFunctionId, ini, eval["MaxUserFunctionId"], 2 * 65536);
     Config::Bind(CheckSymLink, ini, eval["CheckSymLink"], true);
 
     Config::Bind(EnableAlternative, ini, eval["EnableAlternative"], 0);
@@ -882,17 +984,38 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::Bind(Eval ## name, ini, eval[#name], defaultVal);
     EVALFLAGS()
 #undef F
+    if (EvalPerfRelocate > 0) {
+      setRelocateRequests(EvalPerfRelocate);
+    }
     low_malloc_huge_pages(EvalMaxLowMemHugePages);
+    HardwareCounter::Init(EvalProfileHWEnable,
+                          url_decode(EvalProfileHWEvents.data(),
+                                     EvalProfileHWEvents.size()).toCppString(),
+                          EvalRecordSubprocessTimes);
+
     Config::Bind(EnableEmitSwitch, ini, eval["EnableEmitSwitch"], true);
     Config::Bind(EnableEmitterStats, ini, eval["EnableEmitterStats"],
                  EnableEmitterStats);
+    Config::Bind(EnableIntrinsicsExtension, ini,
+                 eval["EnableIntrinsicsExtension"], EnableIntrinsicsExtension);
     Config::Bind(RecordCodeCoverage, ini, eval["RecordCodeCoverage"]);
     if (EvalJit && RecordCodeCoverage) {
       throw std::runtime_error("Code coverage is not supported with "
         "Eval.Jit=true");
     }
+    Config::Bind(DisableSmartAllocator, ini, eval["DisableSmartAllocator"],
+                 DisableSmartAllocator);
+    SetArenaSlabAllocBypass(DisableSmartAllocator);
+
     if (RecordCodeCoverage) CheckSymLink = true;
     Config::Bind(CodeCoverageOutputFile, ini, eval["CodeCoverageOutputFile"]);
+    // NB: after we know the value of RepoAuthoritative.
+    Config::Bind(EnableArgsInBacktraces, ini, eval["EnableArgsInBacktraces"],
+                 !RepoAuthoritative);
+    Config::Bind(EvalAuthoritativeMode, ini, eval["AuthoritativeMode"], false);
+    if (RepoAuthoritative) {
+      EvalAuthoritativeMode = true;
+    }
     {
       Hdf debugger = eval["Debugger"];
       Config::Bind(EnableDebugger, ini, debugger["EnableDebugger"]);
@@ -916,81 +1039,23 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
       Config::Bind(DebuggerRpcHostDomain, ini, debugger["RPC.HostDomain"]);
       Config::Bind(DebuggerDefaultRpcTimeout, ini,
                    debugger["RPC.DefaultTimeout"], 30);
-    }
-    {
-      Hdf lang = config["Hack"]["Lang"];
-      Config::Bind(IntsOverflowToInts, ini, lang["IntsOverflowToInts"],
-                   EnableHipHopSyntax);
-      Config::Bind(StrictArrayFillKeys, ini, lang["StrictArrayFillKeys"]);
-      Config::Bind(DisallowDynamicVarEnvFuncs, ini,
-                   lang["DisallowDynamicVarEnvFuncs"]);
-      // Defaults to EnableHHSyntax since, if you have that on, you are
-      // assumed to know what you're doing.
-      Config::Bind(LookForTypechecker, ini, lang["LookForTypechecker"],
-                   !EnableHipHopSyntax);
-    }
-    {
-      Hdf repo = config["Repo"];
-      {
-        Hdf repoLocal = repo["Local"];
-        // Repo.Local.Mode.
-        Config::Bind(RepoLocalMode, ini, repoLocal["Mode"]);
-        if (RepoLocalMode.empty()) {
-          const char* HHVM_REPO_LOCAL_MODE = getenv("HHVM_REPO_LOCAL_MODE");
-          if (HHVM_REPO_LOCAL_MODE != nullptr) {
-            RepoLocalMode = HHVM_REPO_LOCAL_MODE;
-          }
-          RepoLocalMode = "r-";
-        }
-        if (RepoLocalMode.compare("rw")
-            && RepoLocalMode.compare("r-")
-            && RepoLocalMode.compare("--")) {
-          Logger::Error("Bad config setting: Repo.Local.Mode=%s",
-                        RepoLocalMode.c_str());
-          RepoLocalMode = "rw";
-        }
-        // Repo.Local.Path.
-        Config::Bind(RepoLocalPath, ini, repoLocal["Path"]);
-        if (RepoLocalPath.empty()) {
-          const char* HHVM_REPO_LOCAL_PATH = getenv("HHVM_REPO_LOCAL_PATH");
-          if (HHVM_REPO_LOCAL_PATH != nullptr) {
-            RepoLocalPath = HHVM_REPO_LOCAL_PATH;
-          }
-        }
-      }
-      {
-        Hdf repoCentral = repo["Central"];
-        // Repo.Central.Path.
-        Config::Bind(RepoCentralPath, ini, repoCentral["Path"]);
-      }
-      {
-        Hdf repoEval = repo["Eval"];
-        // Repo.Eval.Mode.
-        Config::Bind(RepoEvalMode, ini, repoEval["Mode"]);
-        if (RepoEvalMode.empty()) {
-          RepoEvalMode = "readonly";
-        } else if (RepoEvalMode.compare("local")
-                   && RepoEvalMode.compare("central")
-                   && RepoEvalMode.compare("readonly")) {
-          Logger::Error("Bad config setting: Repo.Eval.Mode=%s",
-                        RepoEvalMode.c_str());
-          RepoEvalMode = "readonly";
-        }
-      }
-      Config::Bind(RepoJournal, ini, repo["Journal"], "delete");
-      Config::Bind(RepoCommit, ini, repo["Commit"], true);
-      Config::Bind(RepoDebugInfo, ini, repo["DebugInfo"], true);
-      Config::Bind(RepoAuthoritative, ini, repo["Authoritative"], false);
-      Config::Bind(RepoPreload, ini, repo["Preload"], RepoAuthoritative);
-    }
 
-    // NB: after we know the value of RepoAuthoritative.
-    Config::Bind(EnableArgsInBacktraces, ini, eval["EnableArgsInBacktraces"],
-                 !RepoAuthoritative);
-    Config::Bind(EvalAuthoritativeMode, ini, eval["AuthoritativeMode"], false);
-    if (RepoAuthoritative) {
-      EvalAuthoritativeMode = true;
+      Config::Bind(XDebugChrome, ini, debugger["XDebugChrome"], false);
     }
+  }
+  {
+    Hdf lang = config["Hack"]["Lang"];
+    Config::Bind(IntsOverflowToInts, ini, lang["IntsOverflowToInts"],
+                 EnableHipHopSyntax);
+    Config::Bind(StrictArrayFillKeys, ini, lang["StrictArrayFillKeys"]);
+    Config::Bind(DisallowDynamicVarEnvFuncs, ini,
+                 lang["DisallowDynamicVarEnvFuncs"]);
+    Config::Bind(IconvIgnoreCorrect, ini, lang["IconvIgnoreCorrect"]);
+    Config::Bind(MinMaxAllowDegenerate, ini, lang["MinMaxAllowDegenerate"]);
+    // Defaults to EnableHHSyntax since, if you have that on, you are
+    // assumed to know what you're doing.
+    Config::Bind(LookForTypechecker, ini, lang["LookForTypechecker"],
+                 !EnableHipHopSyntax);
   }
   {
     Hdf server = config["Server"];
@@ -1000,15 +1065,20 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::Bind(ServerType, ini, server["Type"], ServerType);
     Config::Bind(ServerIP, ini, server["IP"]);
     Config::Bind(ServerFileSocket, ini, server["FileSocket"]);
-    ServerPrimaryIP = GetPrimaryIP();
+
+#ifdef FACEBOOK
+    //Do not cause slowness on startup -- except for Facebook
+    if (GetServerPrimaryIPv4().empty() && GetServerPrimaryIPv6().empty()) {
+      throw std::runtime_error("Unable to resolve the server's "
+          "IPv4 or IPv6 address");
+    }
+#endif
+
     Config::Bind(ServerPort, ini, server["Port"], 80);
     Config::Bind(ServerBacklog, ini, server["Backlog"], 128);
     Config::Bind(ServerConnectionLimit, ini, server["ConnectionLimit"], 0);
     Config::Bind(ServerThreadCount, ini, server["ThreadCount"],
                  Process::GetCPUCount() * 2);
-
-    Config::Bind(ProdServerPort, ini,
-        server["ProdServerPort"], 80);
 
     Config::Bind(ServerThreadRoundRobin, ini, server["ThreadRoundRobin"]);
     Config::Bind(ServerWarmupThrottleRequestCount, ini,
@@ -1028,18 +1098,20 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::Bind(ServerHttpSafeMode, ini, server["HttpSafeMode"]);
     Config::Bind(ServerStatCache, ini, server["StatCache"], false);
     Config::Bind(ServerFixPathInfo, ini, server["FixPathInfo"], false);
-    Config::Get(ini, server["WarmupRequests"], ServerWarmupRequests);
-    Config::Get(ini, server["HighPriorityEndPoints"],
-                ServerHighPriorityEndPoints);
+    Config::Bind(ServerAddVaryEncoding, ini, server["AddVaryEncoding"],
+                 ServerAddVaryEncoding);
+    Config::Bind(ServerWarmupRequests, ini, server["WarmupRequests"]);
+    Config::Bind(ServerHighPriorityEndPoints, ini,
+                 server["HighPriorityEndPoints"]);
     Config::Bind(ServerExitOnBindFail, ini, server["ExitOnBindFail"], false);
 
     Config::Bind(RequestTimeoutSeconds, ini, server["RequestTimeoutSeconds"],
                  0);
     Config::Bind(MaxRequestAgeFactor, ini, server["MaxRequestAgeFactor"], 0);
     Config::Bind(PspTimeoutSeconds, ini, server["PspTimeoutSeconds"], 0);
+    Config::Bind(PspCpuTimeoutSeconds, ini, server["PspCpuTimeoutSeconds"], 0);
     Config::Bind(ServerMemoryHeadRoom, ini, server["MemoryHeadRoom"], 0);
-    Config::Bind(RequestMemoryMaxBytes, ini, server["RequestMemoryMaxBytes"],
-                       std::numeric_limits<int64_t>::max());
+    Config::Bind(RequestMemoryMaxBytes, ini, server["RequestMemoryMaxBytes"], (16l << 30)); // 16GiB
     Config::Bind(ResponseQueueCount, ini, server["ResponseQueueCount"], 0);
     if (ResponseQueueCount <= 0) {
       ResponseQueueCount = ServerThreadCount / 10;
@@ -1055,7 +1127,7 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
                  0);
     Config::Bind(ServerShutdownListenNoWork, ini,
                  server["ShutdownListenNoWork"], -1);
-    Config::Get(ini, server["SSLNextProtocols"], ServerNextProtocols);
+    Config::Bind(ServerNextProtocols, ini, server["SSLNextProtocols"]);
     if (ServerGracefulShutdownWait < ServerDanglingWait) {
       ServerGracefulShutdownWait = ServerDanglingWait;
     }
@@ -1069,7 +1141,6 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::Bind(ForceCompressionParam, ini,
                  server["ForceCompression"]["Param"]);
 
-    Config::Bind(EnableMagicQuotesGpc, ini, server["EnableMagicQuotesGpc"]);
     Config::Bind(EnableKeepAlive, ini, server["EnableKeepAlive"], true);
     Config::Bind(ExposeHPHP, ini, server["ExposeHPHP"], true);
     Config::Bind(ExposeXFBServer, ini, server["ExposeXFBServer"], false);
@@ -1085,14 +1156,14 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::Bind(MaxPostSize, ini, server["MaxPostSize"], 100);
     MaxPostSize <<= 20;
     Config::Bind(AlwaysPopulateRawPostData, ini,
-                 server["AlwaysPopulateRawPostData"], true);
+                 server["AlwaysPopulateRawPostData"], false);
     Config::Bind(LibEventSyncSend, ini, server["LibEventSyncSend"], true);
     Config::Bind(TakeoverFilename, ini, server["TakeoverFilename"]);
     Config::Bind(ExpiresActive, ini, server["ExpiresActive"], true);
     Config::Bind(ExpiresDefault, ini, server["ExpiresDefault"], 2592000);
     if (ExpiresDefault < 0) ExpiresDefault = 2592000;
     Config::Bind(DefaultCharsetName, ini, server["DefaultCharsetName"],
-                 "utf-8");
+                 "");
 
     Config::Bind(RequestBodyReadLimit, ini, server["RequestBodyReadLimit"], -1);
 
@@ -1109,7 +1180,7 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     if (!srcRoot.empty()) SourceRoot = srcRoot;
     FileCache::SourceRoot = SourceRoot;
 
-    Config::Get(ini, server["IncludeSearchPaths"], IncludeSearchPaths);
+    Config::Bind(IncludeSearchPaths, ini, server["IncludeSearchPaths"]);
     for (unsigned int i = 0; i < IncludeSearchPaths.size(); i++) {
       IncludeSearchPaths[i] = FileUtil::normalizeDir(IncludeSearchPaths[i]);
     }
@@ -1143,7 +1214,7 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::Bind(RequestInitDocument, ini, server["RequestInitDocument"]);
 
     Config::Bind(SafeFileAccess, ini, server["SafeFileAccess"]);
-    Config::Get(ini, server["AllowedDirectories"], AllowedDirectories);
+    Config::Bind(AllowedDirectories, ini, server["AllowedDirectories"]);
 
     Config::Bind(WhitelistExec, ini, server["WhitelistExec"]);
     Config::Bind(WhitelistExecWarningOnly, ini,
@@ -1154,10 +1225,9 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::Bind(UnserializationWhitelistCheckWarningOnly, ini,
                  server["UnserializationWhitelistCheckWarningOnly"], true);
 
-    Config::Get(ini, server["AllowedFiles"], AllowedFiles);
-
-    Config::Get(ini, server["ForbiddenFileExtensions"],
-                ForbiddenFileExtensions);
+    Config::Bind(AllowedFiles, ini, server["AllowedFiles"]);
+    Config::Bind(ForbiddenFileExtensions, ini,
+                 server["ForbiddenFileExtensions"]);
 
     Config::Bind(LockCodeMemory, ini, server["LockCodeMemory"], false);
     Config::Bind(MaxArrayChain, ini, server["MaxArrayChain"], INT_MAX);
@@ -1179,7 +1249,7 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
 
     Config::Bind(UploadTmpDir, ini, upload["UploadTmpDir"], "/tmp");
     Config::Bind(EnableFileUploads, ini, upload["EnableFileUploads"], true);
-    Config::Bind(MaxFileUploads, ini, "max_file_uploads", 20);
+    Config::Bind(MaxFileUploads, ini, upload["MaxFileUploads"], 20);
     Config::Bind(EnableUploadProgress, ini, upload["EnableUploadProgress"]);
     Config::Bind(Rfc1867Freq, ini, upload["Rfc1867Freq"], 256 * 1024);
     if (Rfc1867Freq < 0) Rfc1867Freq = 256 * 1024;
@@ -1285,37 +1355,37 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
   }
   {
     Hdf content = config["StaticFile"];
-    Config::Get(ini, content["Extensions"], StaticFileExtensions);
-    Config::Get(ini, content["Generators"], StaticFileGenerators);
+    Config::Bind(StaticFileExtensions, ini, content["Extensions"]);
+    Config::Bind(StaticFileGenerators, ini, content["Generators"]);
 
     Hdf matches = content["FilesMatch"];
-    if (matches.exists()) {
-      for (Hdf hdf = matches.firstChild(); hdf.exists(); hdf = hdf.next()) {
-        FilesMatches.push_back(std::make_shared<FilesMatch>(ini, hdf));
-      }
-    }
+    auto matches_callback = [] (const IniSettingMap &ini_m, const Hdf &hdf_m,
+                                const std::string &ini_m_key) {
+      FilesMatches.push_back(std::make_shared<FilesMatch>(ini_m, hdf_m));
+    };
+    Config::Iterate(ini, matches, matches_callback);
   }
   {
     Hdf phpfile = config["PhpFile"];
-    Config::Get(ini, phpfile["Extensions"], PhpFileExtensions);
+    Config::Bind(PhpFileExtensions, ini, phpfile["Extensions"]);
   }
   {
     Hdf admin = config["AdminServer"];
     Config::Bind(AdminServerPort, ini, admin["Port"], 0);
     Config::Bind(AdminThreadCount, ini, admin["ThreadCount"], 1);
     Config::Bind(AdminPassword, ini, admin["Password"]);
-    Config::Get(ini, admin["Passwords"], AdminPasswords);
+    Config::Bind(AdminPasswords, ini, admin["Passwords"]);
   }
   {
     Hdf proxy = config["Proxy"];
-    Config::Bind(ProxyOrigin, ini, proxy["Origin"]);
+    Config::Bind(ProxyOriginRaw, ini, proxy["Origin"]);
+    Config::Bind(ProxyPercentageRaw, ini, proxy["Percentage"], 0);
     Config::Bind(ProxyRetry, ini, proxy["Retry"], 3);
     Config::Bind(UseServeURLs, ini, proxy["ServeURLs"]);
-    Config::Get(ini, proxy["ServeURLs"], ServeURLs);
+    Config::Bind(ServeURLs, ini, proxy["ServeURLs"]);
     Config::Bind(UseProxyURLs, ini, proxy["ProxyURLs"]);
-    Config::Bind(ProxyPercentage, ini, proxy["Percentage"], 0);
-    Config::Get(ini, proxy["ProxyURLs"], ProxyURLs);
-    Config::Get(ini, proxy["ProxyPatterns"], ProxyPatterns);
+    Config::Bind(ProxyURLs, ini, proxy["ProxyURLs"]);
+    Config::Bind(ProxyPatterns, ini, proxy["ProxyPatterns"]);
   }
   {
     Hdf http = config["Http"];
@@ -1355,6 +1425,7 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
 
     Config::Bind(LocalMemcache, ini, debug["LocalMemcache"]);
     Config::Bind(MemcacheReadOnly, ini, debug["MemcacheReadOnly"]);
+    Config::Bind(StackTraceTimeout, ini, debug["StackTraceTimeout"], 0);
 
     {
       Hdf simpleCounter = debug["SimpleCounter"];
@@ -1366,7 +1437,7 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
   }
   {
     Hdf stats = config["Stats"];
-    Config::Bind(EnableStats, ini, stats); // main switch
+    Config::Bind(EnableStats, ini, stats["Enable"], false); // main switch
 
     Config::Bind(EnableAPCStats, ini, stats["APC"], false);
     Config::Bind(EnableWebStats, ini, stats["Web"]);
@@ -1406,11 +1477,11 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
     Config::Bind(SandboxFromCommonRoot, ini, sandbox["FromCommonRoot"]);
     Config::Bind(SandboxDirectoriesRoot, ini, sandbox["DirectoriesRoot"]);
     Config::Bind(SandboxLogsRoot, ini, sandbox["LogsRoot"]);
-    Config::Get(ini, sandbox["ServerVariables"], SandboxServerVariables);
+    Config::Bind(SandboxServerVariables, ini, sandbox["ServerVariables"]);
   }
   {
     Hdf mail = config["Mail"];
-    Config::Bind(SendmailPath, ini, mail["SendmailPath"], "sendmail -t -i");
+    Config::Bind(SendmailPath, ini, mail["SendmailPath"], "/usr/lib/sendmail -t -i");
     Config::Bind(MailForceExtraParameters, ini, mail["ForceExtraParameters"]);
   }
   {
@@ -1446,7 +1517,8 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
 #ifdef FACEBOOK
   {
     Hdf fb303Server = config["Fb303Server"];
-    Config::Bind(EnableFb303Server, ini, fb303Server["Enable"], true);
+    Config::Bind(EnableFb303Server, ini,
+                 fb303Server["Enable"], EnableFb303Server);
     Config::Bind(Fb303ServerPort, ini, fb303Server["Port"], 0);
     Config::Bind(Fb303ServerThreadStackSizeMb, ini,
                  fb303Server["ThreadStackSizeMb"], 8);
@@ -1457,18 +1529,12 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
 #endif
 
   {
-    Hdf hhprofServer = config["Xenon"];
-    Config::Bind(XenonPeriodSeconds, ini, hhprofServer["Period"], 0.0);
-    Config::Bind(XenonForceAlwaysOn, ini, hhprofServer["ForceAlwaysOn"], false);
+    Hdf xenon = config["Xenon"];
+    Config::Bind(XenonPeriodSeconds, ini, xenon["Period"], 0.0);
+    Config::Bind(XenonForceAlwaysOn, ini, xenon["ForceAlwaysOn"], false);
   }
 
-  Config::Get(ini, config["CustomSettings"], CustomSettings);
-
-  if (RuntimeOption::OptionHooks != nullptr) {
-    for (auto hookFunc : *RuntimeOption::OptionHooks) {
-      hookFunc(ini, config);
-    }
-  }
+  Config::Bind(CustomSettings, ini, config["CustomSettings"]);
 
   refineStaticStringTableSize();
 
@@ -1497,6 +1563,8 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
   // Paths and Directories
   IniSetting::Bind(IniSetting::CORE, IniSetting::PHP_INI_SYSTEM,
                    "doc_root", &RuntimeOption::SourceRoot);
+  IniSetting::Bind(IniSetting::CORE, IniSetting::PHP_INI_SYSTEM,
+                   "sendmail_path", &RuntimeOption::SendmailPath);
 
   // FastCGI
   IniSetting::Bind(IniSetting::CORE, IniSetting::PHP_INI_ONLY,
@@ -1571,14 +1639,14 @@ void RuntimeOption::Load(IniSetting::Map& ini, Hdf& config,
   Config::Bind(RuntimeOption::DynamicExtensionPath, ini,
                config["DynamicExtensionPath"],
                RuntimeOption::DynamicExtensionPath);
-  // there is no way to bind array ini/hdf settings.
-  Config::Get(ini, config["extensions"], RuntimeOption::Extensions);
-  Config::Get(ini, config["DynamicExtensions"],
-              RuntimeOption::DynamicExtensions);
+  Config::Bind(RuntimeOption::Extensions, ini, config["extensions"]);
+  Config::Bind(RuntimeOption::DynamicExtensions, ini,
+               config["DynamicExtensions"]);
 
 
-  Extension::LoadModules(ini, config);
-  SharedStores::Create();
+  ExtensionRegistry::moduleLoad(ini, config);
+  extern void initialize_apc();
+  initialize_apc();
 }
 
 ///////////////////////////////////////////////////////////////////////////////

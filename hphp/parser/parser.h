@@ -67,6 +67,16 @@ enum class ClosureType {
   Long,
 };
 
+enum class PropAccessType {
+  Normal,
+  NullSafe,
+};
+
+enum ObjPropType {
+  ObjPropNormal,
+  ObjPropXhpAttr
+};
+
 //////////////////////////////////////////////////////////////////////
 
 typedef void* TStatementPtr;
@@ -83,6 +93,7 @@ public:
 
   static bool IsClosureName                (const std::string &name);
   std::string newClosureName(
+      const std::string &namespaceName,
       const std::string &className,
       const std::string &funcName);
 
@@ -107,7 +118,8 @@ public:
    * Public accessors.
    */
   const char *file() const { return m_fileName;}
-  std::string getMessage(bool filename = false) const;
+  std::string getMessage(bool filename = false,
+                         bool rawPosWhenNoError = false) const;
   std::string getMessage(Location *loc, bool filename = false) const;
   LocationPtr getLocation() const;
   void getLocation(Location &loc) const {

@@ -14,11 +14,12 @@
    +----------------------------------------------------------------------+
 */
 
+#include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/builtin-functions.h"
-#include "hphp/runtime/base/variable-serializer.h"
 #include "hphp/runtime/base/execution-context.h"
-#include "hphp/runtime/base/types.h"
+#include "hphp/runtime/base/memory-manager.h"
+#include "hphp/runtime/base/variable-serializer.h"
 
 #include "hphp/system/systemlib.h"
 
@@ -28,11 +29,13 @@ namespace HPHP {
 // resources have a separate id space
 __thread int ResourceData::os_max_resource_id;
 
-ResourceData::ResourceData() : m_count(0) {
-  assert(uintptr_t(this) % sizeof(TypedValue) == 0);
+ResourceData::ResourceData()
+  : m_size{0}, m_kind(HeaderKind::Resource), m_count(0)
+{
   int& pmax = os_max_resource_id;
   if (pmax < 3) pmax = 3; // reserving 1, 2, 3 for STDIN, STDOUT, STDERR
   o_id = ++pmax;
+  assert(MM().checkContains(this));
 }
 
 void ResourceData::o_setId(int id) {
@@ -72,12 +75,9 @@ const String& ResourceData::o_getClassNameHook() const {
 }
 
 void ResourceData::serializeImpl(VariableSerializer *serializer) const {
-  String saveName;
-  int saveId;
-  serializer->getResourceInfo(saveName, saveId);
-  serializer->setResourceInfo(o_getResourceName(), o_id);
+  serializer->pushResourceInfo(o_getResourceName(), o_id);
   empty_array().serialize(serializer);
-  serializer->setResourceInfo(saveName, saveId);
+  serializer->popResourceInfo();
 }
 
 const String& ResourceData::o_getResourceName() const {
@@ -94,7 +94,13 @@ void ResourceData::serialize(VariableSerializer* serializer) const {
 }
 
 void ResourceData::compileTimeAssertions() {
+  static_assert(offsetof(ResourceData, m_kind) == HeaderKindOffset, "");
   static_assert(offsetof(ResourceData, m_count) == FAST_REFCOUNT_OFFSET, "");
+}
+
+void ResourceData::vscan(IMarker& mark) const {
+  // default implementation scans for ambiguous pointers.
+  mark(this, heapSize());
 }
 
 ///////////////////////////////////////////////////////////////////////////////

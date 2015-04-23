@@ -29,10 +29,10 @@
 
 #include <tbb/concurrent_hash_map.h>
 
-#include "folly/Conv.h"
-#include "folly/String.h"
-#include "folly/Format.h"
-#include "folly/ScopeGuard.h"
+#include <folly/Conv.h>
+#include <folly/String.h>
+#include <folly/Format.h>
+#include <folly/ScopeGuard.h>
 
 #include "hphp/util/trace.h"
 #include "hphp/runtime/vm/hhbc.h"
@@ -309,7 +309,7 @@ bool in(StatsSS& env, const bc::CGetM& op) {
     case LSL:
     case LSC:
       return TTop;
-    case NumLocationCodes:
+    case InvalidLocationCode:
       break;
     }
     not_reached();
@@ -331,16 +331,7 @@ bool in(StatsSS& env, const bc::FCallBuiltin& op) {
     }
   }
 
-  // run the interpreter and check the top of the stack
   default_dispatch(env, op);
-
-  if (reducible) {
-    auto t = topT(env);
-    auto const v = tv(t);
-    if (!v) {
-      reducible = false;
-    }
-  }
 
   auto builtin = op.str3;
   {
@@ -418,8 +409,7 @@ void collect_simple(Stats& stats, const Bytecode& bc) {
 }
 
 void collect_func(Stats& stats, const Index& index, php::Func& func) {
-  auto const isPM = func.unit->pseudomain.get() == &func;
-  if (!func.cls && !isPM) {
+  if (!func.cls) {
     ++stats.totalFunctions;
     if (func.attrs & AttrPersistent) {
       ++stats.persistentFunctions;
@@ -439,12 +429,12 @@ void collect_func(Stats& stats, const Index& index, php::Func& func) {
     }
   }
 
-  if (!options.extendedStats || isPM) return;
+  if (!options.extendedStats) return;
 
   auto const ctx = Context { func.unit, &func, func.cls };
   auto const fa  = analyze_func(index, ctx);
   {
-    Trace::Bump bumper{Trace::hhbbc, kTraceBump};
+    Trace::Bump bumper{Trace::hhbbc, kStatsBump};
     for (auto& blk : func.blocks) {
       auto state = fa.bdata[blk->id].stateIn;
       if (!state.initialized) continue;

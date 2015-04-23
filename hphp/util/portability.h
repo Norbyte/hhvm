@@ -16,7 +16,8 @@
 #ifndef incl_HPHP_PORTABILITY_H_
 #define incl_HPHP_PORTABILITY_H_
 
-#include "folly/Likely.h" // defining LIKELY/UNLIKELY is part of this header
+#include <folly/Likely.h> // defining LIKELY/UNLIKELY is part of this header
+#include <folly/CPortability.h> // defining FOLLY_DISABLE_ADDRESS_SANITIZER
 
 namespace HPHP {
 
@@ -94,9 +95,6 @@ namespace HPHP {
 
 #if defined(__x86_64__)
 
-# define DECLARE_STACK_POINTER(sp)                \
-    void* sp;                                     \
-    asm volatile("mov %%rsp, %0" : "=r" (sp) ::)
 # if defined(__clang__)
 #  define DECLARE_FRAME_POINTER(fp)               \
     ActRec* fp;                                   \
@@ -110,14 +108,28 @@ namespace HPHP {
 # if defined(__clang__)
 #  error Clang implementation not done for ARM
 # endif
-# define DECLARE_STACK_POINTER(sp) register void*   sp asm("sp");
 # define DECLARE_FRAME_POINTER(fp) register ActRec* fp asm("x29");
+
+#elif defined(__powerpc64__)
+
+# if defined(__clang__)
+#  error Clang implementation not done for PPC64
+# endif
+# define DECLARE_FRAME_POINTER(fp) register ActRec* fp = (ActRec*) __builtin_frame_address(0);
 
 #else
 
 # error What are the stack and frame pointers called on your architecture?
 
 #endif
+
+//////////////////////////////////////////////////////////////////////
+
+// We reserve the exit status 127 to signal a failure in the
+// interpreter. 127 is a valid exit code on all reasonable
+// architectures: POSIX requires at least 8 unsigned bits and
+// Windows 32 signed bits.
+#define HPHP_EXIT_FAILURE 127
 
 //////////////////////////////////////////////////////////////////////
 

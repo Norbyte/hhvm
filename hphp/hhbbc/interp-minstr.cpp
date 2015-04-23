@@ -20,13 +20,13 @@
 #include <string>
 #include <utility>
 
-#include "folly/Optional.h"
-#include "folly/Format.h"
+#include <folly/Optional.h>
+#include <folly/Format.h>
 
 #include "hphp/util/trace.h"
 
 #include "hphp/hhbbc/interp-internal.h"
-#include "hphp/hhbbc/type-arith.h"
+#include "hphp/hhbbc/type-ops.h"
 
 namespace HPHP { namespace HHBBC {
 
@@ -37,6 +37,19 @@ namespace {
 const StaticString s_stdClass("stdClass");
 
 //////////////////////////////////////////////////////////////////////
+
+/*
+ * Note: the couldBe comparisons here with sempty() are asking "can this string
+ * be a non-reference counted empty string".  What actually matters is whether
+ * it can be an empty string at all.  Currently, all reference counted strings
+ * are TStr, which has no values and may also be non-reference
+ * counted---emptiness isn't separately tracked like it is for arrays, so if
+ * anything happened that could make it reference counted this check will
+ * return true.
+ *
+ * This means this code is fine for now, but if we implement #3837503
+ * (non-static strings with values in the type system) it will need to change.
+ */
 
 bool couldBeEmptyish(Type ty) {
   return ty.couldBe(TNull) ||
@@ -329,6 +342,10 @@ bool couldBeInPublicStatic(ISS& env, const Base& b) {
 //////////////////////////////////////////////////////////////////////
 
 void handleInThisPropD(MIS& env) {
+  // NullSafe (Q) props do not promote an emptyish base to stdClass instance.
+  if (env.mvec.mcodes[env.mInd].mcode == MQT) {
+    return;
+  }
   if (!couldBeInThis(env, env.base)) return;
 
   if (auto const name = env.base.locName) {
@@ -346,6 +363,11 @@ void handleInThisPropD(MIS& env) {
 }
 
 void handleInSelfPropD(MIS& env) {
+  // NullSafe (Q) props do not promote an emptyish base to stdClass instance.
+  if (env.mvec.mcodes[env.mInd].mcode == MQT) {
+    return;
+  }
+
   if (!couldBeInSelf(env, env.base)) return;
 
   if (auto const name = env.base.locName) {
@@ -361,6 +383,11 @@ void handleInSelfPropD(MIS& env) {
 }
 
 void handleInPublicStaticPropD(MIS& env) {
+  // NullSafe (Q) props do not promote an emptyish base to stdClass instance.
+  if (env.mvec.mcodes[env.mInd].mcode == MQT) {
+    return;
+  }
+
   if (!couldBeInPublicStatic(env, env.base)) return;
 
   auto const indexer = env.collect.publicStatics;
@@ -369,7 +396,7 @@ void handleInPublicStaticPropD(MIS& env) {
   auto const name = baseLocNameType(env.base);
   auto const ty = env.index.lookup_public_static(env.base.locTy, name);
   if (propCouldPromoteToObj(ty)) {
-    indexer->merge(env.base.locTy, name,
+    indexer->merge(env.ctx, env.base.locTy, name,
       objExact(env.index.builtin_class(s_stdClass.get())));
   }
 }
@@ -415,7 +442,7 @@ void handleInPublicStaticElemD(MIS& env) {
   auto const ty = env.index.lookup_public_static(env.base.locTy, name);
   if (elemCouldPromoteToArr(ty)) {
     // Might be possible to only merge a TArrE, but for now this is ok.
-    indexer->merge(env.base.locTy, name, TArr);
+    indexer->merge(env.ctx, env.base.locTy, name, TArr);
   }
 }
 
@@ -451,7 +478,7 @@ void handleInPublicStaticElemU(MIS& env) {
    * Merging InitCell is correct, but very conservative, for now.
    */
   auto const name = baseLocNameType(env.base);
-  indexer->merge(env.base.locTy, name, TInitCell);
+  indexer->merge(env.ctx, env.base.locTy, name, TInitCell);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -565,6 +592,10 @@ void handleBaseElemU(MIS& env) {
 }
 
 void handleBasePropD(MIS& env) {
+  // NullSafe (Q) props do not promote an emptyish base to stdClass instance.
+  if (env.mvec.mcodes[env.mInd].mcode == MQT) {
+    return;
+  }
   auto& ty = env.base.type;
   if (ty.subtypeOf(TObj)) return;
   if (propMustPromoteToObj(ty)) {
@@ -623,14 +654,14 @@ Type mcodeKey(MIS& env) {
   case MPC:  return topC(env, --env.stackIdx);
   case MPL:  return locAsCell(env, melem.immLoc);
   case MPT:  return sval(melem.immStr);
-
+  case MQT:  return sval(melem.immStr);
   case MEC:  return topC(env, --env.stackIdx);
   case MET:  return sval(melem.immStr);
   case MEL:  return locAsCell(env, melem.immLoc);
   case MEI:  return ival(melem.immInt);
 
   case MW:
-  case NumMemberCodes:
+  case InvalidMemberCode:
     always_assert(0);
     break;
   }
@@ -743,7 +774,7 @@ Base miBase(MIS& env) {
       return miBaseSProp(env, cls, prop);
     }
 
-  case NumLocationCodes:
+  case InvalidLocationCode:
     break;
   }
   not_reached();
@@ -754,8 +785,9 @@ Base miBase(MIS& env) {
 
 void miProp(MIS& env) {
   auto const name     = mcodeStringKey(env);
-  bool const isDefine = env.info.getAttr(env.mcode()) & MIA_define;
-  bool const isUnset  = env.info.getAttr(env.mcode()) & MIA_unset;
+  auto const isDefine = env.info.getAttr(env.mcode()) & MIA_define;
+  auto const isUnset  = env.info.getAttr(env.mcode()) & MIA_unset;
+  auto const isNullsafe = (env.mvec.mcodes[env.mInd].mcode == MQT);
 
   /*
    * MIA_unset Props doesn't promote "emptyish" things to stdClass,
@@ -818,19 +850,18 @@ void miProp(MIS& env) {
   }
 
   /*
-   * Otherwise, intermediate props with define can promote a null,
-   * false, or "" to stdClass.  Those cases, and others, if it's not
-   * MIA_define, will set the base to a null value in tvScratch.
-   * The base may also legitimately be an object and our next base
-   * is in an object property.
+   * Otherwise, intermediate props with define can promote a null, false, or ""
+   * to stdClass.  Those cases, and others, if it's not MIA_define, will set
+   * the base to a null value in tvScratch.  The base may also legitimately be
+   * an object and our next base is in an object property.
    *
-   * If we know for sure we're promoting to stdClass, we can put the
-   * locType pointing at that.  Otherwise we conservatively treat
-   * all these cases as "possibly" being inside of an object
-   * property with "PostProp" with locType TTop.
+   * If we know for sure we're promoting to stdClass, we can put the locType
+   * pointing at that.  Otherwise we conservatively treat all these cases as
+   * "possibly" being inside of an object property with "PostProp" with locType
+   * TTop.
    */
   auto const newBaseLocTy =
-    propMustPromoteToObj(env.base.type)
+    isDefine && !isNullsafe && propMustPromoteToObj(env.base.type)
       ? objExact(env.index.builtin_class(s_stdClass.get()))
       : TTop;
 
@@ -1025,7 +1056,7 @@ void miFinalSetOpProp(MIS& env, SetOpOp subop) {
   if (couldBeThisObj(env, env.base)) {
     if (name && mustBeThisObj(env, env.base)) {
       if (auto const lhsTy = thisPropAsCell(env, name)) {
-        resultTy = typeArithSetOp(subop, *lhsTy, rhsTy);
+        resultTy = typeSetOp(subop, *lhsTy, rhsTy);
       }
     }
 

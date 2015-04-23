@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <vector>
+#include <algorithm>
 
 #include "hphp/util/abi-cxx.h"
 #include "hphp/util/text-color.h"
@@ -28,8 +29,8 @@
 #include "hphp/runtime/vm/jit/containers.h"
 #include "hphp/runtime/vm/jit/guard-constraints.h"
 #include "hphp/runtime/vm/jit/ir-opcode.h"
-#include "hphp/runtime/vm/jit/layout.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/runtime/vm/jit/cfg.h"
 
 namespace HPHP { namespace jit {
 
@@ -309,13 +310,23 @@ void print(std::ostream& os, const Block* block, AreaIndex area,
     os << '\n';
 
     if (asmInfo) {
-      TcaRange instRange = asmInfo->instRangesForArea(area)[inst];
-      if (!instRange.empty()) {
-        disasmRange(os, instRange.begin(), instRange.end());
-        os << '\n';
-        assert(instRange.end() >= blockRange.start());
-        assert(instRange.end() <= blockRange.end());
-        blockRange = TcaRange(instRange.end(), blockRange.end());
+      // There can be asm ranges in areas other than the one this blocks claims
+      // to be in so we have to iterate all the areas to be sure to get
+      // everything.
+      for (auto i = 0; i < kNumAreas; ++i) {
+        AreaIndex currentArea = static_cast<AreaIndex>(i);
+        TcaRange instRange = asmInfo->instRangesForArea(currentArea)[inst];
+        if (!instRange.empty()) {
+          os << std::string(kIndent + 4, ' ') << areaAsString(currentArea);
+          os << ":\n";
+          disasmRange(os, instRange.begin(), instRange.end());
+          os << '\n';
+          if (currentArea == area) {
+            assert_no_log(instRange.end() >= blockRange.start());
+            assert_no_log(instRange.end() <= blockRange.end());
+            blockRange = TcaRange(instRange.end(), blockRange.end());
+          }
+        }
       }
     }
   }
@@ -374,18 +385,30 @@ void printOpcodeStats(std::ostream& os, const BlockList& blocks) {
  * Unit
  */
 void print(std::ostream& os, const IRUnit& unit, const AsmInfo* asmInfo,
-           const GuardConstraints* guards, bool dotBodies) {
+           const GuardConstraints* guards) {
   // For nice-looking dumps, we want to remember curMarker between blocks.
   BCMarker curMarker;
+  static bool dotBodies = getenv("HHIR_DOT_BODIES");
 
-  auto const layout = layoutBlocks(unit);
-  auto const& blocks = layout.blocks;
+  auto blocks = rpoSortCfg(unit);
+  // Partition into main, cold and frozen, without changing relative order.
+  auto cold = std::stable_partition(blocks.begin(), blocks.end(),
+    [&] (Block* b) {
+      return b->hint() == Block::Hint::Neither ||
+             b->hint() == Block::Hint::Likely;
+    }
+  );
+  auto frozen = std::stable_partition(cold, blocks.end(),
+    [&] (Block* b) { return b->hint() == Block::Hint::Unlikely; }
+  );
 
   if (dumpIREnabled(kExtraExtraLevel)) printOpcodeStats(os, blocks);
 
   // Print the block CFG above the actual code.
+
+  auto const backedges = findBackEdges(unit);
   os << "digraph G {\n";
-  for (Block* block : blocks) {
+  for (auto block : blocks) {
     if (block->empty()) continue;
     if (dotBodies && block->hint() != Block::Hint::Unlikely &&
         block->hint() != Block::Hint::Unused) {
@@ -405,14 +428,30 @@ void print(std::ostream& os, const IRUnit& unit, const AsmInfo* asmInfo,
                           block->id(), body);
     }
 
-    auto* next = block->next();
-    auto* taken = block->taken();
+    auto next = block->nextEdge();
+    auto taken = block->takenEdge();
     if (!next && !taken) continue;
+    auto edge_color = [&] (Edge* edge) {
+      auto const target = edge->to();
+      return
+        target->isCatch() ? " [color=blue]" :
+        target->isExit() ? " [color=cyan]" :
+        backedges.count(edge) ? " [color=red]" :
+        target->hint() == Block::Hint::Unlikely ? " [color=green]" : "";
+    };
+    auto show_edge = [&] (Edge* edge) {
+      os << folly::format(
+        "B{} -> B{}{}",
+        block->id(),
+        edge->to()->id(),
+        edge_color(edge)
+      );
+    };
     if (next) {
-      os << folly::format("B{} -> B{}", block->id(), next->id());
+      show_edge(next);
       if (taken) os << "; ";
     }
-    if (taken) os << folly::format("B{} -> B{}", block->id(), taken->id());
+    if (taken) show_edge(taken);
     os << "\n";
   }
   os << "}\n";
@@ -420,11 +459,11 @@ void print(std::ostream& os, const IRUnit& unit, const AsmInfo* asmInfo,
   AreaIndex currentArea = AreaIndex::Main;
   curMarker = BCMarker();
   for (auto it = blocks.begin(); it != blocks.end(); ++it) {
-    if (it == layout.acoldIt) {
+    if (it == cold) {
       os << folly::format("\n{:-^60}", "cold blocks");
       currentArea = AreaIndex::Cold;
     }
-    if (it == layout.afrozenIt) {
+    if (it == frozen) {
       os << folly::format("\n{:-^60}", "frozen blocks");
       currentArea = AreaIndex::Frozen;
     }
@@ -437,9 +476,9 @@ void print(const IRUnit& unit) {
   std::cerr << std::endl;
 }
 
-std::string IRUnit::toString() const {
+std::string show(const IRUnit& unit) {
   std::ostringstream out;
-  print(out, *this);
+  print(out, unit);
   return out.str();
 }
 

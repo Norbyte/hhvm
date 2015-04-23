@@ -9,7 +9,7 @@
  *
  */
 
-function show<T>(T $x): void { }
+function show<T>(T $x): void {}
 
 async function gen_int(): Awaitable<int> {
   return 42;
@@ -20,15 +20,10 @@ async function test(): Awaitable<void> {
     'foo' => gen_int(),
     'bar' => array(
       'baz' => gen_int(),
-      'quux' => array(
-        'innermost' => gen_int(),
-      ),
+      'quux' => array('innermost' => gen_int()),
     ),
-    'something else' => array(
-      'one last thing' => gen_int(),
-    ),
+    'something else' => array('one last thing' => gen_int()),
   );
 
   await gen_array_rec($a);
-  return null;
 }

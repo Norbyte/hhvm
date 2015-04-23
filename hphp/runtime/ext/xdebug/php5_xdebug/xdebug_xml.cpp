@@ -20,7 +20,7 @@
 #include "hphp/runtime/ext/xdebug/php5_xdebug/xdebug_mm.h"
 #include "hphp/runtime/ext/xdebug/php5_xdebug/xdebug_str.h"
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/type-string.h"
 #include "hphp/runtime/base/zend-string.h"
 
@@ -31,7 +31,7 @@ namespace HPHP {
 ////////////////////////////////////////////////////////////////////////////////
 
 // Xml encode the passed string
-String xdebug_xmlize(char *string, int len) {
+String xdebug_xmlize(const char* string, size_t len) {
   String str(string, CopyString);
   if (len) {
     str = string_replace(str, "&","&amp;");
@@ -113,8 +113,8 @@ void xdebug_xml_return_node(xdebug_xml_node* node, struct xdebug_str *output) {
   }
 }
 
-xdebug_xml_node *xdebug_xml_node_init_ex(char *tag, int free_tag) {
-  xdebug_xml_node *xml = (xdebug_xml_node*) xdmalloc(sizeof (xdebug_xml_node));
+xdebug_xml_node* xdebug_xml_node_init_ex(char* tag, int free_tag) {
+  auto xml = (xdebug_xml_node*)xdmalloc(sizeof(xdebug_xml_node));
 
   xml->tag = tag;
   xml->text = nullptr;
@@ -168,8 +168,13 @@ static void xdebug_xml_text_node_dtor(xdebug_xml_text_node* node) {
   xdfree(node);
 }
 
-void xdebug_xml_add_text(xdebug_xml_node *xml, char *text, int free /* = 1*/) {
-  xdebug_xml_add_text_ex(xml, text, strlen(text), free, 0);
+void xdebug_xml_add_text(
+  xdebug_xml_node *xml,
+  const char *text,
+  int free /* = 1*/
+) {
+  // Safe as we'll onlyr read the string from the XML node, not write/free it.
+  xdebug_xml_add_text_ex(xml, const_cast<char*>(text), strlen(text), free, 0);
 }
 
 void xdebug_xml_add_text_encode(xdebug_xml_node *xml, char *text) {

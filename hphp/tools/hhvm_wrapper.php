@@ -38,6 +38,7 @@ function my_option_map(): OptionInfoMap {
                             'Do not use the default wrapper runtime options'},
 'build-root:'     => Pair { '',
                             'Override the default directory for hhvm and hphp'},
+'perf:'           => Pair { '', 'Run perf record'},
   };
 }
 
@@ -89,6 +90,7 @@ function determine_flags(OptionMap $opts): string {
       '-v Eval.JitEnableRenameFunction=0 '.
       '-v Eval.GdbSyncChunks=1 '.
       '-v Eval.AllowHhas=true '.
+      '-v Eval.CheckReturnTypeHints=2 '.
       '';
   }
 
@@ -103,9 +105,26 @@ function determine_flags(OptionMap $opts): string {
   }
 
   if ($opts->containsKey('region-mode')) {
-    $flags .=
-      '-v Eval.JitRegionSelector='.((string)$opts['region-mode']).' '.
-      '';
+    if ($opts['region-mode'] == 'method') {
+      $flags .=
+        '-v Eval.JitLoops=1 '.
+        '-v Eval.JitPGO=0 '.
+        '';
+      if (!$opts->containsKey('compile')) {
+        echo 'Reminder: running region-mode=method without --compile is '.
+             "almost never going to work...\n";
+      }
+    }
+    if ($opts['region-mode'] == 'wholecfg') {
+      $flags .=
+        '-v Eval.JitPGORegionSelector='.((string)$opts['region-mode']).' '.
+        '-v Eval.JitLoops=1 '.
+        '';
+    } else {
+      $flags .=
+        '-v Eval.JitRegionSelector='.((string)$opts['region-mode']).' '.
+        '';
+    }
   }
 
   $simple_args = Map {
@@ -247,6 +266,9 @@ function run_hhvm(OptionMap $opts): void {
 
   $pfx = determine_env($opts);
   $pfx .= $opts->containsKey('gdb') ? 'gdb --args ' : '';
+  if ($opts->containsKey('perf')) {
+    $pfx .= 'perf record -g -o ' . $opts['perf'] . ' ';
+  }
   $hhvm = get_paths($opts)['hhvm'];
   $cmd = "$pfx $hhvm $flags ".argv_for_shell();
   if ($opts->containsKey('print-command')) {

@@ -13,15 +13,17 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #include "hphp/runtime/debugger/cmd/cmd_list.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "hphp/runtime/debugger/cmd/cmd_info.h"
 #include "hphp/runtime/base/file.h"
-#include "hphp/runtime/ext/ext_file.h"
+#include "hphp/runtime/debugger/cmd/cmd_info.h"
+#include "hphp/runtime/debugger/debugger_client.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 
 namespace HPHP { namespace Eval {
 ///////////////////////////////////////////////////////////////////////////////
@@ -342,7 +344,7 @@ void CmdList::onClient(DebuggerClient &client) {
 bool CmdList::onServer(DebuggerProxy &proxy) {
   auto savedWarningFrequency = RuntimeOption::WarningFrequency;
   RuntimeOption::WarningFrequency = 0;
-  m_code = f_file_get_contents(m_file.c_str());
+  m_code = HHVM_FN(file_get_contents)(m_file.c_str());
   if (!proxy.isLocal() && !m_code.toBoolean() && m_file[0] != '/') {
     DSandboxInfo info = proxy.getSandbox();
     if (info.m_path.empty()) {
@@ -350,7 +352,7 @@ bool CmdList::onServer(DebuggerProxy &proxy) {
                     info.desc().c_str());
     } else {
       std::string full_path = info.m_path + m_file;
-      m_code = f_file_get_contents(full_path.c_str());
+      m_code = HHVM_FN(file_get_contents)(full_path.c_str());
     }
   }
   RuntimeOption::WarningFrequency = savedWarningFrequency;

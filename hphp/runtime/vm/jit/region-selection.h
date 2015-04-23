@@ -22,9 +22,11 @@
 
 #include <boost/container/flat_map.hpp>
 
-#include "folly/Format.h"
+#include <folly/Format.h>
+#include <folly/Optional.h>
 
 #include "hphp/runtime/vm/jit/containers.h"
+#include "hphp/runtime/vm/jit/stack-offsets.h"
 #include "hphp/runtime/vm/jit/type.h"
 #include "hphp/runtime/vm/jit/types.h"
 #include "hphp/runtime/vm/func.h"
@@ -56,7 +58,7 @@ struct RegionDesc {
   struct TypePred;
   struct ReffinessPred;
   typedef std::shared_ptr<Block> BlockPtr;
-  typedef int32_t BlockId;
+  typedef TransID BlockId;
   // BlockId Encoding:
   //   - Non-negative numbers are blocks that correspond
   //     to the start of a TransProfile translation, and therefore can
@@ -65,6 +67,7 @@ struct RegionDesc {
   //     to blocks created by inlining and which don't correspond to
   //     the beginning of a profiling translation.
   typedef boost::container::flat_set<BlockId> BlockIdSet;
+  typedef std::vector<BlockId>  BlockIdVec;
   typedef std::vector<BlockPtr> BlockVec;
 
   bool              empty() const;
@@ -76,14 +79,33 @@ struct RegionDesc {
   const BlockIdSet& preds(BlockId bid) const;
   const BlockIdSet& sideExitingBlocks() const;
   bool              isExit(BlockId bid) const;
-  Block*            addBlock(SrcKey sk, int length, Offset spOffset);
+
+  /*
+   * Returns the last BC offset in the region that corresponds to the
+   * function where the region starts.  This will normally be the offset
+   * of the last instruction in the last block, except if the function
+   * ends with an inlined call.  In this case, the offset of the
+   * corresponding FCall* in the function that starts the region is
+   * returned.
+   *
+   * Note that the notion of "last BC offset" only makes sense for
+   * regions that are linear traces.
+   */
+  SrcKey            lastSrcKey() const;
+
+  Block*            addBlock(SrcKey sk, int length, FPAbsOffset spOffset,
+                             uint16_t inlineLevel);
   void              deleteBlock(BlockId bid);
   void              renumberBlock(BlockId oldId, BlockId newId);
   void              addArc(BlockId src, BlockId dst);
   void              setSideExitingBlock(BlockId bid);
   bool              isSideExitingBlock(BlockId bid) const;
+  folly::Optional<BlockId> nextRetrans(BlockId id) const;
+  void              setNextRetrans(BlockId id, BlockId next);
   void              append(const RegionDesc&  other);
   void              prepend(const RegionDesc& other);
+  void              chainRetransBlocks();
+  uint32_t          instrSize() const;
   std::string       toString() const;
 
   template<class Work>
@@ -91,9 +113,10 @@ struct RegionDesc {
 
  private:
   struct BlockData {
-    BlockPtr   block;
-    BlockIdSet preds;
-    BlockIdSet succs;
+    BlockPtr                 block;
+    BlockIdSet               preds;
+    BlockIdSet               succs;
+    folly::Optional<BlockId> nextRetrans;
     explicit BlockData(BlockPtr b = nullptr) : block(b) {}
   };
 
@@ -102,6 +125,10 @@ struct RegionDesc {
   void       copyBlocksFrom(const RegionDesc& other,
                             BlockVec::iterator where);
   void       copyArcsFrom(const RegionDesc& other);
+  void       sortBlocks();
+  void       postOrderSort(RegionDesc::BlockId     bid,
+                           RegionDesc::BlockIdSet& visited,
+                           RegionDesc::BlockIdVec& outVec);
 
   std::vector<BlockPtr>             m_blocks;
   hphp_hash_map<BlockId, BlockData> m_data;
@@ -131,8 +158,7 @@ struct RegionDesc::Location {
   };
   struct Local { uint32_t locId;  };
   struct Stack {
-    uint32_t offset;   // offset from SP
-    uint32_t fpOffset; // offset from FP
+    FPAbsOffset offsetFromFP;
   };
 
   /* implicit */ Location(Local l) : m_tag{Tag::Local}, m_local(l) {}
@@ -141,25 +167,26 @@ struct RegionDesc::Location {
   Tag tag() const { return m_tag; };
 
   uint32_t localId() const {
-    assert(m_tag == Tag::Local);
+    assertx(m_tag == Tag::Local);
     return m_local.locId;
   }
 
-  uint32_t stackOffset() const {
-    assert(m_tag == Tag::Stack);
-    return m_stack.offset;
-  }
-
-  uint32_t stackOffsetFromFp() const {
-    assert(m_tag == Tag::Stack);
-    return m_stack.fpOffset;
+  FPAbsOffset offsetFromFP() const {
+    assertx(m_tag == Tag::Stack);
+    return m_stack.offsetFromFP;
   }
 
   bool operator==(const Location& other) const {
-    return (m_tag == other.m_tag) &&
-      ((m_tag == Tag::Local && localId() == other.localId()) ||
-       (m_tag == Tag::Stack &&
-        stackOffsetFromFp() == other.stackOffsetFromFp()));
+    if (m_tag != other.m_tag) return false;
+
+    switch (m_tag) {
+    case Tag::Local:
+      return localId() == other.localId();
+    case Tag::Stack:
+      return offsetFromFP() == other.offsetFromFP();
+    }
+    not_reached();
+    return false;
   }
 
   bool operator!=(const Location& other) const {
@@ -167,8 +194,16 @@ struct RegionDesc::Location {
   }
 
   bool operator<(const Location& other) const {
-    return m_tag < other.m_tag ||
-      (m_tag == other.m_tag && m_local.locId < other.m_local.locId);
+    if (m_tag < other.m_tag) return true;
+    if (m_tag > other.m_tag) return false;
+    switch (m_tag) {
+    case Tag::Local:
+      return localId() < other.localId();
+    case Tag::Stack:
+      return offsetFromFP() < other.offsetFromFP();
+    }
+    not_reached();
+    return false;
   }
 
 private:
@@ -231,14 +266,14 @@ inline bool operator==(const RegionDesc::ReffinessPred& a,
  * at various execution points, including at entry to the block.
  */
 class RegionDesc::Block {
+ public:
   typedef boost::container::flat_multimap<SrcKey, TypePred> TypePredMap;
   typedef boost::container::flat_map<SrcKey, bool> ParamByRefMap;
   typedef boost::container::flat_multimap<SrcKey, ReffinessPred> RefPredMap;
   typedef boost::container::flat_map<SrcKey, const Func*> KnownFuncMap;
 
-public:
   explicit Block(const Func* func, bool resumed, Offset start, int length,
-                 Offset initSpOff);
+                 FPAbsOffset initSpOff, uint16_t inlineLevel);
 
   Block& operator=(const Block&) = delete;
 
@@ -256,11 +291,13 @@ public:
   int         length()            const { return m_length; }
   bool        empty()             const { return length() == 0; }
   bool        contains(SrcKey sk) const;
-  Offset      initialSpOffset()   const { return m_initialSpOffset; }
+  FPAbsOffset initialSpOffset()   const { return m_initialSpOffset; }
+  uint16_t    inlineLevel()       const { return m_inlineLevel; }
 
   void setId(BlockId id) {
     m_id = id;
   }
+  void setInitialSpOffset(FPAbsOffset sp) { m_initialSpOffset = sp; }
 
   /*
    * Set and get whether or not this block ends with an inlined FCall. Inlined
@@ -268,7 +305,7 @@ public:
    * one or more blocks from the callee.
    */
   void setInlinedCallee(const Func* callee) {
-    assert(callee);
+    assertx(callee);
     m_inlinedCallee = callee;
   }
   const Func* inlinedCallee() const {
@@ -340,9 +377,9 @@ private:
   const Offset   m_start;
   Offset         m_last;
   int            m_length;
-  Offset         m_initialSpOffset;
+  FPAbsOffset    m_initialSpOffset;
   const Func*    m_inlinedCallee;
-
+  uint16_t       m_inlineLevel; // 0 means the outer-most function
   TypePredMap    m_typePreds;
   ParamByRefMap  m_byRefs;
   RefPredMap     m_refPreds;
@@ -366,7 +403,7 @@ struct RegionContext {
 
   const Func* func;
   Offset bcOffset;
-  Offset spOffset;
+  FPAbsOffset spOffset;
   bool resumed;
   jit::vector<LiveType> liveTypes;
   jit::vector<PreLiveAR> preLiveARs;
@@ -387,7 +424,7 @@ struct RegionContext::LiveType {
  * objOrClass.
  */
 struct RegionContext::PreLiveAR {
-  uint32_t    stackOff;
+  int32_t stackOff;
   const Func* func;
   Type        objOrCls;
 };

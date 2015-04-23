@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_EXT_REFLECTION_H_
 #define incl_HPHP_EXT_REFLECTION_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/vm/native-data.h"
 
 namespace HPHP {
@@ -94,6 +94,12 @@ class ReflectionClassHandle {
     return *this;
   }
   ~ReflectionClassHandle() {}
+  String init(const String& name) {
+    auto const cls = Unit::loadClass(name.get());
+    if (!cls) return empty_string();
+    setClass(cls);
+    return cls->nameStr();
+  }
 
   static ReflectionClassHandle* Get(ObjectData* obj) {
     return Native::data<ReflectionClassHandle>(obj);
@@ -103,15 +109,55 @@ class ReflectionClassHandle {
     return Native::data<ReflectionClassHandle>(obj)->getClass();
   }
 
-  const Class* getClass() { return m_cls; }
+  const Class* getClass() const { return m_cls; }
   void setClass(const Class* cls) {
     assert(cls != nullptr);
     assert(m_cls == nullptr);
     m_cls = cls;
   }
 
+  Variant sleep() const {
+    return String(getClass()->nameStr());
+  }
+
+  void wakeup(const Variant& content, ObjectData* obj);
+
  private:
   const Class* m_cls{nullptr};
+};
+
+/* A ReflectionConstHandle is a NativeData object wrapping a Const*
+ * for the purposes of ReflectionTypeConstant. */
+extern const StaticString s_ReflectionConstHandle;
+class ReflectionConstHandle {
+ public:
+  ReflectionConstHandle(): m_const(nullptr) {}
+  explicit ReflectionConstHandle(const Class::Const* cst): m_const(cst) {};
+  ReflectionConstHandle(const ReflectionConstHandle&) = delete;
+  ReflectionConstHandle& operator=(const ReflectionConstHandle& other) {
+    m_const = other.m_const;
+    return *this;
+  }
+  ~ReflectionConstHandle() {}
+
+  static ReflectionConstHandle* Get(ObjectData* obj) {
+    return Native::data<ReflectionConstHandle>(obj);
+  }
+
+  static const Class::Const* GetConstFor(ObjectData* obj) {
+    return Native::data<ReflectionConstHandle>(obj)->getConst();
+  }
+
+  const Class::Const* getConst() { return m_const; }
+
+  void setConst(const Class::Const* cst) {
+    assert(cst != nullptr);
+    assert(m_const == nullptr);
+    m_const = cst;
+  }
+
+ private:
+  const Class::Const* m_const{nullptr};
 };
 
 namespace DebuggerReflection {

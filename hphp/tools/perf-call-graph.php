@@ -1,6 +1,5 @@
 #!/usr/local/bin/php -j
 <?php
-// Copyright 2004-present Facebook. All Rights Reserved.
 
 # If $func looks like a mangled C++ symbol, attempt to demangle it, stripping
 # off any trailing junk first.
@@ -124,6 +123,7 @@ EOT;
 }
 
 function main($argv) {
+  ini_set('memory_limit', '64G');
   if (posix_isatty(STDIN)) {
     usage($argv[0]);
     return 1;

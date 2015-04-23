@@ -41,7 +41,7 @@ let remove_function_arg_visit toks parsed_line (k, _) meth =
     match parsed_line.arg with
     | Argument arg ->
       (* Find the arg'th parameter. The f_params list contains other tokens, so
-       * we need to count the occurances of Left3, which represents an actual
+       * we need to count the occurrences of Left3, which represents an actual
        * argument definition. *)
       let (_, params, _) = meth.A.f_params in
       let rec find n = function
@@ -61,7 +61,7 @@ let remove_function_arg_visit toks parsed_line (k, _) meth =
       | None, _ ->
         (* This is the only place we want to raise Already_mutated -- everywhere
          * else should be impossible, i.e., it indicates that the log message
-         * refers to a function or paramter which doesn't exist at all. Here,
+         * refers to a function or parameter which doesn't exist at all. Here,
          * the parameter exists, we just don't have a soft typehint marker
          * there. Notably, we should never have a typehint marker without a soft
          * typehint marker or vice versa, so raising Impossible below is
@@ -146,7 +146,7 @@ let remove_member_function_visitor toks class_ parsed_line =
 
 (* it's ~20% faster to compute the regexp only once *)
 let re1 = Str.regexp ".*Argument \\([0-9]+\\) \\(passed \\)?to \\(.+::\\)?\\(.+\\)() must be of type [@?].+, .+ given (?in \\([^ ]+\\) on line [0-9]+)?"
-let re2 = Str.regexp ".*Value returned from \\(.+::\\)?\\(.+\\)() must be of type @.+, .+ given (?in \\(.+\\) on line [0-9]+)?"
+let re2 = Str.regexp ".*Value returned from\\( async\\)? \\(function\\|method\\) \\(.+::\\)?\\(.+\\)() must be of type @.+, .+ given (?in \\(.+\\) on line [0-9]+)?"
 
 (**
  * Parses both, argument and return type failures.
@@ -167,9 +167,9 @@ let parse_logline tbl line =
   else if Str.string_match re2 line 0
   then begin
     let fn, func, class_opt =
-      Str.matched_group 3 line,
-      Str.matched_group 2 line,
-      (try Some (Str.matched_group 1 line) with Not_found -> None)
+      Str.matched_group 5 line,
+      Str.matched_group 4 line,
+      (try Some (Str.matched_group 3 line) with Not_found -> None)
     in
     Some {file_name=fn; func=func; cl=class_opt; arg=Return}
   end

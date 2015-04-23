@@ -36,18 +36,18 @@ static_assert(
 inline MemoryManager& MM() { return *MemoryManager::TlsWrapper::getNoCheck(); }
 
 template<class T, class... Args> T* smart_new(Args&&... args) {
-  auto const mem = MM().smartMallocSize(sizeof(T));
+  auto const mem = smart_malloc(sizeof(T));
   try {
     return new (mem) T(std::forward<Args>(args)...);
   } catch (...) {
-    MM().smartFreeSize(mem, sizeof(T));
+    smart_free(mem);
     throw;
   }
 }
 
 template<class T> void smart_delete(T* t) {
   t->~T();
-  MM().smartFreeSize(t, sizeof *t);
+  smart_free(t);
 }
 
 template<class T> T* smart_new_array(size_t count) {
@@ -109,25 +109,49 @@ private:
   MemoryManager& m_mm;
 };
 
+struct MemoryManager::SuppressOOM {
+  explicit SuppressOOM(MemoryManager& mm)
+      : m_mm(mm)
+      , m_savedCouldOOM(mm.m_couldOOM) {
+    FTRACE(1, "SuppressOOM() [couldOOM was {}]\n", m_savedCouldOOM);
+    m_mm.m_couldOOM = false;
+  }
+
+  ~SuppressOOM() {
+    FTRACE(1, "~SuppressOOM() [couldOOM is {}]\n", m_savedCouldOOM);
+    m_mm.m_couldOOM = m_savedCouldOOM;
+  }
+
+  SuppressOOM(const SuppressOOM&) = delete;
+  SuppressOOM& operator=(const SuppressOOM&) = delete;
+
+private:
+  MemoryManager& m_mm;
+  bool m_savedCouldOOM;
+};
+
 //////////////////////////////////////////////////////////////////////
 
-struct MemoryManager::SmallNode {
-  size_t padbytes;  // <= kMaxSmartSize means small block
-};
-
-struct MemoryManager::FreeList::Node {
-  Node* next;
-};
+inline int operator<<(HeaderKind k, int bits) {
+  return int(k) << bits;
+}
 
 inline void* MemoryManager::FreeList::maybePop() {
   auto ret = head;
   if (LIKELY(ret != nullptr)) head = ret->next;
+  FTRACE(4, "FreeList::maybePop(): returning {}\n", ret);
   return ret;
 }
 
-inline void MemoryManager::FreeList::push(void* val) {
-  auto const node = static_cast<Node*>(val);
+inline void MemoryManager::FreeList::push(void* val, size_t size) {
+  FTRACE(4, "FreeList::push({}, {}), prev head = {}\n", val, size, head);
+  auto constexpr kMaxFreeSize = std::numeric_limits<uint32_t>::max();
+  static_assert(kMaxSmartSize <= kMaxFreeSize, "");
+  assert(size > 0 && size <= kMaxFreeSize);
+  auto const node = static_cast<FreeNode*>(val);
   node->next = head;
+  // The extra store to initialize a free header here is expensive.
+  // Instead, initFree() initializes all free headers just before iterating
   head = node;
 }
 
@@ -238,12 +262,13 @@ inline void* MemoryManager::smartMallocSize(uint32_t bytes) {
   unsigned i = smartSize2Index(bytes);
   void* p = m_freelists[i].maybePop();
   if (UNLIKELY(p == nullptr)) {
-    p = slabAlloc(debugAddExtra(MemoryManager::smartSizeClass(bytes)), i);
+    p = slabAlloc(bytes, i);
+    p = ((char*)p + kDebugExtraSize);
   }
+  p = ((char*)p - kDebugExtraSize);
   assert((reinterpret_cast<uintptr_t>(p) & kSmartSizeAlignMask) == 0);
-
   FTRACE(3, "smartMallocSize: {} -> {}\n", bytes, p);
-  return debugPostAllocate(p, bytes, bytes);
+  return debugPostAllocate(p, bytes, debug ? smartSizeClass(bytes) : bytes);
 }
 
 inline void MemoryManager::smartFreeSize(void* ptr, uint32_t bytes) {
@@ -251,30 +276,16 @@ inline void MemoryManager::smartFreeSize(void* ptr, uint32_t bytes) {
   assert(bytes <= kMaxSmartSize + kDebugExtraSize);
   assert((reinterpret_cast<uintptr_t>(ptr) & kSmartSizeAlignMask) == 0);
 
+  if (UNLIKELY(m_bypassSlabAlloc)) {
+    return smartFreeSizeBig(ptr, bytes);
+  }
   unsigned i = smartSize2Index(bytes);
-  m_freelists[i].push(debugPreFree(ptr, bytes, bytes));
+  FTRACE(3, "smartFreeSize({}, {}), freelist {}\n", ptr, bytes, i);
+  debugPreFree(ptr, bytes, bytes);
+  m_freelists[i].push(ptr, bytes);
   m_stats.usage -= bytes;
 
   FTRACE(3, "smartFreeSize: {} ({} bytes)\n", ptr, bytes);
-}
-
-template<bool callerSavesActualSize>
-ALWAYS_INLINE
-std::pair<void*,size_t> MemoryManager::smartMallocSizeBig(size_t bytes) {
-#ifdef USE_JEMALLOC
-  void* ptr;
-  size_t sz;
-  auto const retptr =
-    smartMallocSizeBigHelper<callerSavesActualSize>(ptr, sz, bytes);
-  FTRACE(3, "smartMallocBig: {} ({} requested, {} usable)\n",
-         retptr, bytes, sz);
-  return std::make_pair(retptr, sz);
-#else
-  m_stats.usage += bytes;
-  auto const ret = smartMallocBig(debugAddExtra(bytes));
-  FTRACE(3, "smartMallocBig: {} ({} bytes)\n", ret, bytes);
-  return std::make_pair(debugPostAllocate(ret, bytes, bytes), bytes);
-#endif
 }
 
 ALWAYS_INLINE
@@ -282,9 +293,9 @@ void MemoryManager::smartFreeSizeBig(void* vp, size_t bytes) {
   m_stats.usage -= bytes;
   // Since we account for these direct allocations in our usage and adjust for
   // them on allocation, we also need to adjust for them negatively on free.
-  JEMALLOC_STATS_ADJUST(&m_stats, -bytes);
-  FTRACE(3, "smartFreeBig: {} ({} bytes)\n", vp, bytes);
-  smartFreeBig(static_cast<SweepNode*>(debugPreFree(vp, bytes, 0)) - 1);
+  m_stats.borrow(-bytes);
+  FTRACE(3, "smartFreeSizeBig: {} ({} bytes)\n", vp, bytes);
+  m_heap.freeBig(debugPreFree(vp, bytes, 0));
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -292,7 +303,7 @@ void MemoryManager::smartFreeSizeBig(void* vp, size_t bytes) {
 ALWAYS_INLINE
 void* MemoryManager::objMalloc(size_t size) {
   if (LIKELY(size <= kMaxSmartSize)) return smartMallocSize(size);
-  return smartMallocSizeBig<false>(size).first;
+  return smartMallocSizeBig<false>(size).ptr;
 }
 
 ALWAYS_INLINE
@@ -311,24 +322,16 @@ void* MemoryManager::smartMallocSizeLogged(uint32_t size) {
 }
 
 ALWAYS_INLINE
-void* MemoryManager::smartMallocSizeLoggedTracked(uint32_t size) {
-  auto const retptr = smartMallocSize(size);
-  if (memory_profiling) { logAllocation(retptr, size); }
-  return track(retptr);
-}
-
-ALWAYS_INLINE
 void MemoryManager::smartFreeSizeLogged(void* p, uint32_t size) {
   if (memory_profiling) { logDeallocation(p); }
   smartFreeSize(p, size);
 }
 
-template<bool callerSavesActualSize>
-ALWAYS_INLINE
-std::pair<void*,size_t> MemoryManager::smartMallocSizeBigLogged(size_t size) {
-  auto const retptr = smartMallocSizeBig<callerSavesActualSize>(size);
-  if (memory_profiling) { logAllocation(retptr.first, size); }
-  return retptr;
+template<bool callerSavesActualSize> ALWAYS_INLINE
+MemBlock MemoryManager::smartMallocSizeBigLogged(size_t size) {
+  auto const block = smartMallocSizeBig<callerSavesActualSize>(size);
+  if (memory_profiling) { logAllocation(block.ptr, size); }
+  return block;
 }
 
 ALWAYS_INLINE
@@ -348,22 +351,6 @@ ALWAYS_INLINE
 void MemoryManager::objFreeLogged(void* vp, size_t size) {
   if (memory_profiling) { logDeallocation(vp); }
   objFree(vp, size);
-}
-
-ALWAYS_INLINE
-void* MemoryManager::track(void* p) {
-  if (UNLIKELY(m_trackingInstances)) {
-    return trackSlow(p);
-  }
-  return p;
-}
-
-ALWAYS_INLINE
-void* MemoryManager::untrack(void* p) {
-  if (UNLIKELY(m_trackingInstances)) {
-    return untrackSlow(p);
-  }
-  return p;
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -439,19 +426,73 @@ inline void MemoryManager::resetExternalStats() { resetStatsImpl(false); }
 
 //////////////////////////////////////////////////////////////////////
 
-ALWAYS_INLINE
-void MemoryManager::setObjectTracking(bool val) {
-  if (val) {
-    m_instances.clear();
+inline bool MemoryManager::contains(void *p) const {
+  return m_heap.contains(p);
+}
+
+inline bool MemoryManager::checkContains(void* p) const {
+  // Be conservative if the smart allocator is disabled.
+  assert(RuntimeOption::DisableSmartAllocator || contains(p));
+  return true;
+}
+
+//////////////////////////////////////////////////////////////////////
+
+template <typename T>
+MemoryManager::RootId MemoryManager::addRoot(SmartPtr<T>&& ptr) {
+  assert(ptr);
+  const RootId token = ptr->getId();
+  getRootMap<T>().emplace(token, std::move(ptr));
+  return token;
+}
+
+template <typename T>
+MemoryManager::RootId MemoryManager::addRoot(const SmartPtr<T>& ptr) {
+  assert(ptr);
+  const RootId token = ptr->getId();
+  getRootMap<T>()[token] = ptr;
+  return token;
+}
+
+template <typename T>
+SmartPtr<T> MemoryManager::lookupRoot(RootId token) const {
+  auto& handleMap = getRootMap<T>();
+  auto itr = handleMap.find(token);
+  return itr != handleMap.end() ? unsafe_cast_or_null<T>(itr->second) : nullptr;
+}
+
+template <typename T>
+SmartPtr<T> MemoryManager::removeRoot(RootId token) {
+  auto& handleMap = getRootMap<T>();
+  auto itr = handleMap.find(token);
+  if(itr != handleMap.end()) {
+    auto ptr = std::move(itr->second);
+    handleMap.erase(itr);
+    return unsafe_cast_or_null<T>(ptr);
   }
-  m_trackingInstances = val;
+  return nullptr;
 }
 
-ALWAYS_INLINE
-bool MemoryManager::getObjectTracking() {
-  return m_trackingInstances;
+template <typename T>
+bool MemoryManager::removeRoot(const SmartPtr<T>& ptr) {
+  return (bool)removeRoot<T>(ptr->getId());
 }
 
+template <typename F>
+void MemoryManager::scanRootMaps(F& m) const {
+  if (m_objectRoots) {
+    for(const auto& root : *m_objectRoots) {
+      scan(root.second, m);
+    }
+  }
+  if (m_resourceRoots) {
+    for(const auto& root : *m_resourceRoots) {
+      scan(root.second, m);
+    }
+  }
+}
+
+//////////////////////////////////////////////////////////////////////
 
 }
 

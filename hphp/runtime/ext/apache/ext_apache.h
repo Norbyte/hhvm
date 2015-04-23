@@ -18,12 +18,12 @@
 #ifndef incl_HPHP_EXT_APACHE_H_
 #define incl_HPHP_EXT_APACHE_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/util/health-monitor-types.h"
 
 namespace HPHP {
 
-class ApacheExtension : public Extension {
+class ApacheExtension final : public Extension {
  public:
   ApacheExtension();
   virtual ~ApacheExtension();

@@ -22,6 +22,7 @@
 #include "hphp/zend/zend-string.h"
 #include "hphp/zend/zend-html.h"
 #include "hphp/util/string-vsnprintf.h"
+#include "hphp/parser/parse-time-fatal-exception.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -153,15 +154,6 @@ Scanner::~Scanner() {
   }
 }
 
-void Scanner::setHashBang(const char *rawText, int rawLeng, int type) {
-  if (m_type & ReturnAllTokens) {
-    setToken(rawText, rawLeng);
-  } else {
-    m_token->setText("", 0);
-    incLoc(rawText, rawLeng, type);
-  }
-}
-
 // scanToken() will always get a new token from the frontier
 // regardless of whether there are tokens in the lookahead store
 int Scanner::scanToken(ScannerToken &t, Location &l) {
@@ -244,9 +236,11 @@ bool Scanner::tryParseTypeList(TokenStore::iterator& pos) {
       nextLookahead(pos);
     }
     if (!tryParseNSType(pos)) return false;
-    if (pos->t == T_AS) {
+    if (pos->t == T_AS || pos->t == T_SUPER) {
       nextLookahead(pos);
-      if (!tryParseNSType(pos)) return false;
+      if (!tryParseNSType(pos)) {
+        return false;
+      }
     }
     if (pos->t != ',') return true;
     nextLookahead(pos);
@@ -255,6 +249,7 @@ bool Scanner::tryParseTypeList(TokenStore::iterator& pos) {
 
 bool Scanner::tryParseNonEmptyLambdaParams(TokenStore::iterator& pos) {
   for (;; nextLookahead(pos)) {
+    if (pos->t == ')' || pos->t == T_LAMBDA_CP) return true;
     if (pos->t != T_VARIABLE) {
       if (pos->t == T_ELLIPSIS) {
         nextLookahead(pos);
@@ -353,8 +348,6 @@ void Scanner::parseApproxParamDefVal(TokenStore::iterator& pos) {
       case T_NAMESPACE:
       case T_SHAPE:
       case T_ARRAY:
-      case T_MIARRAY:
-      case T_MSARRAY:
       case T_FUNCTION:
       case T_DOUBLE_ARROW:
       case T_DOUBLE_COLON:
@@ -427,12 +420,16 @@ Scanner::tryParseNSType(TokenStore::iterator& pos) {
   for (;;) {
     switch (pos->t) {
       case T_STRING:
+      case T_SUPER:
       case T_XHP_ATTRIBUTE:
       case T_XHP_CATEGORY:
       case T_XHP_CHILDREN:
       case T_XHP_REQUIRED:
       case T_ENUM:
       case T_ARRAY:
+      case T_CALLABLE:
+      case T_UNRESOLVED_TYPE:
+      case T_UNRESOLVED_NEWTYPE:
         nextLookahead(pos);
         break;
       case T_SHAPE:
@@ -458,7 +455,7 @@ Scanner::tryParseNSType(TokenStore::iterator& pos) {
       nextLookahead(pos);
       return true;
     }
-    if (pos->t != T_NS_SEPARATOR) {
+    if (pos->t != T_NS_SEPARATOR && pos->t != T_DOUBLE_COLON) {
       return true;
     }
     nextLookahead(pos);
@@ -730,10 +727,11 @@ std::string Scanner::escape(const char *str, int len, char quote_type) const {
             case '\\': output += '\\'; break;
             case '$':  output += '$';  break;
             case '"':
+            case '`':
               if (str[i] != quote_type) {
                 output += '\\';
               }
-              output += '"';
+              output += str[i];
               break;
             case 'x':
             case 'X': {
@@ -748,6 +746,70 @@ std::string Scanner::escape(const char *str, int len, char quote_type) const {
                 output += ch;
                 output += str[i];
               }
+              break;
+            }
+            case 'u': {
+              // Unicode escape sequence
+              //   "\u{123456}"
+              if (str[i+1] != '{') {
+                // BC for "\u1234" passthrough
+                output += ch;
+                output += str[i];
+                break;
+              }
+
+              bool valid = true;
+              auto start = str + i + 2;
+              auto closebrace = strchr(start, '}');
+              if (closebrace > start) {
+                for (auto p = start; p < closebrace; ++p) {
+                  if (!isxdigit(*p)) {
+                    valid = false;
+                    break;
+                  }
+                }
+              } else {
+                valid = false;
+              }
+
+              auto fatal = [this](const char *msg) {
+                auto loc = getLocation();
+                return ParseTimeFatalException(
+                  loc->file,
+                  loc->line0,
+                  "%s", msg);
+              };
+              if (!valid) {
+                throw fatal("Invalid UTF-8 codepoint escape sequence");
+              }
+
+              std::string codepoint(start, closebrace - start);
+              char *end = nullptr;
+              int32_t uchar = strtol(codepoint.c_str(), &end, 16);
+              if ((end && *end) || (uchar > 0x10FFFF)) {
+                throw fatal(
+                  "Invalid UTF-8 codepoint escape sequence: "
+                  "Codepoint too large");
+              }
+              if (uchar <= 0x0007F) {
+                output += (char)uchar;
+              } else if (uchar <= 0x007FF) {
+                output += (char)(0xC0 | ( uchar >> 6         ));
+                output += (char)(0x80 | ( uchar        & 0x3F));
+              } else if (uchar <= 0x00FFFF) {
+                output += (char)(0xE0 | ( uchar >> 12        ));
+                output += (char)(0x80 | ((uchar >>  6) & 0x3F));
+                output += (char)(0x80 | ( uchar        & 0x3F));
+              } else if (uchar <= 0x10FFFF) {
+                output += (char)(0xF0 | ( uchar >> 18        ));
+                output += (char)(0x80 | ((uchar >> 12) & 0x3F));
+                output += (char)(0x80 | ((uchar >>  6) & 0x3F));
+                output += (char)(0x80 | ( uchar        & 0x3F));
+              } else {
+                not_reached();
+                assert(false);
+              }
+              i += codepoint.size() + 2 /* strlen("{}") */;
               break;
             }
             default: {

@@ -20,6 +20,8 @@
 #include "hphp/util/bitops.h"
 #include "hphp/vixl/a64/assembler-a64.h"
 
+#include <folly/Optional.h>
+
 namespace HPHP { namespace jit {
 struct Vreg;
 struct Vout;
@@ -36,22 +38,21 @@ struct Vout;
 struct PhysReg {
  private:
   static constexpr auto kMaxRegs = 64;
-  static constexpr auto kSIMDOffset = 33;
-
-  // These are populated in Map's constructor, because they depend on a
-  // RuntimeOption.
-  static int kNumGP;
-  static int kNumSIMD;
+  static constexpr auto kGPOffset = 0;
+  static constexpr auto kSIMDOffset = 33; // ARM has 33 GP registers.
+  static constexpr auto kSFOffset = 63;
+  static constexpr auto kNumSF = 1;
 
  public:
   enum Type {
     GP,
     SIMD,
-    kNumTypes,  // keep last
+    SF,
   };
   explicit constexpr PhysReg() : n(-1) {}
   constexpr /* implicit */ PhysReg(Reg64 r) : n(int(r)) {}
   constexpr /* implicit */ PhysReg(RegXMM r) : n(int(r) + kSIMDOffset) {}
+  constexpr /* implicit */ PhysReg(RegSF r) : n(int(r) + kSFOffset) {}
   explicit constexpr PhysReg(Reg32 r) : n(int(r)) {}
   explicit constexpr PhysReg(Reg8 r) : n(int(r)) {}
 
@@ -60,12 +61,16 @@ struct PhysReg {
     : n(r.code() + kSIMDOffset) {}
 
   /* implicit */ operator Reg64() const {
-    assert(isGP() || n == -1);
+    assertx(isGP() || n == -1);
     return Reg64(n);
   }
   /* implicit */ operator RegXMM() const {
-    assert(isSIMD() || n == -1);
+    assertx(isSIMD() || n == -1);
     return RegXMM(n - kSIMDOffset);
+  }
+  /* implicit */ operator RegSF() const {
+    assertx(isSF() || n == -1);
+    return RegSF(n - kSFOffset);
   }
 
   /* implicit */ operator vixl::CPURegister() const {
@@ -75,19 +80,25 @@ struct PhysReg {
       if (isGP()) {
         return vixl::CPURegister(n, vixl::kXRegSize,
                                  vixl::CPURegister::kRegister);
-      } else {
+      } else if (isSIMD()) {
         return vixl::CPURegister(n - kSIMDOffset, vixl::kDRegSize,
                                  vixl::CPURegister::kFPRegister);
+      } else {
+        assertx(isSF());
+        return vixl::NoCPUReg;
       }
     }
   }
 
   Type type() const {
-    assert(n >= 0 && n < kMaxRegs);
-    return n < kSIMDOffset ? GP : SIMD;
+    assertx(n >= 0 && n < kMaxRegs);
+    return isGP() ? GP :
+           isSIMD() ? SIMD :
+           /* isSF() ? */ SF;
   }
-  bool isGP () const { return n >= 0 && n < kSIMDOffset; }
-  bool isSIMD() const { return n >= kSIMDOffset && n < kMaxRegs; }
+  bool isGP() const { return n >= kGPOffset && n < kGPOffset+numGP(); }
+  bool isSIMD() const { return n >= kSIMDOffset && n < kSIMDOffset+numSIMD(); }
+  bool isSF() const { return n >= kSFOffset && n < kSFOffset+kNumSF; }
   constexpr bool operator==(PhysReg r) const { return n == r.n; }
   constexpr bool operator!=(PhysReg r) const { return n != r.n; }
   constexpr bool operator==(Reg64 r) const { return Reg64(n) == r; }
@@ -96,28 +107,36 @@ struct PhysReg {
   constexpr bool operator!=(Reg32 r) const { return Reg32(n) != r; }
 
   MemoryRef operator[](intptr_t p) const {
-    assert(type() == GP);
+    assertx(type() == GP);
     return *(*this + p);
   }
   MemoryRef operator[](Reg64 i) const {
-    assert(type() == GP);
+    assertx(type() == GP);
     return *(*this + i);
   }
   MemoryRef operator[](ScaledIndex s) const {
-    assert(type() == GP);
+    assertx(type() == GP);
     return *(*this + s);
   }
   MemoryRef operator[](ScaledIndexDisp s) const {
-    assert(type() == GP);
+    assertx(type() == GP);
     return *(*this + s.si + s.disp);
   }
   MemoryRef operator[](DispReg dr) const {
-    assert(type() == GP);
+    assertx(type() == GP);
     return *(*this + ScaledIndex(dr.base, 0x1) + dr.disp);
   }
 
   static int getNumGP();
   static int getNumSIMD();
+  static int numGP() {
+    static int kNumGP = getNumGP();
+    return kNumGP;
+  }
+  static int numSIMD() {
+    static int kNumSIMD = getNumSIMD();
+    return kNumSIMD;
+  }
 
   /*
    * This struct can be used to efficiently represent a map from PhysReg to T.
@@ -131,24 +150,25 @@ struct PhysReg {
   template<typename T>
   struct Map {
     Map() : m_elms() {
-      // These are used in operator++ to determine how to iterate. They're
-      // initialized here because they depend on a RuntimeOption so they can't
-      // be inited at static init time.
-      if (kNumGP == 0 || kNumSIMD == 0) {
-        kNumGP = getNumGP();
-        kNumSIMD = getNumSIMD();
-      }
     }
 
     T& operator[](const PhysReg& r) {
-      assert(r.n != -1);
+      assertx(r.n != -1);
       return m_elms[r.n];
     }
 
     const T& operator[](const PhysReg& r) const {
-      assert(r.n != -1);
+      assertx(r.n != -1);
       return m_elms[r.n];
     }
+
+    bool operator==(const Map& other) const {
+      for (auto reg : *this) {
+        if ((*this)[reg] != other[reg]) return false;
+      }
+      return true;
+    }
+    bool operator!=(const Map& other) const { return !operator==(other); }
 
     struct iterator {
       PhysReg operator*() const {
@@ -161,9 +181,11 @@ struct PhysReg {
 
       iterator& operator++() {
         idx++;
-        if (idx == kNumGP) {
+        if (idx == kGPOffset + numGP() && idx < kSIMDOffset) {
           idx = kSIMDOffset;
-        } else if (idx == kSIMDOffset + kNumSIMD) {
+        } else if (idx == kSIMDOffset + numSIMD() && idx < kSFOffset) {
+          idx = kSFOffset;
+        } else if (idx == kSFOffset + kNumSF && idx < kMaxRegs) {
           idx = kMaxRegs;
         }
         return *this;
@@ -210,7 +232,7 @@ constexpr PhysReg InvalidReg;
  * Zero-initializing this class is guaranteed to produce an empty set.
  */
 struct RegSet {
-  explicit RegSet() : m_bits(0) {}
+  RegSet() : m_bits(0) {}
   explicit RegSet(PhysReg pr) : m_bits(uint64_t(1) << pr.n) {}
 
   // Union
@@ -223,6 +245,10 @@ struct RegSet {
   RegSet& operator|=(const RegSet& rhs) {
     m_bits |= rhs.m_bits;
     return *this;
+  }
+
+  RegSet& operator|=(PhysReg r) {
+    return add(r);
   }
 
   // Intersection
@@ -308,15 +334,23 @@ struct RegSet {
     uint64_t out;
     bool retval = ffs64(m_bits, out);
     reg = PhysReg(out);
-    assert(!retval || (reg.n >= 0 && reg.n < 64));
+    assertx(!retval || (reg.n >= 0 && reg.n < 64));
     return retval;
+  }
+
+  PhysReg findFirst() const {
+    uint64_t out;
+    if (ffs64(m_bits, out)) {
+      return PhysReg(out);
+    }
+    return InvalidReg;
   }
 
   bool findLast(PhysReg& reg) {
     uint64_t out;
     bool retval = fls64(m_bits, out);
     reg = PhysReg(out);
-    assert(!retval || (reg.n >= 0 && reg.n < 64));
+    assertx(!retval || (reg.n >= 0 && reg.n < 64));
     return retval;
   }
 
@@ -350,15 +384,15 @@ private:
   static_assert(sizeof(m_bits) * 8 >= PhysReg::kMaxRegs, "");
 };
 
-// this could be a std::pair<PhysReg> but initializing them using
-// Reg64, e.g. {rax,rdx} causes an internal error in gcc-4.7.1.
-struct RegPair {
-  RegPair() {}
-  explicit RegPair(PhysReg r) : first(r) {}
-  RegPair(PhysReg r0, PhysReg r1) : first(r0), second(r1) {}
-  PhysReg first, second;
-};
-const RegPair InvalidRegPair; // {InvalidReg,InvalidReg}
+inline RegSet operator|(PhysReg r1, PhysReg r2) {
+  return RegSet(r1).add(r2);
+}
+
+inline RegSet operator|(RegSet regs, PhysReg r) {
+  return regs.add(r);
+}
+
+std::string show(RegSet regs);
 
 static_assert(std::is_trivially_destructible<RegSet>::value,
               "RegSet must have a trivial destructor");

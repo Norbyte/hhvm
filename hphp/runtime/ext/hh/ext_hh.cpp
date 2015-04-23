@@ -20,11 +20,24 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include "hphp/runtime/base/unit-cache.h"
 #include "hphp/runtime/base/autoload-handler.h"
-#include "hphp/runtime/ext/ext_fb.h"
+#include "hphp/runtime/base/execution-context.h"
+#include "hphp/runtime/base/unit-cache.h"
+#include "hphp/runtime/ext/fb/ext_fb.h"
+#include "hphp/runtime/vm/runtime.h"
+#include "hphp/runtime/vm/vm-regs.h"
 
 namespace HPHP {
+
+//////////////////////////////////////////////////////////////////////
+
+const StaticString
+  s_empty(""),
+  s_emptyArr("array()"),
+  s_true("true"),
+  s_false("false"),
+  s_86metadata("86metadata");
+
 ///////////////////////////////////////////////////////////////////////////////
 bool HHVM_FUNCTION(autoload_set_paths,
                    const Variant& map,
@@ -52,23 +65,61 @@ bool HHVM_FUNCTION(could_include, const String& file) {
   return lookupUnit(file.get(), "", nullptr /* initial_opt */) != nullptr;
 }
 
-String HHVM_FUNCTION(serialize_memoize_param, const Variant& param) {
+Variant HHVM_FUNCTION(serialize_memoize_param, const Variant& param) {
+  auto type = param.getType();
+  if (type == KindOfInt64) {
+    return param;
+  }
+  if (type == KindOfUninit || type == KindOfNull) {
+    return s_empty;
+  }
+  if (type == KindOfBoolean) {
+    return param.asBooleanVal() ? s_true : s_false;
+  }
+  if (type == KindOfArray) {
+    Array arr = param.toArray();
+    if (arr.size() == 0) {
+      return s_emptyArr;
+    }
+  }
+
   return fb_compact_serialize(param, FBCompactSerializeBehavior::MemoizeParam);
 }
 
-static class HHExtension : public Extension {
+void HHVM_FUNCTION(set_frame_metadata, const Variant& metadata) {
+  VMRegAnchor _;
+  auto fp = vmfp();
+  if (fp && fp->skipFrame()) fp = g_context->getPrevVMState(fp);
+  if (UNLIKELY(!fp)) return;
+
+  if (LIKELY(!fp->hasVarEnv())) {
+    auto const local = fp->func()->lookupVarId(s_86metadata.get());
+    if (local != kInvalidId) {
+      cellSet(*metadata.asCell(), *tvAssertCell(frame_local(fp, local)));
+      return;
+    }
+
+    fp->setVarEnv(VarEnv::createLocal(fp));
+  }
+
+  assert(fp->hasVarEnv());
+  fp->getVarEnv()->set(s_86metadata.get(), metadata.asTypedValue());
+}
+
+static class HHExtension final : public Extension {
  public:
   HHExtension(): Extension("hh", NO_EXTENSION_VERSION_YET) { }
-  virtual void moduleInit() {
+  void moduleInit() override {
     HHVM_NAMED_FE(HH\\autoload_set_paths, HHVM_FN(autoload_set_paths));
     HHVM_NAMED_FE(HH\\could_include, HHVM_FN(could_include));
     HHVM_NAMED_FE(HH\\serialize_memoize_param,
                   HHVM_FN(serialize_memoize_param));
+    HHVM_NAMED_FE(HH\\set_frame_metadata, HHVM_FN(set_frame_metadata));
     loadSystemlib();
   }
 } s_hh_extension;
 
-static class XHPExtension : public Extension {
+static class XHPExtension final : public Extension {
  public:
   XHPExtension(): Extension("xhp", NO_EXTENSION_VERSION_YET) { }
   bool moduleEnabled() const override { return RuntimeOption::EnableXHP; }

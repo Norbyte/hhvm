@@ -38,10 +38,13 @@ public:
 
   ExpressionPtr getObject() const { return m_object; }
   bool isNullSafe() const { return m_nullsafe; }
+  bool isXhpGetAttr() const { return m_xhpGetAttr; }
+  void setIsXhpGetAttr() { m_xhpGetAttr = true; }
+
 private:
   ExpressionPtr m_object;
   bool m_nullsafe;
-  int m_objTemp;
+  bool m_xhpGetAttr;
 
   // for avoiding code generate toObject(Variant)
   bool directVariantProxy(AnalysisResultPtr ar);

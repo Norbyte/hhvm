@@ -8,14 +8,13 @@
  *
  *)
 
-open Utils
-
 (*****************************************************************************)
 (* The "static" environment, initialized first and then doesn't change *)
 (*****************************************************************************)
 
 type genv = {
     options          : ServerArgs.options;
+    config           : ServerConfig.t;
     workers          : Worker.t list option;
   }
 
@@ -29,14 +28,15 @@ type genv = {
  * The Ast.id are keys to index this shared space.
  *)
 type env = {
-    files_info     : FileInfo.t SMap.t;
+    files_info     : FileInfo.t Relative_path.Map.t;
     nenv           : Naming.env;
     errorl         : Errors.t;
     (* the strings in those sets represent filenames *)
-    failed_parsing : SSet.t;
-    failed_decl    : SSet.t;
-    failed_check   : SSet.t;
+    failed_parsing : Relative_path.Set.t;
+    failed_decl    : Relative_path.Set.t;
+    failed_check   : Relative_path.Set.t;
   }
+let typechecker_options env = (Naming.typechecker_options env.nenv)
 
 (*****************************************************************************)
 (* Killing the server  *)
@@ -53,7 +53,8 @@ let list_files env oc =
   let acc = List.fold_right begin
     fun error acc ->
       let pos = Errors.get_pos error in
-      SSet.add pos.Pos.pos_file acc
-  end env.errorl SSet.empty in
-  SSet.iter (fun (s) -> Printf.fprintf oc "%s\n" s) acc;
+      Relative_path.Set.add pos.Pos.pos_file acc
+  end env.errorl Relative_path.Set.empty in
+  Relative_path.Set.iter (fun s ->
+    Printf.fprintf oc "%s\n" (Relative_path.to_absolute s)) acc;
   flush oc

@@ -29,10 +29,10 @@
 #include <utility>
 #include <vector>
 
-#include "folly/gen/Base.h"
-#include "folly/gen/String.h"
-#include "folly/ScopeGuard.h"
-#include "folly/Memory.h"
+#include <folly/gen/Base.h>
+#include <folly/gen/String.h>
+#include <folly/ScopeGuard.h>
+#include <folly/Memory.h>
 
 #include "hphp/runtime/base/repo-auth-type.h"
 #include "hphp/runtime/base/repo-auth-type-codec.h"
@@ -119,8 +119,10 @@ std::set<Offset> findBasicBlocks(const FuncEmitter& fe) {
     auto const pc = reinterpret_cast<const Op*>(bc + offset);
     auto const nextOff = offset + instrLen(pc);
     auto const atLast = nextOff == fe.past;
+    auto const breaksBB = instrIsNonCallControlFlow(*pc) ||
+      instrFlags(*pc) & TF;
 
-    if (instrIsNonCallControlFlow(*pc) && !atLast) {
+    if (breaksBB && !atLast) {
       markBlock(nextOff);
     }
 
@@ -173,7 +175,7 @@ struct ExnTreeInfo {
    * Map from EHEnt to the ExnNode that will represent exception
    * behavior in that region.
    */
-  std::map<const EHEnt*,borrowed_ptr<php::ExnNode>> ehMap;
+  std::map<const EHEntEmitter*,borrowed_ptr<php::ExnNode>> ehMap;
 
   /*
    * Fault funclets don't actually fall in the EHEnt region for all of
@@ -759,8 +761,8 @@ std::unique_ptr<php::Func> parse_func(ParseUnitState& puState,
 
   /*
    * Builtin functions get some extra information.  The returnType flag is only
-   * non-KindOfInvalid for these, but note that something may be a builtin and
-   * still have a KindOfInvalid return type.
+   * non-folly::none for these, but note that something may be a builtin and
+   * still have a folly::none return type.
    */
   if (fe.attrs & AttrBuiltin) {
     ret->nativeInfo             = folly::make_unique<php::NativeInfo>();
@@ -808,6 +810,7 @@ std::unique_ptr<php::Class> parse_class(ParseUnitState& puState,
   ret->traitPrecRules    = pce.traitPrecRules();
   ret->traitAliasRules   = pce.traitAliasRules();
   ret->requirements      = pce.requirements();
+  ret->numDeclMethods    = pce.numDeclMethods();
 
   parse_methods(puState, borrow(ret), unit, pce);
 
@@ -832,9 +835,10 @@ std::unique_ptr<php::Class> parse_class(ParseUnitState& puState,
       php::Const {
         cconst.name(),
         borrow(ret),
-        cconst.val(),
+        cconst.valOption(),
         cconst.phpCode(),
-        cconst.typeConstraint()
+        cconst.typeConstraint(),
+        cconst.isTypeconst()
       }
     );
   }

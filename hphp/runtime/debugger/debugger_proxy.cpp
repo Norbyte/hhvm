@@ -20,7 +20,7 @@
 #include <stack>
 #include <vector>
 
-#include "folly/Conv.h"
+#include <folly/Conv.h>
 
 #include "hphp/runtime/debugger/cmd/cmd_interrupt.h"
 #include "hphp/runtime/debugger/cmd/cmd_flow_control.h"
@@ -28,9 +28,10 @@
 #include "hphp/runtime/debugger/cmd/cmd_machine.h"
 #include "hphp/runtime/debugger/debugger.h"
 #include "hphp/runtime/debugger/debugger_hook_handler.h"
+#include "hphp/runtime/debugger/dummy_sandbox.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/thread-info.h"
-#include "hphp/runtime/ext/ext_socket.h"
+#include "hphp/runtime/ext/sockets/ext_sockets.h"
 #include "hphp/runtime/vm/debugger-hook.h"
 #include "hphp/runtime/vm/vm-regs.h"
 #include "hphp/util/process.h"
@@ -42,10 +43,9 @@ namespace HPHP { namespace Eval {
 TRACE_SET_MOD(debugger);
 
 DebuggerProxy::DebuggerProxy(SmartPtr<Socket> socket, bool local)
-    : m_stopped(false), m_local(local), m_dummySandbox(nullptr),
-      m_hasBreakPoints(false), m_threadMode(Normal), m_thread(0),
+    : m_local(local),
       m_signalThread(this, &DebuggerProxy::pollSignal),
-      m_okayToPoll(true), m_signum(CmdSignal::SignalNone) {
+      m_signum(CmdSignal::SignalNone) {
   TRACE(2, "DebuggerProxy::DebuggerProxy\n");
   m_thrift.create(socket);
   m_dummyInfo = DSandboxInfo::CreateDummyInfo((int64_t)this);
@@ -150,8 +150,7 @@ std::string DebuggerProxy::getSandboxId() {
 void DebuggerProxy::getThreads(std::vector<DThreadInfoPtr> &threads) {
   TRACE(2, "DebuggerProxy::getThreads\n");
   Lock lock(this);
-  std::stack<void *> &interrupts =
-    ThreadInfo::s_threadInfo->m_reqInjectionData.interrupts;
+  auto& interrupts = RID().interrupts;
   assert(!interrupts.empty());
   if (!interrupts.empty()) {
     CmdInterrupt *tint = (CmdInterrupt*)interrupts.top();
@@ -248,10 +247,11 @@ void DebuggerProxy::notifyDummySandbox() {
 }
 
 void DebuggerProxy::setBreakPoints(
-    std::vector<BreakPointInfoPtr> &breakpoints) {
+  std::vector<BreakPointInfoPtr>& breakpoints
+) {
   TRACE(2, "DebuggerProxy::setBreakPoints\n");
-  // Hold the break mutex while we update the proxy's state. There's no need
-  // to hold it over the longer operation to set breakpoints in each file later.
+  // Hold the break mutex while we update the proxy's state. There's no need to
+  // hold it over the longer operation to set breakpoints in each file later.
   {
     WriteLock lock(m_breakMutex);
     // breakpoints holds a list of fresh new BreakPointInfo objects that
@@ -488,7 +488,7 @@ void DebuggerProxy::pollSignal() {
 bool DebuggerProxy::getClientConnectionInfo(VRefParam address,
                                             VRefParam port) {
   Resource s(m_thrift.getSocket().get());
-  return f_socket_getpeername(s, address, port);
+  return HHVM_FN(socket_getpeername)(s, address, port);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

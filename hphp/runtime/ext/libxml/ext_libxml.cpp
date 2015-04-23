@@ -17,15 +17,17 @@
 
 #include "hphp/runtime/ext/libxml/ext_libxml.h"
 
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/file-stream-wrapper.h"
 #include "hphp/runtime/base/file.h"
 #include "hphp/runtime/base/request-event-handler.h"
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/stream-wrapper-registry.h"
+#include "hphp/runtime/base/string-util.h"
 #include "hphp/runtime/base/zend-url.h"
-#include "hphp/runtime/ext/ext_file.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 
-#include "folly/FBVector.h"
+#include <folly/FBVector.h>
 
 #include <libxml/parserInternals.h>
 #include <libxml/tree.h>
@@ -68,25 +70,59 @@ struct LibXmlRequestData final : RequestEventHandler {
   void requestInit() override {
     m_use_error = false;
     m_suppress_error = false;
-    m_errors.reset();
+    m_errors = xmlErrorVec();
     m_entity_loader_disabled = false;
-    m_streams_context = uninit_null();
+    m_streams_context = nullptr;
   }
 
   void requestShutdown() override {
     m_use_error = false;
-    m_errors.reset();
-    m_streams_context = uninit_null();
+    m_errors = xmlErrorVec();
+    m_streams_context = nullptr;
   }
 
   bool m_entity_loader_disabled;
   bool m_suppress_error;
   bool m_use_error;
   xmlErrorVec m_errors;
-  Variant m_streams_context;
+  SmartPtr<StreamContext> m_streams_context;
 };
 
 IMPLEMENT_STATIC_REQUEST_LOCAL(LibXmlRequestData, tl_libxml_request_data);
+
+namespace {
+
+// This function takes ownership of a SmartPtr<File> and returns
+// a void* token that can be used to lookup the File later.  This
+// is so a reference to the file can be stored in an XML context
+// object as a void*.  The set of remembered files is cleared out
+// during MemoryManager reset.  The ext_libxml extension is the only
+// XML extension that should be storing streams in the MemoryManager
+// since it has no other place to safely store a SmartPtr.
+// The other XML extensions either own the SmartPtr<File> locally
+// or are able to store it in a object.
+inline void* rememberStream(SmartPtr<File>&& stream) {
+  return reinterpret_cast<void*>(MM().addRoot(std::move(stream)));
+}
+
+// This function returns the File associated with the given token.
+// If the token is not in the MemoryManager map, it means a pointer to
+// the File has been stored directly in the XML context.
+inline SmartPtr<File> getStream(void* userData) {
+  auto token = reinterpret_cast<MemoryManager::RootId>(userData);
+  auto res = MM().lookupRoot<File>(token);
+  return res ? res : *reinterpret_cast<SmartPtr<File>*>(token);
+}
+
+// This closes and deletes the File associated with the given token.
+// It is used by the XML callback that destroys a context.
+inline bool forgetStream(void* userData) {
+  auto token = reinterpret_cast<MemoryManager::RootId>(userData);
+  auto ptr = MM().removeRoot<File>(token);
+  return ptr->close();
+}
+
+}
 
 static Class* s_LibXMLError_class;
 
@@ -126,13 +162,43 @@ const StaticString
   s_LIBXML_ERR_FATAL("LIBXML_ERR_FATAL");
 
 ///////////////////////////////////////////////////////////////////////////////
+
+void XMLNodeData::sweep() {
+  if (m_node) {
+    assert(this == m_node->_private);
+    php_libxml_node_free_resource(m_node);
+  }
+
+  if (m_doc) m_doc->detachNode();
+}
+
+void XMLDocumentData::cleanup() {
+  assert(!m_liveNodes);
+  auto docp = (xmlDocPtr)m_node;
+  if (docp->URL) {
+    xmlFree((void*)docp->URL);
+    docp->URL = nullptr;
+  }
+  xmlFreeDoc(docp);
+
+  m_node = nullptr; // don't let XMLNode try to cleanup
+}
+
+void XMLDocumentData::sweep() {
+  if (!m_liveNodes) {
+    cleanup();
+  }
+  m_destruct = true;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Callbacks and helpers
 //
 // Note that these stream callbacks may re-enter the VM via a user-defined
 // stream wrapper. The VM state should be synced using VMRegAnchor by the
 // caller, before entering libxml2.
 
-static Resource libxml_streams_IO_open_wrapper(
+static SmartPtr<File> libxml_streams_IO_open_wrapper(
     const char *filename, const char* mode, bool read_only)
 {
   ITRACE(1, "libxml_open_wrapper({}, {}, {})\n", filename, mode, read_only);
@@ -147,11 +213,11 @@ static Resource libxml_streams_IO_open_wrapper(
    */
   if (read_only) {
     int pathIndex = 0;
-    Stream::Wrapper * wrapper = Stream::getWrapperFromURI(strFilename,
-                                                          &pathIndex);
+    Stream::Wrapper* wrapper = Stream::getWrapperFromURI(strFilename,
+                                                         &pathIndex);
     if (dynamic_cast<FileStreamWrapper*>(wrapper)) {
-      if (!f_file_exists(strFilename)) {
-        return Resource();
+      if (!HHVM_FN(file_exists)(strFilename)) {
+        return nullptr;
       }
     }
   }
@@ -159,18 +225,17 @@ static Resource libxml_streams_IO_open_wrapper(
   // PHP unescapes the URI here, but that should properly be done by the
   // wrapper.  The wrapper should expect a valid URI, e.g. file:///foo%20bar
   return File::Open(strFilename, mode, 0,
-      tl_libxml_request_data->m_streams_context);
+                    tl_libxml_request_data->m_streams_context);
 }
 
 int libxml_streams_IO_read(void* context, char* buffer, int len) {
   ITRACE(1, "libxml_IO_read({}, {}, {})\n", context, (void*)buffer, len);
   Trace::Indent _i;
 
-  Resource stream(static_cast<ResourceData*>(context));
+  auto stream = getStream(context);
   assert(len >= 0);
-  Variant ret = f_fread(stream, len);
-  if (ret.isString()) {
-    const String& str = ret.asCStrRef();
+  if (len > 0) {
+    String str = stream->read(len);
     if (str.size() <= len) {
       std::memcpy(buffer, str.data(), str.size());
       return str.size();
@@ -184,14 +249,9 @@ int libxml_streams_IO_write(void* context, const char* buffer, int len) {
   ITRACE(1, "libxml_IO_write({}, {}, {})\n", context, (void*)buffer, len);
   Trace::Indent _i;
 
-  Resource stream(static_cast<ResourceData*>(context));
-  String strBuffer(StringData::Make(buffer, len, CopyString));
-  Variant ret = f_fwrite(stream, strBuffer);
-  if (ret.isInteger() && ret.asInt64Val() < INT_MAX) {
-    return (int)ret.asInt64Val();
-  } else {
-    return -1;
-  }
+  auto stream = getStream(context);
+  int64_t ret = stream->write(String(buffer, len, CopyString));
+  return (ret < INT_MAX) ? ret : -1;
 }
 
 int libxml_streams_IO_close(void* context) {
@@ -204,12 +264,11 @@ int libxml_streams_IO_close(void* context) {
     return 0;
   }
 
-  Resource stream(static_cast<ResourceData*>(context));
-  // Release the reference owned by context. Guaranteed to not go to zero since
-  // we just created one belonging to stream.
-  stream.get()->decRefCount();
+  return forgetStream(context) ? 0 : -1;
+}
 
-  return f_fclose(stream) ? 0 : -1;
+int libxml_streams_IO_nop_close(void* context) {
+  return 0;
 }
 
 static xmlExternalEntityLoader s_default_entity_loader = nullptr;
@@ -255,14 +314,13 @@ libxml_create_input_buffer(const char* URI, xmlCharEncoding enc) {
 
  if (tl_libxml_request_data->m_entity_loader_disabled || !URI) return nullptr;
 
-  Resource stream = libxml_streams_IO_open_wrapper(URI, "rb", true);
-  if (stream.isInvalid()) return nullptr;
+  auto stream = libxml_streams_IO_open_wrapper(URI, "rb", true);
+  if (!stream || stream->isInvalid()) return nullptr;
 
   // Allocate the Input buffer front-end.
   xmlParserInputBufferPtr ret = xmlAllocParserInputBuffer(enc);
   if (ret != nullptr) {
-    stream.get()->incRefCount();
-    ret->context = stream.get();
+    ret->context = rememberStream(std::move(stream));
     ret->readcallback = libxml_streams_IO_read;
     ret->closecallback = libxml_streams_IO_close;
   }
@@ -284,15 +342,14 @@ libxml_create_output_buffer(const char *URI,
   }
   // PHP unescapes the URI here, but that should properly be done by the
   // wrapper.  The wrapper should expect a valid URI, e.g. file:///foo%20bar
-  Resource stream = libxml_streams_IO_open_wrapper(URI, "wb", false);
-  if (stream.isInvalid()) {
+  auto stream = libxml_streams_IO_open_wrapper(URI, "wb", false);
+  if (!stream || stream->isInvalid()) {
     return nullptr;
   }
   // Allocate the Output buffer front-end.
   xmlOutputBufferPtr ret = xmlAllocOutputBuffer(encoder);
   if (ret != nullptr) {
-    stream.get()->incRefCount();
-    ret->context = stream.get();
+    ret->context = rememberStream(std::move(stream));
     ret->writecallback = libxml_streams_IO_write;
     ret->closecallback = libxml_streams_IO_close;
   }
@@ -333,6 +390,10 @@ void libxml_add_error(const std::string &msg) {
 
 void php_libxml_node_free(xmlNodePtr node) {
   if (node) {
+    if (node->_private) {
+      // XXX: we may be sweeping- so don't create a smart pointer
+      reinterpret_cast<XMLNodeData*>(node->_private)->reset();
+    }
     switch (node->type) {
     case XML_ATTRIBUTE_NODE:
       xmlFreeProp((xmlAttrPtr) node);
@@ -376,6 +437,7 @@ static void php_libxml_node_free_list(xmlNodePtr node) {
       switch (node->type) {
       /* Skip property freeing for the following types */
       case XML_NOTATION_NODE:
+      case XML_ENTITY_DECL:
         break;
       case XML_ENTITY_REF_NODE:
         php_libxml_node_free_list((xmlNodePtr) node->properties);
@@ -388,7 +450,6 @@ static void php_libxml_node_free_list(xmlNodePtr node) {
       case XML_ATTRIBUTE_DECL:
       case XML_DTD_NODE:
       case XML_DOCUMENT_TYPE_NODE:
-      case XML_ENTITY_DECL:
       case XML_NAMESPACE_DECL:
       case XML_TEXT_NODE:
         php_libxml_node_free_list(node->children);
@@ -541,13 +602,14 @@ bool HHVM_FUNCTION(libxml_disable_entity_loader, bool disable /* = true */) {
 }
 
 void HHVM_FUNCTION(libxml_set_streams_context, const Resource & context) {
-  tl_libxml_request_data->m_streams_context = context;
+  tl_libxml_request_data->m_streams_context =
+    dyn_cast_or_null<StreamContext>(context);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Extension
 
-class LibXMLExtension : public Extension {
+class LibXMLExtension final : public Extension {
   public:
     LibXMLExtension() : Extension("libxml") {}
 

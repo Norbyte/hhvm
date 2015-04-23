@@ -232,7 +232,7 @@ CPP;
 function outputExtensionCPP(string $dest, string $extname,
                             array $funcs, array $classes): void {
   $fp = fopen($dest, 'w');
-  fwrite($fp, "#include \"hphp/runtime/base/base-includes.h\"\n");
+  fwrite($fp, "#include \"hphp/runtime/ext/extension.h\"\n");
   fwrite($fp, "namespace HPHP {\n");
 
   foreach($classes as $class) {
@@ -253,10 +253,10 @@ function outputExtensionCPP(string $dest, string $extname,
   }
 
   fwrite($fp, str_repeat('/', 78) . "\n\n");
-  fwrite($fp, "class {$extname}Extension : public Extension {\n");
+  fwrite($fp, "static class {$extname}Extension final : public Extension {\n");
   fwrite($fp, " public:\n");
   fwrite($fp, "  {$extname}Extension() : Extension(\"{$extname}\") {}\n");
-  fwrite($fp, "  virtual void moduleInit() {\n");
+  fwrite($fp, "  void moduleInit() override {\n");
 
   foreach($classes as $class) {
     if (empty($class['functions'])) continue;

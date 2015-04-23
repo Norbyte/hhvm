@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_EXT_HH_H_
 #define incl_HPHP_EXT_HH_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -26,7 +26,8 @@ bool HHVM_FUNCTION(autoload_set_paths,
                    const Variant& map,
                    const String& root);
 bool HHVM_FUNCTION(could_include, const String& file);
-String HHVM_FUNCTION(serialize_memoize_param, const Variant& param);
+Variant HHVM_FUNCTION(serialize_memoize_param, const Variant& param);
+void HHVM_FUNCTION(set_frame_metadata, const Variant& metadata);
 ///////////////////////////////////////////////////////////////////////////////
 }
 

@@ -13,6 +13,7 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #include "hphp/runtime/base/empty-array.h"
 
 #include <utility>
@@ -27,6 +28,8 @@
 #include "hphp/runtime/base/mixed-array.h"
 #include "hphp/runtime/base/mixed-array-defs.h"
 #include "hphp/runtime/base/packed-array-defs.h"
+#include "hphp/runtime/base/shape.h"
+#include "hphp/runtime/base/struct-array.h"
 
 namespace HPHP {
 
@@ -121,7 +124,7 @@ ArrayData* EmptyArray::CopyWithStrongIterators(const ArrayData* ad) {
 
 /*
  * Helper for empty array -> packed transitions.  Creates an array
- * with one element.  The element is transfered into the array (should
+ * with one element.  The element is transferred into the array (should
  * already be incref'd).
  */
 ALWAYS_INLINE
@@ -130,9 +133,9 @@ std::pair<ArrayData*,TypedValue*> EmptyArray::MakePackedInl(TypedValue tv) {
   auto const ad = static_cast<ArrayData*>(
     MM().objMallocLogged(sizeof(ArrayData) + cap * sizeof(TypedValue))
   );
-  assert(cap == packedCodeToCap(cap));
-  ad->m_kindAndSize = uint64_t{1} << 32 | cap; // also set kind
-  ad->m_posAndCount = 0;
+  assert(cap == CapCode::ceil(cap).code);
+  ad->m_sizeAndPos = 1; // size=1, pos=0
+  ad->m_kindAndCount = cap; // kind=Packed, count=0
 
   auto& lval = *reinterpret_cast<TypedValue*>(ad + 1);
   lval.m_data = tv.m_data;
@@ -142,7 +145,6 @@ std::pair<ArrayData*,TypedValue*> EmptyArray::MakePackedInl(TypedValue tv) {
   assert(ad->m_size == 1);
   assert(ad->m_pos == 0);
   assert(ad->m_count == 0);
-  assert((ad->m_packedCapCode & 0xFFFFFFUL) == cap);
   assert(PackedArray::checkInvariants(ad));
   return { ad, &lval };
 }
@@ -164,11 +166,11 @@ EmptyArray::MakeMixed(StringData* key, TypedValue val) {
   auto const cap  = MixedArray::computeMaxElms(mask); // 3
   auto const ad   = smartAllocArray(cap, mask);
 
-  ad->m_kindAndSize = uint64_t{1} << 32 | ArrayData::kMixedKind << 24;
-  ad->m_posAndCount = 0;
-  ad->m_capAndUsed  = uint64_t{1} << 32 | cap;
-  ad->m_tableMask   = mask;
-  ad->m_nextKI      = 0;
+  ad->m_sizeAndPos   = 1; // size=1, pos=0
+  ad->m_kindAndCount = MixedArray::kMixedKind << 24; // capcode=0, count=0
+  ad->m_capAndUsed   = uint64_t{1} << 32 | cap;
+  ad->m_tableMask    = mask;
+  ad->m_nextKI       = 0;
 
   auto const data = reinterpret_cast<MixedArray::Elm*>(ad + 1);
   auto const hash = reinterpret_cast<int32_t*>(data + cap);
@@ -206,11 +208,11 @@ EmptyArray::MakeMixed(int64_t key, TypedValue val) {
   auto const cap  = MixedArray::computeMaxElms(mask); // 3
   auto const ad   = smartAllocArray(cap, mask);
 
-  ad->m_kindAndSize = uint64_t{1} << 32 | ArrayData::kMixedKind << 24;
-  ad->m_posAndCount = 0;
-  ad->m_capAndUsed  = uint64_t{1} << 32 | cap;
-  ad->m_tableMask   = mask;
-  ad->m_nextKI      = key + 1;
+  ad->m_sizeAndPos    = 1; // size=1, pos=0
+  ad->m_kindAndCount  = MixedArray::kMixedKind << 24; // capcode=0, count=0
+  ad->m_capAndUsed    = uint64_t{1} << 32 | cap;
+  ad->m_tableMask     = mask;
+  ad->m_nextKI        = (key >= 0) ? key + 1 : 0;
 
   auto const data = reinterpret_cast<MixedArray::Elm*>(ad + 1);
   auto const hash = reinterpret_cast<int32_t*>(data + cap);
@@ -329,7 +331,7 @@ ArrayData* EmptyArray::PlusEq(ArrayData*, const ArrayData* elems) {
 
 ArrayData* EmptyArray::Merge(ArrayData*, const ArrayData* elems) {
   // Packed arrays don't need renumbering, so don't make a copy.
-  if (elems->isPacked()) {
+  if (elems->isPacked() || elems->isStruct()) {
     elems->incRefCount();
     return const_cast<ArrayData*>(elems);
   }

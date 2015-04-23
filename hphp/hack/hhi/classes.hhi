@@ -1,4 +1,4 @@
-<?hh // decl
+<?hh // decl /* -*- mode: php -*- */
 /**
  * Copyright (c) 2014, Facebook, Inc.
  * All rights reserved.
@@ -15,49 +15,14 @@
  * YOU SHOULD NEVER INCLUDE THIS FILE ANYWHERE!!!
  */
 
-class Exception {
-  protected string $message;
-  // $code should be untyped, or mixed because subclasses use it as a
-  // string, the main example being PDOException
-  protected $code;
-  protected ?Exception $previous = null;
-  protected string $file;
-  protected int $line;
-  protected array $trace;
-
-  public function __construct (string $message = "", int $code = 0,
-                               ?Exception $previous = null) {}
-  public function getMessage(): string {}
-  final public function getPrevious(): Exception {}
-  public final function setPrevious(Exception $previous): void;
-  public function getCode(): int {}
-  final public function getFile(): string {}
-  final public function getLine(): int {}
-  final public function getTrace(): array {}
-  final public function getTraceAsString(): string {}
-  public function __toString(): string {}
-  final private function __clone(): void {}
-
-  public static function getTraceOptions() {}
-  public static function setTraceOptions($opts) {}
-}
-
-class InvalidArgumentException extends Exception {
-}
-
-class RuntimeException extends Exception {
-}
-
-class OutOfBoundsException extends RuntimeException {
-}
-
-final class AsyncGenerator<Tk, Tv, Ts> implements AsyncKeyedIterator<Tk, Tv> {
+final class AsyncGenerator<+Tk, +Tv, -Ts>
+    implements AsyncKeyedIterator<Tk, Tv> {
   public function next(): Awaitable<?(Tk, Tv)> {}
   public function send(?Ts $v): Awaitable<?(Tk, Tv)> {}
   public function raise(Exception $e): Awaitable<?(Tk, Tv)> {}
 }
 
-final class Generator<Tk, Tv, Ts> implements KeyedIterator<Tk, Tv> {
+final class Generator<+Tk, +Tv, -Ts> implements KeyedIterator<Tk, Tv> {
   public function getOrigFuncName(): string {}
   public function current(): Tv {}
   public function key(): Tk {}
@@ -66,16 +31,9 @@ final class Generator<Tk, Tv, Ts> implements KeyedIterator<Tk, Tv> {
   public function send(?Ts $v): void {}
   public function raise(Exception $e): void {}
   public function rewind(): void {}
-  public function getLabel(): int {}
-  public function update(int $label, Tv $value): void {}
-  public function num_args(): int {}
-  public function get_arg(int $index): mixed {}
 }
 
-// TODO(#4534682) Kill Continuation
-type Continuation<Tv> = Generator<int, Tv, void>;
-
-abstract class WaitHandle<T> implements Awaitable<T> {
+abstract class WaitHandle<+T> implements Awaitable<T> {
   public function getWaitHandle(): this {}
   public function import(): void {}
   public function join(): T {}
@@ -84,38 +42,37 @@ abstract class WaitHandle<T> implements Awaitable<T> {
   public function isFailed(): bool {}
   public function getID(): int {}
   public function getName(): string {}
+  public function result() : T {}
   public function getExceptionIfFailed(): ?Exception {}
   public static function setOnIOWaitEnterCallback(?(function(): void) $callback) {}
   public static function setOnIOWaitExitCallback(?(function(): void) $callback) {}
   public static function setOnJoinCallback(?(function(WaitableWaitHandle<mixed>): void) $callback) {}
 }
 
-final class StaticWaitHandle<T> extends WaitHandle<T> {
+final class StaticWaitHandle<+T> extends WaitHandle<T> {
 }
 
-abstract class WaitableWaitHandle<T> extends WaitHandle<T> {
+abstract class WaitableWaitHandle<+T> extends WaitHandle<T> {
   public function getContextIdx(): int {}
   public function getCreator(): /*AsyncFunction*/WaitHandle<mixed> {}
-  public function getParents(): array<BlockableWaitHandle<mixed>> {}
+  public function getParents(): array<WaitableWaitHandle<mixed>> {}
 }
 
-abstract class BlockableWaitHandle<T> extends WaitableWaitHandle<T> {
-}
-
-abstract class ResumableWaitHandle<T> extends BlockableWaitHandle<T> {
+abstract class ResumableWaitHandle<+T> extends WaitableWaitHandle<T> {
   public static function setOnCreateCallback(?(function(AsyncFunctionWaitHandle<mixed>, WaitableWaitHandle<mixed>): void) $callback) {}
   public static function setOnAwaitCallback(?(function(AsyncFunctionWaitHandle<mixed>, WaitableWaitHandle<mixed>): void) $callback) {}
   public static function setOnSuccessCallback(?(function(AsyncFunctionWaitHandle<mixed>, mixed): void) $callback) {}
   public static function setOnFailCallback(?(function(AsyncFunctionWaitHandle<mixed>, Exception): void) $callback) {}
 }
 
-final class AsyncFunctionWaitHandle<T> extends ResumableWaitHandle<T> {
+final class AsyncFunctionWaitHandle<+T> extends ResumableWaitHandle<T> {
 }
 
-final class AsyncGeneratorWaitHandle<Tk, Tv> extends ResumableWaitHandle<?(Tk, Tv)> {
+final class AsyncGeneratorWaitHandle<+Tk, +Tv>
+  extends ResumableWaitHandle<?(Tk, Tv)> {
 }
 
-final class AwaitAllWaitHandle extends BlockableWaitHandle<void> {
+final class AwaitAllWaitHandle extends WaitableWaitHandle<void> {
   public static function fromArray<T>(
     array<WaitHandle<T>> $deps
   ): WaitHandle<void>;
@@ -126,24 +83,31 @@ final class AwaitAllWaitHandle extends BlockableWaitHandle<void> {
     ConstVector<WaitHandle<T>> $deps
   ): WaitHandle<void>;
   public static function setOnCreateCallback(
-    ?(function(AwaitAllWaitHandle<void>, Vector<mixed>): void) $callback
+    ?(function(AwaitAllWaitHandle, Vector<mixed>): void) $callback
   ): void {}
 }
 
-final class GenArrayWaitHandle extends BlockableWaitHandle<array> {
+final class GenArrayWaitHandle extends WaitableWaitHandle<array> {
   // This is technically overloaded to allow an array of nullable
   public static function create(array $dependencies): WaitHandle<array> {}
   public static function setOnCreateCallback(?(function(GenArrayWaitHandle, array): void) $callback) {}
 }
 
-final class GenMapWaitHandle<Tk, Tv> extends BlockableWaitHandle<Map<Tk, Tv>> {
+final class GenMapWaitHandle<Tk, Tv> extends WaitableWaitHandle<Map<Tk, Tv>> {
   public static function create(Map<Tk, WaitHandle<Tv>> $dependencies): WaitHandle<Map<Tk, Tv>> {}
   public static function setOnCreateCallback(?(function(GenMapWaitHandle<Tk, Tv>, Map<mixed, mixed>): void) $callback) {}
 }
 
-final class GenVectorWaitHandle<T> extends BlockableWaitHandle<Vector<T>> {
+final class GenVectorWaitHandle<T> extends WaitableWaitHandle<Vector<T>> {
   public static function create(Vector<WaitHandle<T>> $dependencies): WaitHandle<Vector<T>> {}
   public static function setOnCreateCallback(?(function(GenVectorWaitHandle<T>, Vector<mixed>): void) $callback) {}
+}
+
+final class ConditionWaitHandle<T> extends WaitableWaitHandle<T> {
+  public static function create(WaitHandle<void> $child): ConditionWaitHandle<T> {}
+  public static function setOnCreateCallback(?(function(ConditionWaitHandle<T>, WaitableWaitHandle<void>): void) $callback) {}
+  public function succeed(T $result): void {}
+  public function fail(Exception $exception): void {}
 }
 
 final class RescheduleWaitHandle extends WaitableWaitHandle<void> {
@@ -158,8 +122,16 @@ final class SleepWaitHandle extends WaitableWaitHandle<void> {
   public static function setOnSuccessCallback(?(function(SleepWaitHandle): void) $callback) {}
 }
 
-final class ExternalThreadEventWaitHandle<T> extends WaitableWaitHandle<T> {
+final class ExternalThreadEventWaitHandle<+T> extends WaitableWaitHandle<T> {
   public static function setOnCreateCallback(?(function(ExternalThreadEventWaitHandle<mixed>): void) $callback) {}
   public static function setOnSuccessCallback(?(function(ExternalThreadEventWaitHandle<mixed>, mixed): void) $callback) {}
   public static function setOnFailCallback(?(function(ExternalThreadEventWaitHandle<mixed>, Exception): void) $callback) {}
 }
+
+/*
+ * stdClass is not really final. However, because stdClass has no
+ * properties of its own and is the result of casting an array to an
+ * object, it is exempt from 'property must exist' checks and so should not
+ * be getting extended.
+ */
+final class stdClass {}

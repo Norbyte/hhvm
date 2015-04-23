@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_EXT_MB_H_
 #define incl_HPHP_EXT_MB_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -69,7 +69,8 @@ Variant HHVM_FUNCTION(mb_encode_mimeheader,
 Variant HHVM_FUNCTION(mb_encode_numericentity,
                       const String& str,
                       const Variant& convmap,
-                      const Variant& opt_encoding = null_variant);
+                      const Variant& opt_encoding = null_variant,
+                      bool is_hex = false);
 bool HHVM_FUNCTION(mb_ereg_match,
                    const String& pattern,
                    const String& str,

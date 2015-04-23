@@ -17,7 +17,10 @@
 
 #include "hphp/runtime/ext/stream/ext_stream-user-filters.h"
 #include "hphp/runtime/ext/stream/ext_stream.h"
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/ext/extension.h"
+#include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/file.h"
 #include "hphp/runtime/ext/array/ext_array.h"
 #include "hphp/runtime/ext/std/ext_std.h"
 #include "hphp/system/constants.h"
@@ -96,9 +99,7 @@ private:
       return false;
     }
 
-    auto file = stream.getTyped<File>();
-    assert(file);
-
+    auto file = cast<File>(stream);
     int mode = readwrite.toInt32();
     if (!mode) {
       auto str = file->getMode();
@@ -120,13 +121,13 @@ private:
 
     // If it's ALL we create two resources, but only return one - this
     // matches Zend, and is the documented behavior.
-    Resource ret;
+    SmartPtr<StreamFilter> ret;
     if (mode & k_STREAM_FILTER_READ) {
       auto resource = createInstance(func_name,
-                                     stream,
+                                     file,
                                      filtername,
                                      params);
-      if (resource.isNull()) {
+      if (!resource) {
         return false;
       }
       ret = resource;
@@ -138,10 +139,10 @@ private:
     }
     if (mode & k_STREAM_FILTER_WRITE) {
       auto resource = createInstance(func_name,
-                                     stream,
+                                     file,
                                      filtername,
                                      params);
-      if (resource.isNull()) {
+      if (!resource) {
         return false;
       }
       ret = resource;
@@ -151,20 +152,20 @@ private:
         file->prependWriteFilter(resource);
       }
     }
-    return ret;
+    return Variant(std::move(ret));
   }
 
-  Resource createInstance(const char* php_func,
-                          const Resource& stream,
-                          const String& filter,
-                          const Variant& params) {
+  SmartPtr<StreamFilter> createInstance(const char* php_func,
+                                        SmartPtr<File> stream,
+                                        const String& filter,
+                                        const Variant& params) {
     auto class_name = m_registeredFilters.rvalAt(filter).asCStrRef();
     Class* class_ = Unit::getClass(class_name.get(), true);
     Object obj = Object();
 
     if (LIKELY(class_ != nullptr)) {
       PackedArrayInit ctor_args(3);
-      ctor_args.append(stream);
+      ctor_args.append(Variant(stream));
       ctor_args.append(filter);
       ctor_args.append(params);
       obj = g_context->createObject(class_name.get(), ctor_args.toArray());
@@ -189,10 +190,10 @@ private:
       raise_warning("%s: unable to create or locate filter \"%s\"",
                     php_func,
                     filter.data());
-      return Resource();
+      return nullptr;
     }
 
-    return Resource(NEWOBJ(StreamFilter)(obj, stream));
+    return makeSmartPtr<StreamFilter>(obj, stream);
   }
 };
 IMPLEMENT_STATIC_REQUEST_LOCAL(StreamUserFilters, s_stream_user_filters);
@@ -200,15 +201,15 @@ IMPLEMENT_STATIC_REQUEST_LOCAL(StreamUserFilters, s_stream_user_filters);
 ///////////////////////////////////////////////////////////////////////////////
 // StreamFilter
 
-int64_t StreamFilter::invokeFilter(Resource in,
-                                   Resource out,
+int64_t StreamFilter::invokeFilter(const SmartPtr<BucketBrigade>& in,
+                                   const SmartPtr<BucketBrigade>& out,
                                    bool closing) {
   auto consumedTV = make_tv<KindOfInt64>(0);
   auto consumedRef = RefData::Make(consumedTV);
 
   PackedArrayInit params(4);
-  params.append(in);
-  params.append(out);
+  params.append(Variant(in));
+  params.append(Variant(out));
   params.append(consumedRef);
   params.append(closing);
   return m_filter->o_invoke(s_filter, params.toArray()).toInt64();
@@ -219,13 +220,10 @@ void StreamFilter::invokeOnClose() {
 }
 
 bool StreamFilter::remove() {
-  if (m_stream.isNull()) {
+  if (!m_stream) {
     return false;
   }
-  auto file = m_stream.getTyped<File>();
-  assert(file);
-  Resource rthis(this);
-  auto ret = file->removeFilter(rthis);
+  auto ret = m_stream->removeFilter(SmartPtr<StreamFilter>(this));
   m_stream.reset();
   return ret;
 }
@@ -305,28 +303,19 @@ Variant HHVM_FUNCTION(stream_filter_prepend,
 }
 
 bool HHVM_FUNCTION(stream_filter_remove, const Resource& resource) {
-  auto filter = resource.getTyped<StreamFilter>();
-  assert(filter);
-  return filter->remove();
+  return cast<StreamFilter>(resource)->remove();
 }
 
 Variant HHVM_FUNCTION(stream_bucket_make_writeable, const Resource& bb_res) {
-  auto brigade = bb_res.getTyped<BucketBrigade>();
-  assert(brigade);
-  auto ret = brigade->popFront();
-  return ret;
+  return cast<BucketBrigade>(bb_res)->popFront();
 }
 
 void HHVM_FUNCTION(stream_bucket_append, const Resource& bb_res, const Object& bucket) {
-  auto brigade = bb_res.getTyped<BucketBrigade>();
-  assert(brigade);
-  brigade->appendBucket(bucket);
+  cast<BucketBrigade>(bb_res)->appendBucket(bucket);
 }
 
 void HHVM_FUNCTION(stream_bucket_prepend, const Resource& bb_res, const Object& bucket) {
-  auto brigade = bb_res.getTyped<BucketBrigade>();
-  assert(brigade);
-  brigade->prependBucket(bucket);
+  cast<BucketBrigade>(bb_res)->prependBucket(bucket);
 }
 
 const StaticString

@@ -17,8 +17,8 @@
 #define incl_HPHP_VM_RUNTIME_H_
 
 #include "hphp/runtime/ext/ext_generator.h"
-#include "hphp/runtime/ext/asio/async_function_wait_handle.h"
-#include "hphp/runtime/ext/asio/async_generator.h"
+#include "hphp/runtime/ext/asio/async-function-wait-handle.h"
+#include "hphp/runtime/ext/asio/async-generator.h"
 #include "hphp/runtime/ext/std/ext_std_errorfunc.h"
 #include "hphp/runtime/vm/event-hook.h"
 #include "hphp/runtime/vm/func.h"
@@ -45,6 +45,7 @@ void print_boolean(bool val);
 void raiseWarning(const StringData* sd);
 void raiseNotice(const StringData* sd);
 void raiseArrayIndexNotice(int64_t index);
+void raiseArrayKeyNotice(const StringData* key);
 
 inline Iter*
 frame_iter(const ActRec* fp, int i) {
@@ -249,12 +250,10 @@ RefData* lookupStaticFromClosure(ObjectData* closure,
  * be set up before you use those parts of the runtime.
  */
 
-typedef StringData* (*CompileStringAST)(String, String);
 typedef Unit* (*CompileStringFn)(const char*, int, const MD5&, const char*);
 typedef Unit* (*BuildNativeFuncUnitFn)(const HhbcExtFuncInfo*, ssize_t);
 typedef Unit* (*BuildNativeClassUnitFn)(const HhbcExtClassInfo*, ssize_t);
 
-extern CompileStringAST g_hphp_compiler_serialize_code_model_for;
 extern CompileStringFn g_hphp_compiler_parse;
 extern BuildNativeFuncUnitFn g_hphp_build_native_func_unit;
 extern BuildNativeClassUnitFn g_hphp_build_native_class_unit;
@@ -264,22 +263,6 @@ void assertTv(const TypedValue* tv);
 
 // returns the number of things it put on sp
 int init_closure(ActRec* ar, TypedValue* sp);
-
-/*
- * Returns whether the interface named `s' supports any non-object
- * types.
- */
-bool interface_supports_non_objects(const StringData* s);
-
-bool interface_supports_array(const StringData* s);
-bool interface_supports_string(const StringData* s);
-bool interface_supports_int(const StringData* s);
-bool interface_supports_double(const StringData* s);
-
-bool interface_supports_array(std::string const&);
-bool interface_supports_string(std::string const&);
-bool interface_supports_int(std::string const&);
-bool interface_supports_double(std::string const&);
 
 int64_t zero_error_level();
 void restore_error_level(int64_t oldLevel);

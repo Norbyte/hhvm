@@ -26,6 +26,8 @@
 #include <sstream>
 #include <vector>
 
+#include <boost/container/flat_map.hpp>
+
 #include <folly/Format.h>
 
 #include <tbb/concurrent_hash_map.h>
@@ -40,7 +42,6 @@
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/attr.h"
 #include "hphp/runtime/base/autoload-handler.h"
-#include "hphp/runtime/base/class-info.h"
 #include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/rds.h"
 #include "hphp/runtime/base/runtime-error.h"
@@ -74,6 +75,8 @@
 #include "hphp/runtime/vm/vm-regs.h"
 
 #include "hphp/runtime/server/source-root-info.h"
+
+#include "hphp/runtime/ext/string/ext_string.h"
 
 #include "hphp/system/systemlib.h"
 
@@ -136,6 +139,28 @@ using ExtendedLineInfoCache = tbb::concurrent_hash_map<
 >;
 ExtendedLineInfoCache s_extendedLineInfo;
 
+using LineTableStash = tbb::concurrent_hash_map<
+  const Unit*,
+  LineTable,
+  pointer_hash<Unit>
+>;
+LineTableStash s_lineTables;
+
+/*
+ * Since line numbers are only used for generating warnings and backtraces, the
+ * set of Offset-to-Line# mappings needed is sparse.  To save memory we load
+ * these mappings lazily from the repo and cache only the ones we actually use.
+*/
+
+using LineMap = boost::container::flat_map<Offset,int>;
+
+using LineInfoCache = tbb::concurrent_hash_map<
+  const Unit*,
+  LineMap,
+  pointer_hash<Unit>
+>;
+LineInfoCache s_lineInfo;
+
 //////////////////////////////////////////////////////////////////////
 
 }
@@ -166,6 +191,8 @@ Unit::Unit()
 
 Unit::~Unit() {
   s_extendedLineInfo.erase(this);
+  s_lineTables.erase(this);
+  s_lineInfo.erase(this);
 
   if (!RuntimeOption::RepoAuthoritative) {
     if (debug) {
@@ -197,7 +224,7 @@ Unit::~Unit() {
   if (m_pseudoMainCache) {
     for (auto it = m_pseudoMainCache->begin();
          it != m_pseudoMainCache->end(); ++it) {
-      delete it->second;
+      Func::destroy(it->second);
     }
     delete m_pseudoMainCache;
   }
@@ -221,15 +248,15 @@ static SourceLocTable loadSourceLocTable(const Unit* unit) {
 
   Lock lock(g_classesMutex);
   auto& urp = Repo::get().urp();
-  urp.getSourceLocTab(unit->repoID()).get(unit->sn(), ret);
+  urp.getSourceLocTab[unit->repoID()].get(unit->sn(), ret);
   return ret;
 }
 
 /*
- * Return a copy of the Unit's SourceLocTable, extracting it from the repo if
+ * Return the Unit's SourceLocTable, extracting it from the repo if
  * necessary.
  */
-SourceLocTable getSourceLocTable(const Unit* unit) {
+const SourceLocTable& getSourceLocTable(const Unit* unit) {
   {
     ExtendedLineInfoCache::const_accessor acc;
     if (s_extendedLineInfo.find(acc, unit)) {
@@ -259,7 +286,7 @@ static LineToOffsetRangeVecMap getLineToOffsetRangeVecMap(const Unit* unit) {
     }
   }
 
-  auto const srcLoc = getSourceLocTable(unit);
+  auto const& srcLoc = getSourceLocTable(unit);
 
   LineToOffsetRangeVecMap map;
   Offset baseOff = 0;
@@ -292,6 +319,23 @@ static LineToOffsetRangeVecMap getLineToOffsetRangeVecMap(const Unit* unit) {
   return acc->second.lineToOffsetRange;
 }
 
+static LineTable loadLineTable(const Unit* unit) {
+  auto ret = LineTable{};
+  if (unit->repoID() == RepoIdInvalid) {
+    LineTableStash::accessor acc;
+    if (s_lineTables.find(acc, unit)) {
+      return acc->second;
+    }
+    return ret;
+  }
+
+  Lock lock(g_classesMutex);
+  auto& urp = Repo::get().urp();
+  urp.getUnitLineTable(unit->repoID(), unit->sn(), ret);
+
+  return ret;
+}
+
 int getLineNumber(const LineTable& table, Offset pc) {
   auto const key = LineEntry(pc, -1);
   auto it = std::upper_bound(begin(table), end(table), key);
@@ -303,7 +347,35 @@ int getLineNumber(const LineTable& table, Offset pc) {
 }
 
 int Unit::getLineNumber(Offset pc) const {
-  return HPHP::getLineNumber(m_lineTable, pc);
+  {
+    LineInfoCache::const_accessor acc;
+    if (s_lineInfo.find(acc, this)) {
+      auto& lineMap = acc->second;
+      auto const it = lineMap.find(pc);
+      if (it != lineMap.end()) {
+        return it->second;
+      }
+    }
+  }
+
+  auto line = HPHP::getLineNumber(loadLineTable(this), pc);
+
+  {
+    LineInfoCache::accessor acc;
+    if (s_lineInfo.find(acc, this)) {
+      auto& lineMap = acc->second;
+      lineMap.insert(std::pair<Offset,int>(pc, line));
+      return line;
+    }
+  }
+
+  LineMap newLineMap{};
+  newLineMap.insert(std::pair<Offset,int>(pc, line));
+  LineInfoCache::accessor acc;
+  if (s_lineInfo.insert(acc, this)) {
+    acc->second = std::move(newLineMap);
+  }
+  return line;
 }
 
 bool getSourceLoc(const SourceLocTable& table, Offset pc, SourceLoc& sLoc) {
@@ -318,16 +390,17 @@ bool getSourceLoc(const SourceLocTable& table, Offset pc, SourceLoc& sLoc) {
 }
 
 bool Unit::getSourceLoc(Offset pc, SourceLoc& sLoc) const {
-  auto sourceLocTable = getSourceLocTable(this);
+  auto const& sourceLocTable = getSourceLocTable(this);
   return HPHP::getSourceLoc(sourceLocTable, pc, sLoc);
 }
 
 bool Unit::getOffsetRange(Offset pc, OffsetRange& range) const {
   LineEntry key = LineEntry(pc, -1);
-  auto it = std::upper_bound(m_lineTable.begin(), m_lineTable.end(), key);
-  if (it != m_lineTable.end()) {
+  auto lineTable = loadLineTable(this);
+  auto it = std::upper_bound(lineTable.begin(), lineTable.end(), key);
+  if (it != lineTable.end()) {
     assert(pc < it->pastOffset());
-    Offset base = it == m_lineTable.begin() ? 0 : (it-1)->pastOffset();
+    Offset base = it == lineTable.begin() ? 0 : (it-1)->pastOffset();
     range.m_base = base;
     range.m_past = it->pastOffset();
     return true;
@@ -354,6 +427,12 @@ const Func* Unit::getFunc(Offset pc) const {
   return nullptr;
 }
 
+void stashLineTable(const Unit* unit, LineTable table) {
+  LineTableStash::accessor acc;
+  if (s_lineTables.insert(acc, unit)) {
+    acc->second = std::move(table);
+  }
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Funcs and PreClasses.
@@ -433,8 +512,8 @@ void Unit::loadFunc(const Func *func) {
     (RuntimeOption::RepoAuthoritative || !SystemLib::s_inited) &&
     (func->attrs() & AttrPersistent);
   ne->m_cachedFunc.bind(
-    isPersistent ? RDS::Mode::Persistent
-                 : RDS::Mode::Normal
+    isPersistent ? rds::Mode::Persistent
+                 : rds::Mode::Normal
   );
   const_cast<Func*>(func)->setFuncHandle(ne->m_cachedFunc);
   if (RuntimeOption::EvalPerfDataMap) {
@@ -451,7 +530,6 @@ void Unit::loadFunc(const Func *func) {
 class FrameRestore {
  public:
   explicit FrameRestore(const PreClass* preClass) {
-    auto const ec = g_context.getNoCheck();
     ActRec* fp = vmfp();
     PC pc = vmpc();
 
@@ -480,7 +558,7 @@ class FrameRestore {
       tmp.initNumArgs(0);
       vmfp() = &tmp;
       vmpc() = preClass->unit()->at(preClass->getOffset());
-      ec->pushLocalsAndIterators(tmp.m_func);
+      pushLocalsAndIterators(tmp.m_func);
     } else {
       m_top = nullptr;
       m_fp = nullptr;
@@ -499,7 +577,6 @@ class FrameRestore {
   ActRec* m_fp;
   PC      m_pc;
 };
-
 
 ///////////////////////////////////////////////////////////////////////////////
 // Class lookup.
@@ -590,8 +667,8 @@ Class* Unit::defClass(const PreClass* preClass,
       (!SystemLib::s_inited || RuntimeOption::RepoAuthoritative) &&
       newClass->verifyPersistent();
     nameList->m_cachedClass.bind(
-      isPersistent ? RDS::Mode::Persistent
-                   : RDS::Mode::Normal
+      isPersistent ? rds::Mode::Persistent
+                   : rds::Mode::Normal
     );
     newClass->setClassHandle(nameList->m_cachedClass);
     newClass.get()->incAtomicCount();
@@ -687,32 +764,31 @@ bool Unit::classExists(const StringData* name, bool autoload, ClassKind kind) {
 const Cell* Unit::lookupCns(const StringData* cnsName) {
   auto const handle = lookupCnsHandle(cnsName);
   if (LIKELY(handle != 0)) {
-    TypedValue& tv = RDS::handleToRef<TypedValue>(handle);
+    TypedValue& tv = rds::handleToRef<TypedValue>(handle);
     if (LIKELY(tv.m_type != KindOfUninit)) {
       assert(cellIsPlausible(tv));
       return &tv;
     }
     if (UNLIKELY(tv.m_data.pref != nullptr)) {
-      ClassInfo::ConstantInfo* ci =
-        (ClassInfo::ConstantInfo*)(void*)tv.m_data.pref;
-      auto const tvRet = const_cast<Variant&>(
-        ci->getDeferredValue()).asTypedValue();
+      auto callback =
+        reinterpret_cast<SystemConstantCallback>(tv.m_data.pref);
+      const Cell* tvRet = callback().asTypedValue();
       assert(cellIsPlausible(*tvRet));
       if (LIKELY(tvRet->m_type != KindOfUninit)) {
         return tvRet;
       }
     }
   }
-  if (UNLIKELY(RDS::s_constants().get() != nullptr)) {
-    return RDS::s_constants()->nvGet(cnsName);
+  if (UNLIKELY(rds::s_constants().get() != nullptr)) {
+    return rds::s_constants()->nvGet(cnsName);
   }
   return nullptr;
 }
 
 const Cell* Unit::lookupPersistentCns(const StringData* cnsName) {
   auto const handle = lookupCnsHandle(cnsName);
-  if (!RDS::isPersistentHandle(handle)) return nullptr;
-  auto const ret = &RDS::handleToRef<TypedValue>(handle);
+  if (!rds::isPersistentHandle(handle)) return nullptr;
+  auto const ret = &rds::handleToRef<TypedValue>(handle);
   assert(cellIsPlausible(*ret));
   return ret;
 }
@@ -735,7 +811,7 @@ const TypedValue* Unit::loadCns(const StringData* cnsName) {
 static uint64_t defCnsHelper(uint64_t ch,
                              const TypedValue *value,
                              const StringData *cnsName) {
-  TypedValue* cns = &RDS::handleToRef<TypedValue>(ch);
+  TypedValue* cns = &rds::handleToRef<TypedValue>(ch);
   if (UNLIKELY(cns->m_type != KindOfUninit) ||
       UNLIKELY(cns->m_data.pref != nullptr)) {
     raise_notice(Strings::CONSTANT_ALREADY_DEFINED, cnsName->data());
@@ -756,18 +832,18 @@ bool Unit::defCns(const StringData* cnsName, const TypedValue* value,
   auto const handle = makeCnsHandle(cnsName, persistent);
 
   if (UNLIKELY(handle == 0)) {
-    if (UNLIKELY(!RDS::s_constants().get())) {
+    if (UNLIKELY(!rds::s_constants().get())) {
       /*
        * This only happens when we call define on a non
        * static string. Not worth presizing or otherwise
        * optimizing for.
        */
-      RDS::s_constants() =
+      rds::s_constants() =
         Array::attach(MixedArray::MakeReserve(1));
     }
-    auto const existed = !!RDS::s_constants()->nvGet(cnsName);
+    auto const existed = !!rds::s_constants()->nvGet(cnsName);
     if (!existed) {
-      RDS::s_constants().set(StrNR(cnsName),
+      rds::s_constants().set(StrNR(cnsName),
         tvAsCVarRef(value), true /* isKey */);
       return true;
     }
@@ -777,21 +853,22 @@ bool Unit::defCns(const StringData* cnsName, const TypedValue* value,
   return defCnsHelper(handle, value, cnsName);
 }
 
-void Unit::defDynamicSystemConstant(const StringData* cnsName,
-                                    const void* data) {
+bool Unit::defSystemConstantCallback(const StringData* cnsName,
+                                     SystemConstantCallback callback) {
   static const bool kServer = RuntimeOption::ServerExecutionMode();
   // Zend doesn't define the STD* streams in server mode so we don't either
   if (UNLIKELY(kServer &&
        (s_stdin.equal(cnsName) ||
         s_stdout.equal(cnsName) ||
         s_stderr.equal(cnsName)))) {
-    return;
+    return false;
   }
   auto const handle = makeCnsHandle(cnsName, true);
   assert(handle);
-  TypedValue* cns = &RDS::handleToRef<TypedValue>(handle);
+  TypedValue* cns = &rds::handleToRef<TypedValue>(handle);
   assert(cns->m_type == KindOfUninit);
-  cns->m_data.pref = (RefData*)data;
+  cns->m_data.pref = reinterpret_cast<RefData*>(callback);
+  return true;
 }
 
 
@@ -801,18 +878,21 @@ void Unit::defDynamicSystemConstant(const StringData* cnsName,
 namespace {
 
 TypeAliasReq typeAliasFromClass(const TypeAlias* thisType, Class *klass) {
-  // If the class is an enum, pull out the actual base type.
+  TypeAliasReq req;
+  req.name = thisType->name;
+  req.nullable = thisType->nullable;
   if (isEnum(klass)) {
-    return TypeAliasReq { klass->enumBaseTy(),
-                          thisType->nullable,
-                          nullptr,
-                          thisType->name };
+    // If the class is an enum, pull out the actual base type.
+    if (auto const enumType = klass->enumBaseTy()) {
+      req.type = dataTypeToAnnotType(*enumType);
+    } else {
+      req.type = AnnotType::Mixed;
+    }
   } else {
-    return TypeAliasReq { KindOfObject,
-                          thisType->nullable,
-                          klass,
-                          thisType->name };
+    req.type = AnnotType::Object;
+    req.klass = klass;
   }
+  return req;
 }
 
 TypeAliasReq resolveTypeAlias(const TypeAlias* thisType) {
@@ -827,12 +907,10 @@ TypeAliasReq resolveTypeAlias(const TypeAlias* thisType) {
    * If the right hand side was a class, we need to autoload and
    * ensure it exists at this point.
    */
-
-  if (thisType->kind != KindOfObject) {
-    return TypeAliasReq { thisType->kind,
-                          thisType->nullable,
-                          nullptr,
-                          thisType->name };
+  if (thisType->type != AnnotType::Object &&
+      thisType->type != AnnotType::Self &&
+      thisType->type != AnnotType::Parent) {
+    return TypeAliasReq::From(*thisType);
   }
 
   /*
@@ -857,10 +935,7 @@ TypeAliasReq resolveTypeAlias(const TypeAlias* thisType) {
   }
 
   if (auto targetTd = targetNE->getCachedTypeAlias()) {
-    return TypeAliasReq { targetTd->kind,
-                          thisType->nullable || targetTd->nullable,
-                          targetTd->klass,
-                          thisType->name };
+    return TypeAliasReq::From(*targetTd, *thisType);
   }
 
   if (AutoloadHandler::s_instance->autoloadClassOrType(
@@ -870,14 +945,11 @@ TypeAliasReq resolveTypeAlias(const TypeAlias* thisType) {
       return typeAliasFromClass(thisType, klass);
     }
     if (auto targetTd = targetNE->getCachedTypeAlias()) {
-      return TypeAliasReq { targetTd->kind,
-                            thisType->nullable || targetTd->nullable,
-                            targetTd->klass,
-                            thisType->name };
+      return TypeAliasReq::From(*targetTd, *thisType);
     }
   }
 
-  return TypeAliasReq { KindOfInvalid, false, nullptr, nullptr };
+  return TypeAliasReq::Invalid();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -900,17 +972,12 @@ void Unit::defTypeAlias(Id id) {
     };
     if (thisType->attrs & AttrPersistent) {
       // We may have cached the fully resolved type in a previous request.
-      auto resolved = resolveTypeAlias(thisType);
-      if (resolved.kind != current->kind ||
-          resolved.nullable != current->nullable ||
-          resolved.klass != current->klass) {
+      if (resolveTypeAlias(thisType) != *current) {
         raiseIncompatible();
       }
       return;
     }
-    if (thisType->kind != current->kind ||
-        thisType->nullable != current->nullable ||
-        Unit::lookupClass(typeName) != current->klass) {
+    if (!current->compat(*thisType)) {
       raiseIncompatible();
     }
     return;
@@ -925,15 +992,15 @@ void Unit::defTypeAlias(Id id) {
 
   if (!nameList->m_cachedTypeAlias.bound()) {
     auto rdsMode = (thisType->attrs & AttrPersistent)
-      ? RDS::Mode::Persistent : RDS::Mode::Normal;
+      ? rds::Mode::Persistent : rds::Mode::Normal;
     nameList->m_cachedTypeAlias.bind(rdsMode);
-    RDS::recordRds(nameList->m_cachedTypeAlias.handle(),
+    rds::recordRds(nameList->m_cachedTypeAlias.handle(),
                    sizeof(TypeAliasReq),
                    "TypeAlias", typeName->data());
   }
 
   auto resolved = resolveTypeAlias(thisType);
-  if (resolved.kind == KindOfInvalid) {
+  if (resolved.invalid) {
     raise_error("Unknown type or class %s", typeName->data());
     return;
   }
@@ -983,7 +1050,7 @@ void Unit::initialMerge() {
       allFuncsUnique = (f->attrs() & AttrUnique);
     }
     loadFunc(f);
-    if (RDS::isPersistentHandle(f->funcHandle())) {
+    if (rds::isPersistentHandle(f->funcHandle())) {
       needsCompact = true;
     }
   }
@@ -1075,7 +1142,7 @@ void Unit::initialMerge() {
             v->rdsHandle() = makeCnsHandle(
               s, k == MergeKind::PersistentDefine);
             if (k == MergeKind::PersistentDefine) {
-              mergeCns(RDS::handleToRef<TypedValue>(v->rdsHandle()),
+              mergeCns(rds::handleToRef<TypedValue>(v->rdsHandle()),
                        v, s);
             }
             break;
@@ -1101,9 +1168,9 @@ void Unit::merge() {
   }
 
   if (UNLIKELY(isDebuggerAttached())) {
-    mergeImpl<true>(RDS::tl_base, m_mergeInfo);
+    mergeImpl<true>(rds::tl_base, m_mergeInfo);
   } else {
-    mergeImpl<false>(RDS::tl_base, m_mergeInfo);
+    mergeImpl<false>(rds::tl_base, m_mergeInfo);
   }
 }
 
@@ -1143,7 +1210,7 @@ static size_t compactMergeInfo(Unit::MergeInfo* in, Unit::MergeInfo* out) {
   size_t delta = 0;
   while (it != fend) {
     Func* func = *it++;
-    if (RDS::isPersistentHandle(func->funcHandle())) {
+    if (rds::isPersistentHandle(func->funcHandle())) {
       delta++;
     } else if (iout) {
       *iout++ = func;
@@ -1164,7 +1231,7 @@ static size_t compactMergeInfo(Unit::MergeInfo* in, Unit::MergeInfo* out) {
       Class* cls = pre->namedEntity()->clsList();
       assert(cls && !cls->m_nextClass);
       assert(cls->preClass() == pre);
-      if (RDS::isPersistentHandle(cls->classHandle())) {
+      if (rds::isPersistentHandle(cls->classHandle())) {
         delta++;
       } else if (out) {
         out->mergeableObj(oix++) = (void*)(uintptr_t(cls) | 1);
@@ -1189,7 +1256,7 @@ static size_t compactMergeInfo(Unit::MergeInfo* in, Unit::MergeInfo* out) {
           Class* cls = pre->namedEntity()->clsList();
           assert(cls && !cls->m_nextClass);
           assert(cls->preClass() == pre);
-          if (RDS::isPersistentHandle(cls->classHandle())) {
+          if (rds::isPersistentHandle(cls->classHandle())) {
             delta++;
           } else if (out) {
             out->mergeableObj(oix++) = (void*)
@@ -1286,7 +1353,7 @@ void Unit::mergeImpl(void* tcbase, MergeInfo* mi) {
           Stats::inc(Stats::UnitMerge_hoistable_persistent);
         }
         if (Stats::enabled() &&
-            RDS::isPersistentHandle(cls->classHandle())) {
+            rds::isPersistentHandle(cls->classHandle())) {
           Stats::inc(Stats::UnitMerge_hoistable_persistent_cache);
         }
         if (Class* parent = cls->parent()) {
@@ -1294,7 +1361,7 @@ void Unit::mergeImpl(void* tcbase, MergeInfo* mi) {
             Stats::inc(Stats::UnitMerge_hoistable_persistent_parent);
           }
           if (Stats::enabled() &&
-              RDS::isPersistentHandle(parent->classHandle())) {
+              rds::isPersistentHandle(parent->classHandle())) {
             Stats::inc(Stats::UnitMerge_hoistable_persistent_parent_cache);
           }
           if (UNLIKELY(!getDataRef<Class*>(tcbase, parent->classHandle()))) {
@@ -1372,7 +1439,7 @@ void Unit::mergeImpl(void* tcbase, MergeInfo* mi) {
             Stats::inc(Stats::UnitMerge_mergeable_unique_persistent);
           }
           if (Stats::enabled() &&
-              RDS::isPersistentHandle(cls->classHandle())) {
+              rds::isPersistentHandle(cls->classHandle())) {
             Stats::inc(Stats::UnitMerge_mergeable_unique_persistent_cache);
           }
           Class::Avail avail = cls->avail(other, true);
@@ -1544,7 +1611,7 @@ Array getFunctions() {
       if (!func_ || (system ^ func_->isBuiltin()) || func_->isGenerated()) {
         continue;
       }
-      a.append(VarNR(func_->name()));
+      a.append(VarNR(HHVM_FN(strtolower)(func_->nameStr())));
     }
   }
   return a;

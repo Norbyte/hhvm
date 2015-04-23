@@ -56,7 +56,7 @@ void GraphBuilder::createBlocks() {
   // ordinary basic block boundaries
   for (InstrRange i = funcInstrs(m_func); !i.empty(); ) {
     PC pc = i.popFront();
-    if (isCF(pc) && !i.empty()) createBlock(i.front());
+    if ((isCF(pc) || isTF(pc)) && !i.empty()) createBlock(i.front());
     if (isSwitch(*reinterpret_cast<const Op*>(pc))) {
       foreachSwitchTarget(reinterpret_cast<const Op*>(pc), [&](Offset& o) {
         createBlock(pc + o);
@@ -124,8 +124,8 @@ void GraphBuilder::createExBlocks() {
     }
     if (handler.m_type == EHEnt::Type::Catch) {
       m_graph->exn_cap += handler.m_catches.size() - 1;
-      for (Range<EHEnt::CatchVec> c(handler.m_catches); !c.empty(); ) {
-        createBlock(c.popFront().second);
+      for (auto const& c : handler.m_catches) {
+        createBlock(c.second);
       }
     } else {
       createBlock(handler.m_fault);
@@ -184,8 +184,8 @@ void GraphBuilder::linkExBlocks() {
       assert(eh->m_base <= off && off < eh->m_past);
       if (eh->m_type == EHEnt::Type::Catch) {
         // each catch block is reachable from b
-        for (Range<EHEnt::CatchVec> j(eh->m_catches); !j.empty(); ) {
-          exns(b)[exn_index++] = at(j.popFront().second);
+        for (auto const& j : eh->m_catches) {
+          exns(b)[exn_index++] = at(j.second);
         }
         eh = nextOuter(ehtab, eh);
       } else {
@@ -202,8 +202,8 @@ void GraphBuilder::linkExBlocks() {
       while (eh) {
         if (eh->m_type == EHEnt::Type::Catch) {
           // each catch target for eh is reachable from b
-          for (Range<EHEnt::CatchVec> j(eh->m_catches); !j.empty(); ) {
-            exns(b)[exn_index++] = at(j.popFront().second);
+          for (auto const& j : eh->m_catches) {
+            exns(b)[exn_index++] = at(j.second);
           }
           eh = nextOuter(ehtab, eh);
         } else {

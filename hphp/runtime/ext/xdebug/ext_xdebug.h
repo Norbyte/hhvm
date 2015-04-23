@@ -18,11 +18,11 @@
 #ifndef incl_HPHP_EXT_XDEBUG_H_
 #define incl_HPHP_EXT_XDEBUG_H_
 
-#include "hphp/runtime/base/base-includes.h"
-#include "hphp/util/thread-local.h"
+#include <folly/Optional.h>
 
-using std::string;
-using std::map;
+#include "hphp/runtime/ext/extension.h"
+#include "hphp/util/thread-local.h"
+#include "hphp/util/timer.h"
 
 namespace HPHP {
 
@@ -30,12 +30,16 @@ struct XDebugServer;
 
 ///////////////////////////////////////////////////////////////////////////////
 
-#define XDEBUG_NAME "xdebug-not-done"
+#define XDEBUG_NAME "xdebug"
 #define XDEBUG_VERSION NO_EXTENSION_VERSION_YET
 #define XDEBUG_AUTHOR "HHVM"
 #define XDEBUG_COPYRIGHT  "Copyright (c) 2002-2013 by Derick Rethans"
 #define XDEBUG_COPYRIGHT_SHORT "Copyright (c) 2002-2013"
 #define XDEBUG_URL "http://hhvm.com/"
+
+#define OUTPUT_NOT_CHECKED -1
+#define OUTPUT_IS_TTY       1
+#define OUTPUT_NOT_TTY      0
 
 // TODO(#3704) Not all of these should be thread local and settable via ini_set
 // Request Local ini config settings
@@ -81,35 +85,28 @@ struct XDebugServer;
   XDEBUG_OPT(bool, "auto_trace", AutoTrace, false) \
   XDEBUG_OPT(int, "cli_color", CliColor, 0) \
   XDEBUG_OPT(bool, "collect_assignments", CollectAssignments, false) \
-  XDEBUG_OPT(bool, "collect_includes", CollectIncludes, true) \
   XDEBUG_OPT(int, "collect_params", CollectParams, 0) \
   XDEBUG_OPT(bool, "collect_return", CollectReturn, false) \
   XDEBUG_OPT(bool, "collect_vars", CollectVars, false) \
-  XDEBUG_OPT(bool, "default_enable", DefaultEnable, true) \
-  XDEBUG_OPT(bool, "dump_globals", DumpGlobals, true) \
-  XDEBUG_OPT(bool, "dump_once", DumpOnce, true) \
   XDEBUG_OPT(bool, "dump_undefined", DumpUndefined, false) \
-  XDEBUG_OPT(string, "file_link_format", FileLinkFormat, "") \
+  XDEBUG_OPT(std::string, "file_link_format", FileLinkFormat, "") \
   XDEBUG_OPT(bool, "force_display_errors", ForceDisplayErrors, false) \
   XDEBUG_OPT(uint64_t, "framebuf_size", FramebufSize, 100000) \
   XDEBUG_OPT(double, "framebuf_expansion", FramebufExpansion, 1.5) \
-  XDEBUG_OPT(string, "idekey", IdeKey, "") \
-  XDEBUG_OPT(string, "manual_url", ManualUrl, "http://www.php.net") \
-  XDEBUG_OPT(int, "overload_var_dump", OverloadVarDump, true) \
+  XDEBUG_OPT(std::string, "idekey", IdeKey, "") \
+  XDEBUG_OPT(std::string, "manual_url", ManualUrl, "http://www.php.net") \
   XDEBUG_OPT(bool, "profiler_append", ProfilerAppend, false) \
   XDEBUG_OPT(bool, "profiler_enable", ProfilerEnable, false) \
   XDEBUG_OPT(bool, "profiler_enable_trigger", ProfilerEnableTrigger, false) \
-  XDEBUG_OPT(string, "profiler_output_dir", ProfilerOutputDir, "/tmp") \
-  XDEBUG_OPT(string, "profiler_output_name", ProfilerOutputName, \
-             "cachegrind.out.%p") \
-  XDEBUG_OPT(bool, "remote_autostart", RemoteAutostart, false) \
+  XDEBUG_OPT(std::string, "profiler_output_dir", ProfilerOutputDir, "/tmp") \
+  XDEBUG_OPT(std::string, "profiler_output_name", ProfilerOutputName, \
+             "cachegrind.out.%t") \
   XDEBUG_OPT(bool, "remote_connect_back", RemoteConnectBack, false) \
   XDEBUG_OPT(int, "remote_cookie_expire_time", RemoteCookieExpireTime, 3600) \
-  XDEBUG_OPT(bool, "remote_enable", RemoteEnable, false) \
-  XDEBUG_OPT(string, "remote_handler", RemoteHandler, "dbgp") \
-  XDEBUG_OPT(string, "remote_host", RemoteHost, "localhost") \
-  XDEBUG_OPT(string, "remote_log", RemoteLog, "") \
-  XDEBUG_OPT(string, "remote_mode", RemoteMode, "req") \
+  XDEBUG_OPT(std::string, "remote_handler", RemoteHandler, "dbgp") \
+  XDEBUG_OPT(std::string, "remote_host", RemoteHost, "localhost") \
+  XDEBUG_OPT(std::string, "remote_log", RemoteLog, "") \
+  XDEBUG_OPT(std::string, "remote_mode", RemoteMode, "req") \
   XDEBUG_OPT(int, "remote_port", RemotePort, 9000) \
   XDEBUG_OPT(double, "remote_timeout", RemoteTimeout, 0.2) \
   XDEBUG_OPT(bool, "show_exception_trace", ShowExcptionTrace, false) \
@@ -118,8 +115,8 @@ struct XDebugServer;
   XDEBUG_OPT(bool, "trace_enable_trigger", TraceEnableTrigger, false) \
   XDEBUG_OPT(int, "trace_format", TraceFormat, 0) \
   XDEBUG_OPT(bool, "trace_options", TraceOptions, false) \
-  XDEBUG_OPT(string, "trace_output_dir", TraceOutputDir, "/tmp") \
-  XDEBUG_OPT(string, "trace_output_name", TraceOutputName, "trace.%c") \
+  XDEBUG_OPT(std::string, "trace_output_dir", TraceOutputDir, "/tmp") \
+  XDEBUG_OPT(std::string, "trace_output_name", TraceOutputName, "trace.%c") \
   XDEBUG_OPT(int, "var_display_max_children", VarDisplayMaxChildren, 128) \
   XDEBUG_OPT(int, "var_display_max_data", VarDisplayMaxData, 512) \
   XDEBUG_OPT(int, "var_display_max_depth", VarDisplayMaxDepth, 3)
@@ -130,15 +127,25 @@ struct XDebugServer;
   XDEBUG_OPT(int, "force_error_reporting", ForceErrorReporting, 0) \
   XDEBUG_OPT(int, "halt_level", HaltLevel, 0) \
 
+// Config options that can also be set from HDF configs.
+#define XDEBUG_HDF_CFG \
+  XDEBUG_OPT(bool, "collect_includes", CollectIncludes, true) \
+  XDEBUG_OPT(bool, "default_enable", DefaultEnable, true) \
+  XDEBUG_OPT(bool, "dump_globals", DumpGlobals, true) \
+  XDEBUG_OPT(bool, "dump_once", DumpOnce, true) \
+  XDEBUG_OPT(int, "overload_var_dump", OverloadVarDump, 1) \
+  XDEBUG_OPT(bool, "remote_autostart", RemoteAutostart, false) \
+  XDEBUG_OPT(bool, "remote_enable", RemoteEnable, false) \
+
 // xdebug.dump.* settings
 #define XDEBUG_DUMP_CFG \
-  XDEBUG_OPT(string, "COOKIE", DumpCookie, "") \
-  XDEBUG_OPT(string, "FILES", DumpFiles, "") \
-  XDEBUG_OPT(string, "GET", DumpGet, "") \
-  XDEBUG_OPT(string, "POST", DumpPost, "") \
-  XDEBUG_OPT(string, "REQUEST", DumpRequest, "") \
-  XDEBUG_OPT(string, "SERVER", DumpServer, "") \
-  XDEBUG_OPT(string, "SESSION", DumpSession, "") \
+  XDEBUG_OPT(std::string, "COOKIE", DumpCookie, "") \
+  XDEBUG_OPT(std::string, "FILES", DumpFiles, "") \
+  XDEBUG_OPT(std::string, "GET", DumpGet, "") \
+  XDEBUG_OPT(std::string, "POST", DumpPost, "") \
+  XDEBUG_OPT(std::string, "REQUEST", DumpRequest, "") \
+  XDEBUG_OPT(std::string, "SERVER", DumpServer, "") \
+  XDEBUG_OPT(std::string, "SESSION", DumpSession, "") \
 
 // Options that notify the profiler on change
 //  collect_memory, collect_time:
@@ -159,43 +166,41 @@ struct XDebugServer;
 #define XDEBUG_CUSTOM_GLOBALS \
   XDEBUG_OPT(bool, nullptr, ProfilerAttached, false) \
   XDEBUG_OPT(int64_t, nullptr, InitTime, Timer::GetCurrentTimeMicros()) \
-  XDEBUG_OPT(XDebugServer*, nullptr, Server, nullptr)
+  XDEBUG_OPT(XDebugServer*, nullptr, Server, nullptr) \
+  XDEBUG_OPT(folly::Optional<bool>, nullptr, OutputIsTTY, folly::none)
 
 // Retrieves the value of the given xdebug global
 #define XDEBUG_GLOBAL(name) (*XDebugExtension::name)
 
 // Returns the ini name for the given hhvm configuration option.
-// TODO(#3704) This should not be hhvm. Need to change tests.
-#define XDEBUG_INI(name) (("hhvm." XDEBUG_NAME ".") + string(name))
-
-// TODO(#3704) Remove when xdebug fully implemented
-#define XDEBUG_NOTIMPLEMENTED  { throw_not_implemented(__FUNCTION__); }
+#define XDEBUG_INI(name) ((XDEBUG_NAME ".") + std::string(name))
 
 ///////////////////////////////////////////////////////////////////////////////
-const int64_t k_XDEBUG_CC_UNUSED = 1;
-const int64_t k_XDEBUG_CC_DEAD_CODE = 2;
-const int64_t k_XDEBUG_TRACE_APPEND = 1;
-const int64_t k_XDEBUG_TRACE_COMPUTERIZED = 2;
-const int64_t k_XDEBUG_TRACE_HTML = 4;
-const int64_t k_XDEBUG_TRACE_NAKED_FILENAME = 8;
-const int64_t k_XDEBUG_PROFILE_APPEND = 1;
+constexpr int64_t k_XDEBUG_CC_UNUSED = 1;
+constexpr int64_t k_XDEBUG_CC_DEAD_CODE = 2;
+constexpr int64_t k_XDEBUG_TRACE_APPEND = 1;
+constexpr int64_t k_XDEBUG_TRACE_COMPUTERIZED = 2;
+constexpr int64_t k_XDEBUG_TRACE_HTML = 4;
+constexpr int64_t k_XDEBUG_TRACE_NAKED_FILENAME = 8;
+constexpr int64_t k_XDEBUG_PROFILE_APPEND = 1;
 ///////////////////////////////////////////////////////////////////////////////
 Variant HHVM_FUNCTION(xdebug_get_profiler_filename);
+void HHVM_FUNCTION(xdebug_var_dump, const Variant&, const Array&);
 ///////////////////////////////////////////////////////////////////////////////
 
-class XDebugExtension : public Extension {
-public:
+struct XDebugExtension final : Extension {
   XDebugExtension() : Extension(XDEBUG_NAME, XDEBUG_VERSION) { }
 
-  virtual void moduleLoad(const IniSetting::Map& ini, Hdf xdebug_hdf);
-  virtual void moduleInit();
-  virtual void requestInit();
-  virtual void requestShutdown();
+  void moduleLoad(const IniSetting::Map& ini, Hdf xdebug_hdf) override;
+  void moduleInit() override;
+  void requestInit() override;
+  void requestShutdown() override;
 
   // Standard config options
   #define XDEBUG_OPT(T, name, sym, val) static DECLARE_THREAD_LOCAL(T, sym);
   XDEBUG_CFG
   XDEBUG_MAPPED_CFG
+  XDEBUG_HDF_CFG
   XDEBUG_DUMP_CFG
   XDEBUG_PROF_CFG
   XDEBUG_CUSTOM_GLOBALS
@@ -203,6 +208,7 @@ public:
 
   // Indicates whether the xdebug extension has been enabled via xdebug.enable
   static bool Enable;
+  bool moduleEnabled() const override { return Enable; }
 };
 
 ///////////////////////////////////////////////////////////////////////////////

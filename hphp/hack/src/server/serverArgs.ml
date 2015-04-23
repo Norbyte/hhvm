@@ -9,32 +9,23 @@
  *)
 
 (*****************************************************************************)
-(* File parsing the arguments on the command line *)
-(*****************************************************************************)
-
-(*****************************************************************************)
 (* The options from the command line *)
 (*****************************************************************************)
 
 type options = {
-    check_mode       : bool;
-    json_mode        : bool;
-    debug_init       : bool;
-    skip_init        : bool;
-    root             : Path.path;
-    should_detach    : bool;
-    convert          : Path.path option;
-    rest             : string list;
-  }
+  check_mode       : bool;
+  json_mode        : bool;
+  root             : Path.path;
+  should_detach    : bool;
+  convert          : Path.path option;
+  no_load          : bool;
+  save_filename    : string option;
+}
 
 (*****************************************************************************)
 (* Usage code *)
 (*****************************************************************************)
 let usage = Printf.sprintf "Usage: %s [WWW DIRECTORY]\n" Sys.argv.(0)
-
-let print_usage_and_exit () =
-  Printf.fprintf stderr "%s" usage;
-  exit 1
 
 (*****************************************************************************)
 (* Options *)
@@ -42,69 +33,66 @@ let print_usage_and_exit () =
 
 module Messages = struct
   let debug         = " debugging mode"
-  let debug_init    = " debug the initialization"
-  let skip          = " skip errors at initialization"
-  let suggest_types = " generates the file hh_pad_patches"
   let check         = " check and exit"
   let json          = " output errors in json format (arc lint mode)"
-  let all           = " sandcastle mode"
   let daemon        = " detach process"
   let from_vim      = " passed from hh_client"
   let from_emacs    = " passed from hh_client"
   let from_hhclient = " passed from hh_client"
   let convert       = " adds type annotations automatically"
-  let rest          = ""
+  let save          = " save server state to file"
+  let no_load       = " don't load from a saved state"
 end
-
 
 (*****************************************************************************)
 (* CAREFUL!!!!!!! *)
 (*****************************************************************************)
-(* --json and --all are used for the linters. External tools are relying on the
+(* --json is used for the linters. External tools are relying on the
    format -- don't change it in an incompatible way!
 *)
 (*****************************************************************************)
 
-let arg x = Arg.Unit (fun () -> x := true)
+(*****************************************************************************)
+(* The main entry point *)
+(*****************************************************************************)
 
-let rest r = Arg.Rest (fun x -> r := x :: !r)
-
-let populate_options () =
+let parse_options () =
   let root          = ref "" in
   let from_vim      = ref false in
   let from_emacs    = ref false in
   let from_hhclient = ref false in
   let debug         = ref false in
-  let debug_init    = ref false in
-  let skip          = ref false in
   let check_mode    = ref false in
   let json_mode     = ref false in
   let should_detach = ref false in
-  let save_types    = ref false in
   let convert_dir   = ref None  in
-  let all           = ref false in
+  let save          = ref None in
+  let no_load       = ref false in
+  let version       = ref false in
   let cdir          = fun s -> convert_dir := Some s in
-  let rest_options  = ref [] in
+  let set_save      = fun s -> save := Some s in
   let options =
-    ["--debug"         , arg debug         , Messages.debug;
-     "--debug-init"    , arg debug_init    , Messages.debug_init;
-     "--skip"          , arg skip          , Messages.skip;
-     "--suggest-types" , arg save_types    , Messages.suggest_types;
-     "--check"         , arg check_mode    , Messages.check;
-     "--json"          , arg json_mode     , Messages.json; (* CAREFUL!!! *)
-     "--all"           , arg all           , Messages.all;  (* CAREFUL!!! *)
-     "--daemon"        , arg should_detach , Messages.daemon;
-     "-d"              , arg should_detach , Messages.daemon;
-     "--from-vim"      , arg from_vim      , Messages.from_vim;
-     "--from-emacs"    , arg from_emacs    , Messages.from_emacs;
-     "--from-hhclient" , arg from_hhclient , Messages.from_hhclient;
-     "--convert"       , Arg.String cdir   , Messages.convert;
-     "--"              , rest rest_options , Messages.rest;
-   ] in
+    ["--debug"         , Arg.Set debug         , Messages.debug;
+     "--check"         , Arg.Set check_mode    , Messages.check;
+     "--json"          , Arg.Set json_mode     , Messages.json; (* CAREFUL!!! *)
+     "--daemon"        , Arg.Set should_detach , Messages.daemon;
+     "-d"              , Arg.Set should_detach , Messages.daemon;
+     "--from-vim"      , Arg.Set from_vim      , Messages.from_vim;
+     "--from-emacs"    , Arg.Set from_emacs    , Messages.from_emacs;
+     "--from-hhclient" , Arg.Set from_hhclient , Messages.from_hhclient;
+     "--convert"       , Arg.String cdir       , Messages.convert;
+     "--save"          , Arg.String set_save   , Messages.save;
+     "--no-load"       , Arg.Set no_load       , Messages.no_load;
+     "--version"       , Arg.Set version       , "";
+    ] in
   let options = Arg.align options in
   Arg.parse options (fun s -> root := s) usage;
-  (* json implies check *)
-  let check_mode = !check_mode || !json_mode; in
+  if !version then begin
+    print_string Build_id.build_id_ohai;
+    exit 0
+  end;
+  (* --json and --save both imply check *)
+  let check_mode = !check_mode || !json_mode || !save <> None; in
   (* Conversion mode implies check *)
   let check_mode = check_mode || !convert_dir <> None in
   let convert = Utils.opt_map Path.mk_path (!convert_dir) in
@@ -113,48 +101,28 @@ let populate_options () =
       Printf.fprintf stderr "You must specify a root directory!\n";
       exit 2
   | _ -> ());
-  { json_mode     = !json_mode;
+  let root_path = Path.mk_path !root in
+  Wwwroot.assert_www_directory root_path;
+  {
+    json_mode     = !json_mode;
     check_mode    = check_mode;
-    debug_init    = !debug_init;
-    skip_init     = !skip;
-    root          = Path.mk_path !root;
+    root          = root_path;
     should_detach = !should_detach;
     convert       = convert;
-    rest          = !rest_options;
+    no_load       = !no_load;
+    save_filename = !save;
   }
 
 (* useful in testing code *)
-let default_options ~root =
-{
+let default_options ~root = {
   check_mode = false;
   json_mode = false;
-  debug_init = false;
-  skip_init = false;
   root = Path.mk_path root;
   should_detach = false;
   convert = None;
-  rest = [];
+  no_load = true;
+  save_filename = None;
 }
-
-(*****************************************************************************)
-(* Code checking that the options passed are correct.
- * Pretty minimalistic for now.
- *)
-(*****************************************************************************)
-
-let check_options options =
-  let root = options.root in
-  Wwwroot.assert_www_directory root;
-  ()
-
-(*****************************************************************************)
-(* The main entry point *)
-(*****************************************************************************)
-
-let parse_options () =
-  let options = populate_options () in
-  check_options options;
-  options
 
 (*****************************************************************************)
 (* Accessors *)
@@ -162,8 +130,8 @@ let parse_options () =
 
 let check_mode options = options.check_mode
 let json_mode options = options.json_mode
-let debug_init options = options.debug_init
-let skip_init options = options.skip_init
 let root options = options.root
 let should_detach options = options.should_detach
 let convert options = options.convert
+let no_load options = options.no_load
+let save_filename options = options.save_filename

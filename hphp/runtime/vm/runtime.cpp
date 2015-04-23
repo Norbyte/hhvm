@@ -15,7 +15,6 @@
 */
 #include "hphp/runtime/vm/runtime.h"
 #include "hphp/runtime/base/execution-context.h"
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/server/source-root-info.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/runtime/base/mixed-array.h"
@@ -30,13 +29,12 @@
 #include "hphp/util/text-util.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/base/zend-functions.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 
 namespace HPHP {
 
 TRACE_SET_MOD(runtime);
 
-CompileStringAST g_hphp_compiler_serialize_code_model_for;
 CompileStringFn g_hphp_compiler_parse;
 BuildNativeFuncUnitFn g_hphp_build_native_func_unit;
 BuildNativeClassUnitFn g_hphp_build_native_class_unit;
@@ -262,73 +260,8 @@ void raiseArrayIndexNotice(const int64_t index) {
   raise_notice("Undefined index: %" PRId64, index);
 }
 
-//////////////////////////////////////////////////////////////////////
-
-const StaticString
-  s_HH_Traversable("HH\\Traversable"),
-  s_HH_KeyedTraversable("HH\\KeyedTraversable"),
-  s_HH_Container("HH\\Container"),
-  s_HH_KeyedContainer("HH\\KeyedContainer"),
-  s_Indexish("Indexish"),
-  s_XHPChild("XHPChild"),
-  s_Stringish("Stringish");
-
-bool interface_supports_non_objects(const StringData* s) {
-  return (s->isame(s_HH_Traversable.get()) ||
-          s->isame(s_HH_KeyedTraversable.get()) ||
-          s->isame(s_HH_Container.get()) ||
-          s->isame(s_HH_KeyedContainer.get()) ||
-          s->isame(s_Indexish.get()) ||
-          s->isame(s_XHPChild.get()) ||
-          s->isame(s_Stringish.get()));
-}
-
-bool interface_supports_array(const StringData* s) {
-  return (s->isame(s_HH_Traversable.get()) ||
-          s->isame(s_HH_KeyedTraversable.get()) ||
-          s->isame(s_HH_Container.get()) ||
-          s->isame(s_HH_KeyedContainer.get()) ||
-          s->isame(s_Indexish.get()) ||
-          s->isame(s_XHPChild.get()));
-}
-
-bool interface_supports_array(const std::string& n) {
-  const char* s = n.c_str();
-  return ((n.size() == 14 && !strcasecmp(s, "HH\\Traversable")) ||
-          (n.size() == 19 && !strcasecmp(s, "HH\\KeyedTraversable")) ||
-          (n.size() == 12 && !strcasecmp(s, "HH\\Container")) ||
-          (n.size() == 17 && !strcasecmp(s, "HH\\KeyedContainer")) ||
-          (n.size() == 8 && !strcasecmp(s, "Indexish")) ||
-          (n.size() == 8 && !strcasecmp(s, "XHPChild")));
-}
-
-bool interface_supports_string(const StringData* s) {
-  return s->isame(s_XHPChild.get())
-    || s->isame(s_Stringish.get());
-}
-
-bool interface_supports_string(const std::string& n) {
-  const char *s = n.c_str();
-  return (n.size() == 8 && !strcasecmp(s, "XHPChild"))
-    || (n.size() == 9 && !strcasecmp(s, "Stringish"));
-}
-
-bool interface_supports_int(const StringData* s) {
-  return (s->isame(s_XHPChild.get()));
-}
-
-bool interface_supports_int(const std::string& n) {
-  const char *s = n.c_str();
-  return (n.size() == 8 && !strcasecmp(s, "XHPChild"));
-}
-
-bool interface_supports_double(const StringData* s) {
-  return (s->isame(s_XHPChild.get()));
-}
-
-bool interface_supports_double(const std::string& n) {
-  const char *s = n.c_str();
-  return (n.size() == 8 && !strcasecmp(s, "XHPChild"));
+void raiseArrayKeyNotice(const StringData* key) {
+  raise_notice("Undefined key: %s", key->data());
 }
 
 //////////////////////////////////////////////////////////////////////

@@ -17,13 +17,20 @@
 #ifndef incl_HPHP_JIT_VASM_PRINT_H_
 #define incl_HPHP_JIT_VASM_PRINT_H_
 
-#include "hphp/runtime/vm/jit/vasm-x64.h"
+#include "hphp/runtime/vm/jit/vasm.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 
 #include <vector>
 #include <iostream>
 #include <string>
 
 namespace HPHP { namespace jit {
+///////////////////////////////////////////////////////////////////////////////
+
+struct Vinstr;
+struct Vunit;
+
+///////////////////////////////////////////////////////////////////////////////
 
 std::string show(Vreg r);
 std::string show(Vptr p);
@@ -38,10 +45,16 @@ void printCfg(std::ostream& out, const Vunit& unit,
 // Tracing level constants.
 constexpr int kInitialVasmLevel = 1;
 constexpr int kVasmImmsLevel = 2;
+constexpr int kVasmFusionLevel = 2;
 constexpr int kVasmCodeGenLevel = 2;
 constexpr int kVasmRegAllocLevel = 3;
+constexpr int kVasmCopyPropLevel = 4;
+constexpr int kVasmARMFoldLevel = 4;
 constexpr int kVasmJumpsLevel = 4;
+constexpr int kVasmExitsLevel = 4;
 constexpr int kVasmDCELevel = 4;
+constexpr int kVasmLowerLevel = 4;
+constexpr int kVasmUnreachableLevel = 6;
 
 // Print the cfg digraph followed by a vasm code listing, if the trace level is
 // above `level'.
@@ -49,9 +62,14 @@ void printUnit(int level,
                const std::string& caption,
                const Vunit& unit);
 
+void printInstrs(std::ostream& out,
+                 const Vunit& unit,
+                 const jit::vector<Vinstr>& code);
+
 // main, cold, frozen
 extern const char* area_names[];
 
-} }
+///////////////////////////////////////////////////////////////////////////////
+}}
 
 #endif

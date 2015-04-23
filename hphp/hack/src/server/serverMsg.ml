@@ -8,6 +8,7 @@
  *
  *)
 
+open Sys_utils
 
 (**
  * Commands and responses hh_server deals with
@@ -20,7 +21,6 @@
  *)
 
 type build_opts = {
-  root: Path.path;
   steps: string list option; (* steps for hack build to run.
                          None means 'all' *)
   no_steps: string list option; (* ...but don't run these steps *)
@@ -30,12 +30,15 @@ type build_opts = {
   test_dir: string option; (* test dir to generate into *)
   grade: bool; (* when true, diff test output against www and print
                   some stats *)
-  list_classes: bool; (* when true, generate class list files for
-                         traversed classes *)
   check: bool; (* some sanity checking *)
   clean_before_build: bool; (* when true, do a clean build *)
   clean: bool; (* when true just clean all generated files *)
   is_push: bool; (* for push builds *)
+  incremental: bool; (* for incremental build *)
+  wait: bool; (* when true, wait forever for server initialization *)
+  (* user the client is running as; if the server is running as a different user
+   * we will probably have hard-to-debug permissions issues, so error out *)
+  user: string;
   verbose: bool;
 }
 
@@ -55,22 +58,21 @@ type file_input =
 | FileContent of string
 
 type insert_patch = {
-  pos: Pos.t;
+  pos: Pos.absolute;
   text: string;
 }
 
 type patch =
 | Insert of insert_patch
-| Remove of Pos.t
+| Remove of Pos.absolute
 | Replace of insert_patch
 
 type command =
 | ERROR_OUT_OF_DATE
-| PRINT_TYPES of file_input
 | STATUS of Path.path
 | LIST_FILES
+| LIST_MODES
 | AUTOCOMPLETE of string
-| SAVE_STATE of string
 | SHOW of string
 | KILL
 | PING
@@ -85,6 +87,10 @@ type command =
 | SEARCH of string * string
 | SUGGEST of string list
 | ARGUMENT_INFO of string * int * int
+| CALC_COVERAGE of string
+| PRINT_COVERAGE_LEVELS of file_input
+| LINT of string list
+| LINT_ALL of int
 
 let cmd_to_channel (oc:out_channel) (cmd:command): unit =
   Printf.fprintf oc "%s\n" Build_id.build_id_ohai;
@@ -106,9 +112,14 @@ type response =
 | SERVER_OUT_OF_DATE
 | DIRECTORY_MISMATCH of directory_mismatch
 | NO_ERRORS
-| ERRORS of Errors.error list
+| ERRORS of Pos.absolute Errors.error_ list
 | SERVER_DYING
 | PONG
+
+type build_progress =
+| BUILD_PROGRESS of string
+| BUILD_ERROR of string
+| BUILD_FINISHED
 
 let response_to_string = function
   | SERVER_OUT_OF_DATE -> "Server Out of Date"
@@ -119,7 +130,9 @@ let response_to_string = function
   | PONG -> "Pong"
 
 let response_to_channel (oc:out_channel) (cmd:response): unit =
-  Printf.fprintf oc "%s\n" Build_id.build_id_ohai;
+  (* flush immediately so that the client knows we're not hung; see
+   * response_from_channel below *)
+  Printf.fprintf oc "%s\n%!" Build_id.build_id_ohai;
   Marshal.to_channel oc cmd [];
   flush oc
 
@@ -127,4 +140,10 @@ let response_from_channel (ic:in_channel): response =
   let s = input_line ic in
   if s <> Build_id.build_id_ohai
   then SERVER_OUT_OF_DATE
-  else Marshal.from_channel ic
+  (* there may be a lot of data returned, so (un)marshalling may take a while;
+   * suspend any active timeouts for now. Since we've already received the
+   * build id, we know that the server has finished computing the data it wants
+   * to send us (i.e. it has not hung) *)
+  else with_timeout 0
+    ~on_timeout:(fun _ -> ())
+    ~do_:(fun () -> Marshal.from_channel ic)

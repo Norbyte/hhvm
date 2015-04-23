@@ -18,8 +18,7 @@
 #ifndef incl_HPHP_EXT_OBJPROF_H_
 #define incl_HPHP_EXT_OBJPROF_H_
 
-#include "hphp/runtime/base/base-includes.h"
-#include <semaphore.h>
+#include "hphp/runtime/ext/extension.h"
 
 /*
  *                       Project ObjProf
@@ -27,12 +26,10 @@
  * Breakdown of allocated memory by object types.
  *
  * How does it work?
- * We turn on tracking of ObjectData* (instances) and then we
- * traverse them to measure their memory.
+ * We traverse all instances of ObjectData* to measure their memory.
  *
  * How do I use it?
- * Calling the objprof_start will start tracking instances.
- * Calling the objprof_get_data extension will trigger the scan.
+ * Call objprof_get_data to trigger the scan.
  */
 
 namespace HPHP {

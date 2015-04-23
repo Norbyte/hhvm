@@ -29,12 +29,12 @@
 #include "hphp/util/either.h"
 #include "hphp/util/smalllocks.h"
 
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/apc-handle.h"
-#include "hphp/runtime/base/runtime-option.h"
-#include "hphp/runtime/base/type-conversions.h"
-#include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/apc-stats.h"
+#include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/runtime-option.h"
+#include "hphp/runtime/base/types.h"
+#include "hphp/runtime/base/type-conversions.h"
 #include "hphp/runtime/server/server-stats.h"
 
 namespace HPHP {
@@ -138,14 +138,11 @@ struct ConcurrentTableSharedStore {
   struct KeyValuePair {
     KeyValuePair() : value(nullptr), sAddr(nullptr) {}
     const char* key;
-    int len;
     APCHandle* value;
     char* sAddr;
     int32_t sSize;
-
-    bool inMem() const {
-      return value != nullptr;
-    }
+    int len;
+    bool inMem() const { return value != nullptr; }
   };
 
   ConcurrentTableSharedStore() = default;
@@ -242,6 +239,11 @@ struct ConcurrentTableSharedStore {
   void dump(std::ostream& out, DumpMode dumpMode);
 
   /*
+   * Dump random key and entry size to output stream
+   */
+  void dumpRandomKeys(std::ostream &out, uint32_t count);
+
+  /*
    * Debugging.  Access information about all the entries in this table.
    *
    * This is extremely expensive and not recommended for use outside of
@@ -286,7 +288,13 @@ private:
   };
 
 private:
-  using Map = tbb::concurrent_hash_map<const char*,StoreValue,CharHashCompare>;
+  template<typename Key, typename T, typename HashCompare>
+  class APCMap : public tbb::concurrent_hash_map<Key,T,HashCompare> {
+  public:
+    void getRandomAPCEntry(std::ostream &out);
+  };
+
+  using Map = APCMap<const char*,StoreValue,CharHashCompare>;
   using ExpirationPair = std::pair<const char*,time_t>;
   using ExpMap = tbb::concurrent_hash_map<const char*,int,CharHashCompare>;
 

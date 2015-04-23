@@ -16,19 +16,28 @@
 */
 
 #include "hphp/runtime/ext/xdebug/ext_xdebug.h"
-#include "hphp/runtime/ext/xdebug/xdebug_profiler.h"
-#include "hphp/runtime/ext/xdebug/xdebug_server.h"
 
 #include "hphp/runtime/base/array-util.h"
+#include "hphp/runtime/base/backtrace.h"
 #include "hphp/runtime/base/code-coverage.h"
 #include "hphp/runtime/base/execution-context.h"
+#include "hphp/runtime/base/extended-logger.h"
+#include "hphp/runtime/base/externals.h"
+#include "hphp/runtime/base/string-util.h"
 #include "hphp/runtime/base/thread-info.h"
-#include "hphp/runtime/base/backtrace.h"
-#include "hphp/runtime/ext/ext_math.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/std/ext_std_math.h"
+#include "hphp/runtime/ext/std/ext_std_variable.h"
+#include "hphp/runtime/ext/string/ext_string.h"
+#include "hphp/runtime/ext/xdebug/php5_xdebug/xdebug_var.h"
+#include "hphp/runtime/ext/xdebug/xdebug_profiler.h"
+#include "hphp/runtime/ext/xdebug/xdebug_server.h"
 #include "hphp/runtime/vm/unwind.h"
 #include "hphp/runtime/vm/vm-regs.h"
+#include "hphp/util/logger.h"
 #include "hphp/util/timer.h"
+
+// TODO(#3704) Remove when xdebug fully implemented
+#define XDEBUG_NOTIMPLEMENTED  { throw_not_implemented(__FUNCTION__); }
 
 namespace HPHP {
 
@@ -36,7 +45,7 @@ namespace HPHP {
 // Helpers
 
 // Globals
-static const StaticString
+const StaticString
   s_SERVER("_SERVER"),
   s_COOKIE("_COOKIE");
 
@@ -45,12 +54,12 @@ static const StaticString
 //
 // If an offset pointer is passed, we store in it it the pc offset of the
 // call to the callee.
-static ActRec *get_call_fp(Offset *off = nullptr) {
+static ActRec* get_call_fp(Offset* off = nullptr) {
   // We want the frame of our callee's callee
   VMRegAnchor _; // Ensure consistent state for vmfp
-  ActRec* fp0 = g_context->getPrevVMState(vmfp());
+  auto fp0 = g_context->getPrevVMState(vmfp());
   assert(fp0);
-  ActRec* fp1 = g_context->getPrevVMState(fp0, off);
+  auto fp1 = g_context->getPrevVMState(fp0, off);
 
   // fp1 should only be NULL if fp0 is the top-level pseudo-main
   if (!fp1) {
@@ -61,7 +70,7 @@ static ActRec *get_call_fp(Offset *off = nullptr) {
 }
 
 // Keys in $_SERVER used by format_filename
-static const StaticString
+const StaticString
   s_HTTP_HOST("HTTP_HOST"),
   s_REQUEST_URI("REQUEST_URI"),
   s_SCRIPT_NAME("SCRIPT_NAME"),
@@ -73,8 +82,8 @@ static const StaticString
 // place, so there shouldn't be more than one reference to it.
 static void replace_special_chars(StringData* str) {
   assert(!str->hasMultipleRefs());
-  int len = str->size();
-  char* data = str->mutableData();
+  auto const len = str->size();
+  auto data = str->mutableData();
   for (int i = 0; i < len; i++) {
     switch (data[i]) {
       case '/':
@@ -94,31 +103,31 @@ static void replace_special_chars(StringData* str) {
 
 // Helper used to create an absolute filename using the passed
 // directory and xdebug-specific format string
-static String format_filename(String* dir,
-                              const String& formatFile,
+static String format_filename(StringSlice dir,
+                              StringSlice formatFile,
                               bool addSuffix) {
   // Create a string buffer and append the directory name
-  int formatlen = formatFile.size();
+  auto const formatlen = formatFile.size();
   StringBuffer buf(formatlen * 2); // Slightly larger than formatlen
-  if (dir != nullptr) {
-    buf.append(*dir);
+  if (!dir.empty()) {
+    buf.append(dir);
     buf.append('/');
   }
 
   // Append the filename
-  ArrayData* globals = get_global_variables()->asArrayData();
+  auto globals = get_global_variables()->asArrayData();
   for (int pos = 0; pos < formatlen; pos++) {
-    char c = formatFile.charAt(pos);
+    auto c = formatFile[pos];
     if (c != '%' || pos + 1 == formatlen) {
       buf.append(c);
       continue;
     }
 
-    c = formatFile.charAt(++pos);
+    c = formatFile[++pos];
     switch (c) {
       // crc32 of current working directory
       case 'c': {
-        int64_t crc32 = f_crc32(g_context->getCwd());
+        auto const crc32 = HHVM_FN(crc32)(g_context->getCwd());
         buf.append(crc32);
         break;
       }
@@ -128,11 +137,11 @@ static String format_filename(String* dir,
         break;
       // Random number
       case 'r':
-        buf.printf("%lx", (uint64_t) f_rand());
+        buf.printf("%lx", (uint64_t)HHVM_FN(rand)());
         break;
       // Script name
       case 's': {
-        Array server = globals->get(s_SERVER).toArray();
+        auto server = globals->get(s_SERVER).toArray();
         if (server.exists(s_SCRIPT_NAME) && server[s_SCRIPT_NAME].isString()) {
           const String scriptname(server[s_SCRIPT_NAME].toString(), CopyString);
           replace_special_chars(scriptname.get());
@@ -142,7 +151,7 @@ static String format_filename(String* dir,
       }
       // Timestamp (seconds)
       case 't': {
-        int64_t sec = (int64_t)time(nullptr);
+        auto const sec = (int64_t)time(nullptr);
         if (sec != -1) {
           buf.append(sec);
         }
@@ -168,7 +177,7 @@ static String format_filename(String* dir,
       }
       // $_SERVER['REQUEST_URI']
       case 'R': {
-        Array server = globals->get(s_SERVER).toArray();
+        auto server = globals->get(s_SERVER).toArray();
         if (globals->exists(s_REQUEST_URI)) {
           const String requri(server[s_REQUEST_URI].toString(), CopyString);
           replace_special_chars(requri.get());
@@ -178,7 +187,7 @@ static String format_filename(String* dir,
       }
       // $_SERVER['UNIQUE_ID']
       case 'U': {
-        Array server = globals->get(s_SERVER).toArray();
+        auto server = globals->get(s_SERVER).toArray();
         if (server.exists(s_UNIQUE_ID) && server[s_UNIQUE_ID].isString()) {
           const String uniqueid(server[s_UNIQUE_ID].toString(), CopyString);
           replace_special_chars(uniqueid.get());
@@ -192,7 +201,7 @@ static String format_filename(String* dir,
         // from the cookies
         String session_name;
         if (IniSetting::Get(s_SESSION_NAME, session_name)) {
-          Array cookies = globals->get(s_COOKIE).toArray();
+          auto cookies = globals->get(s_COOKIE).toArray();
           if (cookies.exists(session_name) &&
               cookies[session_name].isString()) {
             const String sessionstr(cookies[session_name].toString(),
@@ -232,7 +241,7 @@ static inline XDebugProfiler* xdebug_profiler() {
 
 // Starts tracing using the given profiler
 static void start_tracing(XDebugProfiler* profiler,
-                          String* filename = nullptr,
+                          StringSlice filename = StringSlice(nullptr, 0),
                           int64_t options = 0) {
   // Add ini settings
   if (XDEBUG_GLOBAL(TraceOptions)) {
@@ -247,16 +256,18 @@ static void start_tracing(XDebugProfiler* profiler,
 
   // If no filename is passed, php5 xdebug stores in the default output
   // directory with the default file name
-  String* dirname = nullptr;
-  String default_dirname(XDEBUG_GLOBAL(TraceOutputDir));
-  String default_filename(XDEBUG_GLOBAL(TraceOutputName));
-  if (filename == nullptr) {
-    dirname = &default_dirname;
-    filename = &default_filename;
+  StringSlice dirname(nullptr, 0);
+
+  if (filename.empty()) {
+    auto& default_dirname = XDEBUG_GLOBAL(TraceOutputDir);
+    auto& default_filename = XDEBUG_GLOBAL(TraceOutputName);
+
+    dirname = StringSlice(default_dirname.data(), default_dirname.size());
+    filename = StringSlice(default_filename.data(), default_filename.size());
   }
 
-  bool suffix = !(options & k_XDEBUG_TRACE_NAKED_FILENAME);
-  String abs_filename = format_filename(dirname, *filename, suffix);
+  auto const suffix = !(options & k_XDEBUG_TRACE_NAKED_FILENAME);
+  auto abs_filename = format_filename(dirname, filename, suffix);
   profiler->enableTracing(abs_filename, options);
 }
 
@@ -269,9 +280,13 @@ static void start_profiling(XDebugProfiler* profiler) {
   }
 
   // Create the filename then enable
-  String dirname(XDEBUG_GLOBAL(ProfilerOutputDir));
-  String filename(XDEBUG_GLOBAL(ProfilerOutputName));
-  String abs_filename = format_filename(&dirname, filename, false);
+  auto& dirname = XDEBUG_GLOBAL(ProfilerOutputDir);
+  auto& filename = XDEBUG_GLOBAL(ProfilerOutputName);
+  auto dirname_slice = StringSlice(dirname.data(), dirname.size());
+  auto filename_slice = StringSlice(filename.data(), filename.size());
+
+  auto abs_filename = format_filename(dirname_slice, filename_slice, false);
+
   profiler->enableProfiling(abs_filename, opts);
 }
 
@@ -282,7 +297,7 @@ static void attach_xdebug_profiler() {
   if (s_profiler_factory->start(ProfilerKind::XDebug, 0, false)) {
     XDEBUG_GLOBAL(ProfilerAttached) = true;
     // Enable profiling and tracing if we need to
-    XDebugProfiler* profiler = xdebug_profiler();
+    auto profiler = xdebug_profiler();
     if (XDebugProfiler::isProfilingNeeded()) {
       start_profiling(profiler);
     }
@@ -308,7 +323,7 @@ static void detach_xdebug_profiler() {
 // Detaches the xdebug profiler if it's no longer needed
 static void detach_xdebug_profiler_if_needed() {
   assert(XDEBUG_GLOBAL(ProfilerAttached));
-  XDebugProfiler* profiler = xdebug_profiler();
+  auto profiler = xdebug_profiler();
   if (!profiler->isNeeded()) {
     detach_xdebug_profiler();
   }
@@ -327,20 +342,25 @@ static void refresh_xdebug_profiler() {
   }
 }
 
+static bool is_output_tty() {
+  auto& tty = XDEBUG_GLOBAL(OutputIsTTY);
+  if (tty.hasValue()) return *tty;
+  return *(tty = isatty(STDOUT_FILENO));
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // XDebug Implementation
 
 static bool HHVM_FUNCTION(xdebug_break) {
-  XDebugServer* server = XDEBUG_GLOBAL(Server);
+  auto server = XDEBUG_GLOBAL(Server);
   if (server == nullptr) {
     return false;
   }
 
   // Breakpoint displays the current file/line number
-  StringData* file = g_context->getContainingFileName();
-  String filename = file == nullptr ?
-    empty_string() : String(file->data(), CopyString);
-  int line = g_context->getLine();
+  auto file = g_context->getContainingFileName();
+  auto filename = file == nullptr ? empty_string() : String(file);
+  auto const line = g_context->getLine();
 
   // Attempt to perform the breakpoint, detach the server if something goes
   // wrong
@@ -352,66 +372,76 @@ static bool HHVM_FUNCTION(xdebug_break) {
 
 static Variant HHVM_FUNCTION(xdebug_call_class) {
   // PHP5 xdebug returns false if the callee is top-level
-  ActRec *fp = get_call_fp();
+  auto fp = get_call_fp();
   if (fp == nullptr) {
     return false;
   }
 
   // PHP5 xdebug returns "" for no class
-  Class* cls = fp->m_func->cls();
+  auto cls = fp->m_func->cls();
   if (!cls) {
     return staticEmptyString();
   }
-  return String(cls->name()->data(), CopyString);
+  return String(const_cast<StringData*>(cls->name()));
 }
 
 static String HHVM_FUNCTION(xdebug_call_file) {
-  // PHP5 xdebug returns the top-level file if the callee is top-level
-  ActRec *fp = get_call_fp();
+  // PHP5 xdebug returns the top-level file if the callee is top-level.
+  auto fp = get_call_fp();
+  const Func *func;
   if (fp == nullptr) {
-    VMRegAnchor _; // Ensure consistent state for vmfp
-    fp = g_context->getPrevVMState(vmfp());
-    assert(fp);
+    VMRegAnchor _;
+    func = g_context->getPrevFunc(vmfp());
+    assert(func);
+  } else {
+    func = fp->func();
   }
-  return String(fp->m_func->filename()->data(), CopyString);
+  return String(const_cast<StringData*>(func->filename()));
 }
 
 static int64_t HHVM_FUNCTION(xdebug_call_line) {
-  // PHP5 xdebug returns 0 when it can't determine the line number
+  // PHP5 xdebug returns 0 when it can't determine the line number.
   Offset pc;
-  ActRec *fp = get_call_fp(&pc);
+  auto fp = get_call_fp(&pc);
   if (fp == nullptr) {
     return 0;
   }
 
-  Unit *unit = fp->m_func->unit();
+  auto const unit = fp->m_func->unit();
   assert(unit);
   return unit->getLineNumber(pc);
 }
 
 // php5 xdebug main function string equivalent
-static const StaticString s_CALL_FN_MAIN("{main}");
+const StaticString s_CALL_FN_MAIN("{main}");
 
 static Variant HHVM_FUNCTION(xdebug_call_function) {
-  // PHP5 xdebug returns false if the callee is top-level
-  ActRec *fp = get_call_fp();
+  // PHP5 xdebug returns false if the callee is top-level.
+  auto fp = get_call_fp();
   if (fp == nullptr) {
     return false;
   }
 
-  // PHP5 xdebug returns "{main}" for pseudo-main
+  // PHP5 xdebug returns "{main}" for pseudo-main.
   if (fp->m_func->isPseudoMain()) {
     return s_CALL_FN_MAIN;
   }
-  return String(fp->m_func->name()->data(), CopyString);
+  return String(const_cast<StringData*>(fp->m_func->name()));
 }
 
 static bool HHVM_FUNCTION(xdebug_code_coverage_started) {
-  ThreadInfo *ti = ThreadInfo::s_threadInfo.getNoCheck();
+  auto const ti = ThreadInfo::s_threadInfo.getNoCheck();
   return ti->m_reqInjectionData.getCoverage();
 }
 
 // TODO(#3704) This requires var_dump
+/*
+ * Requirements:
+ *
+ *   - xdebug_get_zval_value_fancy
+ *   - xdebug_get_zval_value_ansi
+ *   - xdebug_get_zval_value
+ */
 static TypedValue* HHVM_FN(xdebug_debug_zval)(ActRec* ar)
   XDEBUG_NOTIMPLEMENTED
 
@@ -433,7 +463,7 @@ static void HHVM_FUNCTION(xdebug_enable) {
 }
 
 static Array HHVM_FUNCTION(xdebug_get_code_coverage) {
-  ThreadInfo *ti = ThreadInfo::s_threadInfo.getNoCheck();
+  auto ti = ThreadInfo::s_threadInfo.getNoCheck();
   if (ti->m_reqInjectionData.getCoverage()) {
     return ti->m_coverage->Report(false);
   }
@@ -445,23 +475,29 @@ static Array HHVM_FUNCTION(xdebug_get_collected_errors,
                            bool clean /* = false */)
   XDEBUG_NOTIMPLEMENTED
 
-static const StaticString s_closure_varname("0Closure");
+const StaticString s_closure_varname("0Closure");
 
 static Array HHVM_FUNCTION(xdebug_get_declared_vars) {
+  if (RuntimeOption::RepoAuthoritative) {
+    raise_error("xdebug_get_declared_vars unsupported in RepoAuthoritative "
+      "mode");
+  }
+
   // Grab the callee function
   VMRegAnchor _; // Ensure consistent state for vmfp
-  ActRec* fp = g_context->getPrevVMState(vmfp());
-  assert(fp);
-  const Func* func = fp->func();
+  auto func = g_context->getPrevFunc(vmfp());
+  if (!func) {
+    return Array::Create();
+  }
 
   // Add each named local to the returned array. Note that since this function
   // is supposed to return all _declared_ variables in scope, which includes
   // variables that have been unset.
-  const Id numNames = func->numNamedLocals();
+  auto const numNames = func->numNamedLocals();
   PackedArrayInit vars(numNames);
   for (Id i = 0; i < numNames; ++i) {
     assert(func->lookupVarId(func->localVarName(i)) == i);
-    String varname(func->localVarName(i)->data(), CopyString);
+    String varname(const_cast<StringData*>(func->localVarName(i)));
     // Skip the internal closure "0Closure" variable
     if (!s_closure_varname.equal(varname)) {
       vars.append(varname);
@@ -471,13 +507,12 @@ static Array HHVM_FUNCTION(xdebug_get_declared_vars) {
 }
 
 static Array HHVM_FUNCTION(xdebug_get_function_stack) {
-  // Need to reverse the backtrace to match php5 xdebug
-  Array bt = createBacktrace(BacktraceArgs()
-                             .skipTop()
-                             .withPseudoMain()
-                             .withArgNames()
-                             .withArgValues(*XDebugExtension::CollectParams));
-
+  // Need to reverse the backtrace to match php5 xdebug.
+  auto bt = createBacktrace(BacktraceArgs()
+                            .skipTop()
+                            .withPseudoMain()
+                            .withArgNames()
+                            .withArgValues(*XDebugExtension::CollectParams));
   return ArrayUtil::Reverse(bt).toArray();
 }
 
@@ -493,12 +528,11 @@ Variant HHVM_FUNCTION(xdebug_get_profiler_filename) {
     return false;
   }
 
-  XDebugProfiler* profiler = xdebug_profiler();
+  auto profiler = xdebug_profiler();
   if (profiler->isProfiling()) {
     return profiler->getProfilingFilename();
-  } else {
-    return false;
   }
+  return false;
 }
 
 static int64_t HHVM_FUNCTION(xdebug_get_stack_depth) {
@@ -507,7 +541,7 @@ static int64_t HHVM_FUNCTION(xdebug_get_stack_depth) {
 
 static Variant HHVM_FUNCTION(xdebug_get_tracefile_name) {
   if (XDEBUG_GLOBAL(ProfilerAttached)) {
-    XDebugProfiler* profiler = xdebug_profiler();
+    auto profiler = xdebug_profiler();
     if (profiler->isTracing()) {
       return profiler->getTracingFilename();
     }
@@ -520,8 +554,8 @@ static bool HHVM_FUNCTION(xdebug_is_enabled) {
 }
 
 static int64_t HHVM_FUNCTION(xdebug_memory_usage) {
-  // With jemalloc, the usage can go negative (see ext_std_options.cpp:831)
-  int64_t usage = MM().getStats().usage;
+  // With jemalloc, the usage can go negative (see memory_get_usage)
+  auto const usage = MM().getStats().usage;
   assert(use_jemalloc || usage >= 0);
   return std::max<int64_t>(usage, 0);
 }
@@ -548,7 +582,7 @@ static void HHVM_FUNCTION(xdebug_start_code_coverage,
   }
 
   // If we get here, turn on coverage
-  ThreadInfo *ti = ThreadInfo::s_threadInfo.getNoCheck();
+  auto ti = ThreadInfo::s_threadInfo.getNoCheck();
   ti->m_reqInjectionData.setCoverage(true);
   if (g_context->isNested()) {
     raise_notice("Calling xdebug_start_code_coverage from a nested VM instance "
@@ -568,33 +602,32 @@ static void HHVM_FUNCTION(xdebug_start_error_collection)
 static Variant HHVM_FUNCTION(xdebug_start_trace,
                              const Variant& traceFileVar,
                              int64_t options /* = 0 */) {
-  // Allowed to pass null
-  String traceFileStr;
+  // Allowed to pass null.
+  StringSlice trace_file(nullptr, 0);
   if (traceFileVar.isString()) {
-    traceFileStr = traceFileVar.toString();
+    trace_file = traceFileVar.toString().slice();
   }
-  String* traceFile = traceFileVar.isString()? &traceFileStr : nullptr;
 
-  // Initialize the profiler if it isn't already
+  // Initialize the profiler if it isn't already.
   if (!XDEBUG_GLOBAL(ProfilerAttached)) {
     attach_xdebug_profiler();
   }
 
-  // php5 xdebug returns false when tracing already started
-  XDebugProfiler* profiler = xdebug_profiler();
+  // php5 xdebug returns false when tracing already started.
+  auto profiler = xdebug_profiler();
   if (profiler->isTracing()) {
     return false;
   }
 
   // Start tracing, then grab the current begin frame
-  start_tracing(profiler, traceFile, options);
+  start_tracing(profiler, trace_file, options);
   profiler->beginFrame(nullptr);
   return HHVM_FN(xdebug_get_tracefile_name)();
 }
 
 static void HHVM_FUNCTION(xdebug_stop_code_coverage,
                           bool cleanup /* = true */) {
-  ThreadInfo *ti = ThreadInfo::s_threadInfo.getNoCheck();
+  auto ti = ThreadInfo::s_threadInfo.getNoCheck();
   ti->m_reqInjectionData.setCoverage(false);
   if (cleanup) {
     ti->m_coverage->Reset();
@@ -610,29 +643,63 @@ static Variant HHVM_FUNCTION(xdebug_stop_trace) {
     return false;
   }
 
-  XDebugProfiler* profiler = xdebug_profiler();
+  auto profiler = xdebug_profiler();
   if (!profiler->isTracing()) {
     return false;
   }
 
   // End with xdebug_stop_trace()
   profiler->endFrame(init_null().asTypedValue(), nullptr, false);
-  String filename = profiler->getTracingFilename();
+  auto filename = profiler->getTracingFilename();
   profiler->disableTracing();
   detach_xdebug_profiler_if_needed();
   return filename;
 }
 
 static double HHVM_FUNCTION(xdebug_time_index) {
-  int64_t micro = Timer::GetCurrentTimeMicros() - XDEBUG_GLOBAL(InitTime);
+  auto const micro = Timer::GetCurrentTimeMicros() - XDEBUG_GLOBAL(InitTime);
   return micro * 1.0e-6;
 }
 
-// TODO(#3704) Almost everything left relies on this. Need to translate xdebug's
-//             var_dump code in xdebug_var.c into the appropriate code in
-//             xdebug_var.cpp
-static TypedValue* HHVM_FN(xdebug_var_dump)(ActRec* ar)
-  XDEBUG_NOTIMPLEMENTED
+static void do_var_dump(const Variant& v) {
+  auto const cli = XDEBUG_GLOBAL(CliColor);
+  XDebugExporter exporter;
+  exporter.max_depth = XDEBUG_GLOBAL(VarDisplayMaxDepth);
+  exporter.max_children = XDEBUG_GLOBAL(VarDisplayMaxChildren);
+  exporter.max_data = XDEBUG_GLOBAL(VarDisplayMaxData);
+  exporter.page = 0;
+
+  String str;
+
+  auto const html_errors =
+    ThreadInfo::s_threadInfo->m_reqInjectionData.hasHtmlErrors();
+  if (html_errors) {
+    str = xdebug_get_zval_value_fancy(v, exporter);
+  } else if ((cli == 1 && is_output_tty()) || cli == 2) {
+    str = xdebug_get_zval_value_ansi(v, exporter);
+  } else {
+    str = xdebug_get_zval_value_text(v, exporter);
+  }
+
+  g_context->write(str);
+}
+
+void HHVM_FUNCTION(
+  xdebug_var_dump,
+  const Variant& v,
+  const Array& _argv /* = null_array */
+) {
+  if (!XDEBUG_GLOBAL(OverloadVarDump) || !XDEBUG_GLOBAL(DefaultEnable)) {
+    HHVM_FN(var_dump)(v, _argv);
+    return;
+  }
+
+  do_var_dump(v);
+  auto const size = _argv.size();
+  for (int64_t i = 0; i < size; ++i) {
+    do_var_dump(_argv[i]);
+  }
+}
 
 static void HHVM_FUNCTION(_xdebug_check_trigger_vars) {
   if (XDebugExtension::Enable &&
@@ -646,7 +713,7 @@ static void HHVM_FUNCTION(_xdebug_check_trigger_vars) {
 // Module implementation
 
 // XDebug constants
-static const StaticString
+const StaticString
   s_XDEBUG_CC_UNUSED("XDEBUG_CC_UNUSED"),
   s_XDEBUG_CC_DEAD_CODE("XDEBUG_CC_DEAD_CODE"),
   s_XDEBUG_TRACE_APPEND("XDEBUG_TRACE_APPEND"),
@@ -658,7 +725,7 @@ static const StaticString
 // option.
 template <typename T>
 static inline T xdebug_init_opt(const char* name, T defVal,
-                                map<string, string>& envCfg) {
+                                std::map<std::string, std::string>& envCfg) {
   // First try to load the ini setting
   folly::dynamic ini_val = folly::dynamic::object();
   if (IniSetting::Get(XDEBUG_INI(name), ini_val)) {
@@ -668,7 +735,7 @@ static inline T xdebug_init_opt(const char* name, T defVal,
   }
 
   // Then try to load from the environment
-  map<string, string>::const_iterator env_iter = envCfg.find(name);
+  auto const env_iter = envCfg.find(name);
   if (env_iter != envCfg.end()) {
     T val;
     ini_on_update(env_iter->second, val);
@@ -680,37 +747,37 @@ static inline T xdebug_init_opt(const char* name, T defVal,
 }
 
 // Environment variables the idekey is grabbed from
-const static StaticString
+const StaticString
   s_DBGP_IDEKEY("DBGP_IDEKEY"),
   s_USER("USER"),
   s_USERNAME("USERNAME");
 
 // Attempts to load the default idekey from environment variables
-static void loadIdeKey(map<string, string>& envCfg) {
-  const String dbgp_idekey = g_context->getenv(s_DBGP_IDEKEY);
+static void loadIdeKey(std::map<std::string, std::string>& envCfg) {
+  auto const dbgp_idekey = g_context->getenv(s_DBGP_IDEKEY);
   if (!dbgp_idekey.empty()) {
     envCfg["idekey"] = dbgp_idekey.toCppString();
     return;
   }
 
-  const String user = g_context->getenv(s_USER);
+  auto const user = g_context->getenv(s_USER);
   if (!user.empty()) {
     envCfg["idekey"] = user.toCppString();
     return;
   }
 
-  const String username = g_context->getenv(s_USERNAME);
+  auto const username = g_context->getenv(s_USERNAME);
   if (!username.empty()) {
     envCfg["idekey"] = username.toCppString();
   }
 }
 
 // Environment variable that can be used for certain settings
-const static StaticString s_XDEBUG_CONFIG("XDEBUG_CONFIG");
+const StaticString s_XDEBUG_CONFIG("XDEBUG_CONFIG");
 
 // Loads the "XDEBUG_CONFIG" environment variables.
-static void loadEnvConfig(map<string, string>& envCfg) {
-  const String cfg_raw = g_context->getenv(s_XDEBUG_CONFIG);
+static void loadEnvConfig(std::map<std::string, std::string>& envCfg) {
+  auto const cfg_raw = g_context->getenv(s_XDEBUG_CONFIG);
   if (cfg_raw.empty()) {
     return;
   }
@@ -718,15 +785,15 @@ static void loadEnvConfig(map<string, string>& envCfg) {
   // Parse the config variable. Format is "key=val" list separated by spaces
   // This parsing isn't very efficient, but this isn't performance sensitive and
   // it's similar to what php5 xdebug does.
-  Array cfg = StringUtil::Explode(String(cfg_raw, CopyString), " ").toArray();
+  auto cfg = StringUtil::Explode(cfg_raw, " ").toArray();
   for (ArrayIter iter(cfg); iter; ++iter) {
-    Array keyval = StringUtil::Explode(iter.second().toString(), "=").toArray();
+    auto keyval = StringUtil::Explode(iter.second().toString(), "=").toArray();
     if (keyval.size() != 2) {
       continue;
     }
 
-    string key = keyval[0].toString().toCppString();
-    string val = keyval[1].toString().toCppString();
+    auto key = keyval[0].toString().toCppString();
+    auto val = keyval[1].toString().toCppString();
     if (key == "remote_enable" ||
         key == "remote_port" ||
         key == "remote_host" ||
@@ -744,15 +811,42 @@ static void loadEnvConfig(map<string, string>& envCfg) {
   }
 }
 
+// Stores our HDF-specified values (only integral values for now) across
+// requests.
+static std::map<const char*, int> hdf_values;
+
 void XDebugExtension::moduleLoad(const IniSetting::Map& ini, Hdf xdebug_hdf) {
-  Hdf hdf = xdebug_hdf[XDEBUG_NAME];
-  Enable = Config::GetBool(ini, hdf["enable"], false);
+  assert(hdf_values.empty());
+
+  auto debugger = xdebug_hdf["Eval"]["Debugger"];
+
+  // Get everything as bools.
+  #define XDEBUG_OPT(T, name, sym, val) { \
+    auto key = "XDebug" #sym; \
+    if (debugger[key].exists()) { \
+      hdf_values[#sym] = debugger[key].configGetBool(val);  \
+    } \
+  }
+  XDEBUG_HDF_CFG
+  #undef XDEBUG_OPT
+
+  // But patch up overload_var_dump since it's actually an int.
+  hdf_values["OverloadVarDump"] =
+    debugger["XDebugOverloadVarDump"].configGetInt32(1);
+
+  // XDebug is disabled by default.
+  Config::Bind(Enable, ini, debugger["XDebugEnable"], false);
 }
 
 void XDebugExtension::moduleInit() {
   if (!Enable) {
     return;
   }
+
+  // Stacktraces are always on when XDebug is enabled
+  Logger::SetTheLogger(new ExtendedLogger());
+  ExtendedLogger::EnabledByDefault = true;
+
   Native::registerConstant<KindOfInt64>(
     s_XDEBUG_CC_UNUSED.get(), k_XDEBUG_CC_UNUSED
   );
@@ -813,7 +907,7 @@ void XDebugExtension::requestInit() {
   }
 
   // Load the settings passed in environment variables
-  map<string, string> env_cfg;
+  std::map<std::string, std::string> env_cfg;
   loadIdeKey(env_cfg);
   loadEnvConfig(env_cfg);
 
@@ -826,7 +920,19 @@ void XDebugExtension::requestInit() {
   XDEBUG_CFG
   #undef XDEBUG_OPT
 
-  // hhvm.xdebug.dump.*
+  #define XDEBUG_OPT(T, name, sym, val) { \
+    /* HDF values take priority over INI. */ \
+    auto iter = hdf_values.find(#sym); \
+    XDEBUG_GLOBAL(sym) = iter != hdf_values.end() \
+      ? iter->second \
+      : xdebug_init_opt<T>(name, val, env_cfg); \
+    IniSetting::Bind(this, IniSetting::PHP_INI_ALL, XDEBUG_INI(name), \
+                     &XDEBUG_GLOBAL(sym)); \
+  }
+  XDEBUG_HDF_CFG
+  #undef XDEBUG_OPT
+
+  // xdebug.dump.*
   #define XDEBUG_OPT(T, name, sym, val) { \
     XDEBUG_GLOBAL(sym) = xdebug_init_opt<T>(name, val, env_cfg); \
     IniSetting::Bind(this, IniSetting::PHP_INI_ALL, \
@@ -909,6 +1015,7 @@ bool XDebugExtension::Enable = false;
   IMPLEMENT_THREAD_LOCAL(T, XDebugExtension::sym);
 XDEBUG_CFG
 XDEBUG_MAPPED_CFG
+XDEBUG_HDF_CFG
 XDEBUG_DUMP_CFG
 XDEBUG_PROF_CFG
 XDEBUG_CUSTOM_GLOBALS

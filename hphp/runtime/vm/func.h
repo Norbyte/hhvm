@@ -25,6 +25,7 @@
 #include "hphp/runtime/base/type-string.h"
 #include "hphp/runtime/base/typed-value.h"
 #include "hphp/runtime/base/user-attributes.h"
+#include "hphp/runtime/base/atomic-countable.h"
 
 #include "hphp/runtime/vm/indexed-string-map.h"
 #include "hphp/runtime/vm/type-constraint.h"
@@ -65,22 +66,19 @@ using DVFuncletsVec = std::vector<std::pair<int, Offset>>;
  * Exception handler table entry.
  */
 struct EHEnt {
-  enum class Type {
+  enum class Type : uint8_t {
     Catch,
     Fault
   };
-  typedef std::vector<std::pair<Id, Offset>> CatchVec;
 
   Type m_type;
+  bool m_itRef;
   Offset m_base;
   Offset m_past;
   int m_iterId;
-  bool m_itRef;
   int m_parentIndex;
   Offset m_fault;
-  CatchVec m_catches;
-
-  template<class SerDe> void serde(SerDe& sd);
+  FixedVector<std::pair<Id,Offset>> m_catches;
 };
 
 /*
@@ -134,44 +132,27 @@ struct Func {
    * Parameter default value info.
    */
   struct ParamInfo {
-    ParamInfo()
-      : builtinType(KindOfInvalid)
-      , variadic(false)
-      , funcletOff(InvalidAbsoluteOffset)
-      , defaultValue(make_tv<KindOfUninit>())
-      , phpCode(nullptr)
-      , userType(nullptr)
-    {}
+    ParamInfo();
 
-    template<class SerDe>
-    void serde(SerDe& sd) {
-      sd(builtinType)
-        (funcletOff)
-        (defaultValue)
-        (phpCode)
-        (typeConstraint)
-        (variadic)
-        (userAttributes)
-        (userType)
-        ;
-    }
+    bool hasDefaultValue() const;
+    bool hasScalarDefaultValue() const;
+    bool isVariadic() const;
 
-    bool hasDefaultValue() const {
-      return funcletOff != InvalidAbsoluteOffset;
-    }
-    bool hasScalarDefaultValue() const {
-      return hasDefaultValue() && defaultValue.m_type != KindOfUninit;
-    }
-    bool isVariadic() const { return variadic; }
+    template<class SerDe> void serde(SerDe& sd);
 
-  public:
-    DataType builtinType;     // Typehint for builtins.
-    bool variadic;
-    Offset funcletOff;
-    TypedValue defaultValue;  // Set to Uninit if there is no DV,
-                              // or if there's a nonscalar DV.
-    LowStringPtr phpCode;     // Eval'able PHP code.
-    LowStringPtr userType;    // User-annotated type.
+    // Typehint for builtins.
+    MaybeDataType builtinType{folly::none};
+    // True if this is a `...' parameter.
+    bool variadic{false};
+    // DV initializer funclet offset.
+    Offset funcletOff{InvalidAbsoluteOffset};
+    // Set to Uninit if there is no DV, or if there's a nonscalar DV.
+    TypedValue defaultValue;
+    // Eval-able PHP code.
+    LowStringPtr phpCode{nullptr};
+    // User-annotated type.
+    LowStringPtr userType{nullptr};
+
     TypeConstraint typeConstraint;
     UserAttributeMap userAttributes;
   };
@@ -408,6 +389,8 @@ struct Func {
    *
    * There are a number of caveats regarding this value:
    *
+   *    - If the returnType() is folly::none, the return is a Variant.
+   *
    *    - If the returnType() is KindOfString, KindOfArray, or KindOfObject,
    *      null may also be returned.
    *
@@ -419,7 +402,7 @@ struct Func {
    *
    *    - This list of caveats may be incorrect and/or incomplete.
    */
-  DataType returnType() const;
+  MaybeDataType returnType() const;
 
   /*
    * Whether this function returns by reference.
@@ -896,7 +879,7 @@ public:
    * We can burn these into the TC even when functions are not persistent,
    * since only a single name-to-function mapping will exist per request.
    */
-  RDS::Handle funcHandle() const;
+  rds::Handle funcHandle() const;
 
   /*
    * Get and set the function body code pointer.
@@ -975,18 +958,10 @@ public:
   char& maybeIntercepted() const;
 
   /*
-   * Populate the MethodInfo for this function in `mi'.
-   *
-   * If methInfo() is non-null, this just performs a deep copy.
+   * Access to the global vector of funcs.  This maps FuncID's back to Func*'s.
    */
-  void getFuncInfo(ClassInfo::MethodInfo* mi) const;
-
   static const AtomicVector<const Func*>& getFuncVec();
 
-  /*
-   * Profile-guided optimization linkage.
-   */
-  bool shouldPGO() const;
   void setHot() { m_attrs = (Attr)(m_attrs | AttrHot); }
 
 
@@ -1001,7 +976,7 @@ public:
 
   void setAttrs(Attr attrs);
   void setBaseCls(Class* baseCls);
-  void setFuncHandle(RDS::Link<Func*> l);
+  void setFuncHandle(rds::Link<Func*> l);
   void setHasPrivateAncestor(bool b);
   void setMethodSlot(Slot s);
 
@@ -1085,7 +1060,7 @@ private:
     bool m_isGenerated : 1;
     bool m_hasExtendedSharedData : 1;
 
-    DataType m_returnType;
+    MaybeDataType m_returnType;
     LowStringPtr m_retUserType;
     UserAttributeMap m_userAttributes;
     TypeConstraint m_retTypeConstraint;
@@ -1126,7 +1101,7 @@ private:
     int m_line2;    // Only read if SharedData::m_line2 is kSmallDeltaLimit
   };
 
-  typedef AtomicSmartPtr<SharedData> SharedDataPtr;
+  typedef AtomicSharedPtr<SharedData> SharedDataPtr;
 
   /*
    * SharedData accessors for internal use.
@@ -1182,7 +1157,7 @@ private:
   int m_magic;
 #endif
   unsigned char* volatile m_funcBody;
-  mutable RDS::Link<Func*> m_cachedFunc{RDS::kInvalidHandle};
+  mutable rds::Link<Func*> m_cachedFunc{rds::kInvalidHandle};
   FuncId m_funcId{InvalidFuncId};
   LowStringPtr m_fullName;
   LowStringPtr m_name;
@@ -1216,12 +1191,12 @@ private:
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template<class EHEntVec>
-const EHEnt* findEH(const EHEntVec& ehtab, Offset o) {
+template<class Container>
+const typename Container::value_type* findEH(const Container& ehtab, Offset o) {
   uint32_t i;
   uint32_t sz = ehtab.size();
 
-  const EHEnt* eh = nullptr;
+  const typename Container::value_type* eh = nullptr;
   for (i = 0; i < sz; i++) {
     if (ehtab[i].m_base <= o && o < ehtab[i].m_past) {
       eh = &ehtab[i];
@@ -1229,6 +1204,7 @@ const EHEnt* findEH(const EHEntVec& ehtab, Offset o) {
   }
   return eh;
 }
+
 
 ///////////////////////////////////////////////////////////////////////////////
 }

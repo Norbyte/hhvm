@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_BZ2_FILE_H_
 #define incl_HPHP_BZ2_FILE_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/plain-file.h"
 #include <stdio.h>
 #include <bzlib.h>
@@ -35,7 +35,7 @@ public:
   const String& o_getClassNameHook() const { return classnameof(); }
 
   BZ2File();
-  explicit BZ2File(PlainFile* innerFile);
+  explicit BZ2File(SmartPtr<PlainFile>&& innerFile);
   virtual ~BZ2File();
 
   bool open(const String& filename, const String& mode);
@@ -50,7 +50,7 @@ public:
 
 private:
   BZFILE * m_bzFile;
-  PlainFile * m_innerFile;
+  SmartPtr<PlainFile> m_innerFile;
   bool closeImpl();
 };
 

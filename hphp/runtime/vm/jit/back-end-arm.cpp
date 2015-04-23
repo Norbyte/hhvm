@@ -28,7 +28,6 @@
 #include "hphp/runtime/vm/jit/code-gen-helpers-arm.h"
 #include "hphp/runtime/vm/jit/func-prologues-arm.h"
 #include "hphp/runtime/vm/jit/unique-stubs-arm.h"
-#include "hphp/runtime/vm/jit/reg-alloc-arm.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
 #include "hphp/runtime/vm/jit/unwind-arm.h"
 #include "hphp/runtime/vm/jit/service-requests-inline.h"
@@ -36,14 +35,16 @@
 #include "hphp/runtime/vm/jit/timer.h"
 #include "hphp/runtime/vm/jit/check.h"
 #include "hphp/runtime/vm/jit/print.h"
-#include "hphp/runtime/vm/jit/layout.h"
+#include "hphp/runtime/vm/jit/cfg.h"
 #include "hphp/runtime/vm/jit/vasm-print.h"
 
 namespace HPHP { namespace jit { namespace arm {
 
 TRACE_SET_MOD(hhir);
 
-struct BackEnd : public jit::BackEnd {
+namespace {
+
+struct BackEnd final : jit::BackEnd {
   BackEnd() {}
   ~BackEnd() {}
 
@@ -68,12 +69,8 @@ struct BackEnd : public jit::BackEnd {
     return PhysReg(arm::rVmFp);
   }
 
-  bool storesCell(const IRInstruction& inst, uint32_t srcIdx) override {
-    return false;
-  }
-
-  bool loadsCell(const IRInstruction& inst) override {
-    return false;
+  PhysReg rVmTl() override {
+    return PhysReg(arm::rVmTl);
   }
 
 #define CALLEE_SAVED_BARRIER() \
@@ -85,18 +82,17 @@ struct BackEnd : public jit::BackEnd {
    * A partial equivalent of enterTCHelper, used to set up the ARM simulator.
    */
   uintptr_t setupSimRegsAndStack(vixl::Simulator& sim,
-                                 uintptr_t saved_rStashedAr) {
+                                 ActRec* saved_rStashedAr) {
     sim.   set_xreg(arm::rGContextReg.code(), g_context.getNoCheck());
 
     auto& vmRegs = vmRegsUnsafe();
     sim.   set_xreg(arm::rVmFp.code(), vmRegs.fp);
     sim.   set_xreg(arm::rVmSp.code(), vmRegs.stack.top());
-    sim.   set_xreg(arm::rVmTl.code(), RDS::tl_base);
-    sim.   set_xreg(arm::rStashedAR.code(), saved_rStashedAr);
+    sim.   set_xreg(arm::rVmTl.code(), rds::tl_base);
+    sim.   set_xreg(arm::rStashedAR.code(), uintptr_t(saved_rStashedAr));
 
     // Leave space for register spilling and MInstrState.
-    sim.   set_sp(sim.sp() - kReservedRSPTotalSpace);
-    assert(sim.is_on_stack(reinterpret_cast<void*>(sim.sp())));
+    assertx(sim.is_on_stack(reinterpret_cast<void*>(sim.sp())));
 
     auto spOnEntry = sim.sp();
 
@@ -111,11 +107,10 @@ struct BackEnd : public jit::BackEnd {
   }
 
  public:
-  void enterTCHelper(TCA start, TReqInfo& info) override {
+  void enterTCHelper(TCA start, ActRec* stashedAR) override {
     // This is a pseudo-copy of the logic in enterTCHelper: it sets up the
     // simulator's registers and stack, runs the translation, and gets the
     // necessary information out of the registers when it's done.
-
     vixl::PrintDisassembler disasm(std::cout);
     vixl::Decoder decoder;
     if (getenv("ARM_DISASM")) {
@@ -133,39 +128,24 @@ struct BackEnd : public jit::BackEnd {
     g_context->m_activeSims.push_back(&sim);
     SCOPE_EXIT { g_context->m_activeSims.pop_back(); };
 
-    DEBUG_ONLY auto spOnEntry =
-      setupSimRegsAndStack(sim, info.saved_rStashedAr);
+    DEBUG_ONLY auto spOnEntry = setupSimRegsAndStack(sim, stashedAR);
 
-    // The handshake is different in the case of REQ_BIND_CALL. The code we're
-    // jumping to expects to find a return address in x30, and a saved return
-    // address on the stack.
-    if (info.requestNum == REQ_BIND_CALL) {
+    // The handshake is different when entering at a func prologue. The code
+    // we're jumping to expects to find a return address in x30, and a saved
+    // return address on the stack.
+    if (stashedAR) {
       // Put the call's return address in the link register.
-      auto* ar = reinterpret_cast<ActRec*>(info.saved_rStashedAr);
-      sim.set_lr(ar->m_savedRip);
+      sim.set_lr(stashedAR->m_savedRip);
     }
 
     std::cout.flush();
     sim.RunFrom(vixl::Instruction::Cast(start));
     std::cout.flush();
 
-    assert(sim.sp() == spOnEntry);
+    assertx(sim.sp() == spOnEntry);
 
-    info.requestNum = sim.xreg(0);
-    info.args[0] = sim.xreg(1);
-    info.args[1] = sim.xreg(2);
-    info.args[2] = sim.xreg(3);
-    info.args[3] = sim.xreg(4);
-    info.args[4] = sim.xreg(5);
-    info.saved_rStashedAr = sim.xreg(arm::rStashedAR.code());
-
-    info.stubAddr = reinterpret_cast<TCA>(sim.xreg(arm::rAsm.code()));
-  }
-
-  void moveToAlign(CodeBlock& cb,
-                   MoveToAlignFlags alignment
-                   = MoveToAlignFlags::kJmpTargetAlign) override {
-    // TODO(2967396) implement properly
+    vmRegsUnsafe().fp = (ActRec*)sim.xreg(arm::rVmFp.code());
+    vmRegsUnsafe().stack.top() = (Cell*)sim.xreg(arm::rVmSp.code());
   }
 
   UniqueStubs emitUniqueStubs() override {
@@ -178,19 +158,17 @@ struct BackEnd : public jit::BackEnd {
     return arm::emitServiceReqWork(cb, start, flags, req, argv);
   }
 
+  size_t reusableStubSize() const override {
+    return arm::reusableStubSize();
+  }
+
   void emitInterpReq(CodeBlock& mainCode, CodeBlock& coldCode,
-                     const SrcKey& sk) override {
+                     SrcKey sk) override {
     if (RuntimeOption::EvalJitTransCounters) {
       vixl::MacroAssembler a { mainCode };
       arm::emitTransCounterInc(a);
     }
-    // This jump won't be smashed, but a far jump on ARM requires the same code
-    // sequence.
-    emitSmashableJump(
-      mainCode,
-      emitServiceReq(coldCode, REQ_INTERPRET, sk.offset()),
-      CC_None
-    );
+    not_implemented();
   }
 
   bool funcPrologueHasGuard(TCA prologue, const Func* func) override {
@@ -227,23 +205,6 @@ struct BackEnd : public jit::BackEnd {
     a.    Str   (rAsm, rAsm2[disp]);
   }
 
-  void emitTraceCall(CodeBlock& cb, Offset pcOff) override {
-    // TODO(2967396) implement properly
-  }
-
-  bool isSmashable(Address frontier, int nBytes, int offset = 0) override {
-    // See prepareForSmash().
-    return true;
-  }
-
-  void prepareForSmash(CodeBlock& cb, int nBytes, int offset = 0) override {
-    // Don't do anything. We don't smash code on ARM; we smash non-executable
-    // data -- an 8-byte pointer -- that's embedded in the instruction stream.
-    // As long as that data is 8-byte aligned, it's safe to smash. All
-    // instructions are 4 bytes wide, so we'll just emit a single nop if needed
-    // to align the data.  This is done in emitSmashableJump.
-  }
-
   void prepareForTestAndSmash(CodeBlock& cb, int testBytes,
                               TestAndSmashFlags flags) override {
     // Nothing. See prepareForSmash().
@@ -254,8 +215,8 @@ struct BackEnd : public jit::BackEnd {
     // Assert that this is actually the instruction sequence we expect
     DEBUG_ONLY auto ldr = vixl::Instruction::Cast(addr);
     DEBUG_ONLY auto branch = vixl::Instruction::Cast(addr + 4);
-    assert(ldr->Bits(31, 24) == 0x58);
-    assert((branch->Bits(31, 10) == 0x3587C0 ||
+    assertx(ldr->Bits(31, 24) == 0x58);
+    assertx((branch->Bits(31, 10) == 0x3587C0 ||
             branch->Bits(31, 10) == 0x358FC0) &&
            branch->Bits(4, 0) == 0);
 
@@ -266,20 +227,20 @@ struct BackEnd : public jit::BackEnd {
     auto dataPtr = (isCall ? addr + 12 : addr + 8);
     if ((uintptr_t(dataPtr) & 7) != 0) {
       dataPtr += 4;
-      assert((uintptr_t(dataPtr) & 7) == 0);
+      assertx((uintptr_t(dataPtr) & 7) == 0);
     }
     *reinterpret_cast<TCA*>(dataPtr) = dest;
   }
 
  public:
   void smashJmp(TCA jmpAddr, TCA newDest) override {
-    assert(MCGenerator::canWrite());
+    assertx(MCGenerator::canWrite());
     FTRACE(2, "smashJmp: {} -> {}\n", jmpAddr, newDest);
     smashJmpOrCall(jmpAddr, newDest, false);
   }
 
   void smashCall(TCA callAddr, TCA newDest) override {
-    assert(MCGenerator::canWrite());
+    assertx(MCGenerator::canWrite());
     FTRACE(2, "smashCall: {} -> {}\n", callAddr, newDest);
     smashJmpOrCall(callAddr, newDest, true);
   }
@@ -291,7 +252,7 @@ struct BackEnd : public jit::BackEnd {
     auto dataPtr = jccAddr + 12;
     if ((uintptr_t(dataPtr) & 7) != 0) {
       dataPtr += 4;
-      assert((uintptr_t(dataPtr) & 7) == 0);
+      assertx((uintptr_t(dataPtr) & 7) == 0);
     }
     *reinterpret_cast<TCA*>(dataPtr) = newDest;
   }
@@ -312,13 +273,13 @@ struct BackEnd : public jit::BackEnd {
       a.    Br   (arm::rAsm);
       if (!cb.isFrontierAligned(8)) {
         a.  Nop  ();
-        assert(cb.isFrontierAligned(8));
+        assertx(cb.isFrontierAligned(8));
       }
       a.    bind (&targetData);
       a.    dc64 (reinterpret_cast<int64_t>(dest));
 
       // If this assert breaks, you need to change smashJmp
-      assert(targetData.target() == start + 8 ||
+      assertx(targetData.target() == start + 8 ||
              targetData.target() == start + 12);
     } else {
       a.    B    (&afterData, InvertCondition(arm::convertCC(cc)));
@@ -326,16 +287,20 @@ struct BackEnd : public jit::BackEnd {
       a.    Br   (arm::rAsm);
       if (!cb.isFrontierAligned(8)) {
         a.  Nop  ();
-        assert(cb.isFrontierAligned(8));
+        assertx(cb.isFrontierAligned(8));
       }
       a.    bind (&targetData);
       a.    dc64 (reinterpret_cast<int64_t>(dest));
       a.    bind (&afterData);
 
       // If this assert breaks, you need to change smashJcc
-      assert(targetData.target() == start + 12 ||
+      assertx(targetData.target() == start + 12 ||
              targetData.target() == start + 16);
     }
+  }
+
+  TCA smashableCallFromReturn(TCA retAddr) override {
+    return retAddr - 8;
   }
 
   void emitSmashableCall(CodeBlock& cb, TCA dest) override {
@@ -350,14 +315,14 @@ struct BackEnd : public jit::BackEnd {
     a.  B    (&afterData);
     if (!cb.isFrontierAligned(8)) {
       a.Nop  ();
-      assert(cb.isFrontierAligned(8));
+      assertx(cb.isFrontierAligned(8));
     }
     a.  bind (&targetData);
     a.  dc64 (reinterpret_cast<int64_t>(dest));
     a.  bind (&afterData);
 
     // If this assert breaks, you need to change smashCall
-    assert(targetData.target() == start + 12 ||
+    assertx(targetData.target() == start + 12 ||
            targetData.target() == start + 16);
   }
 
@@ -374,7 +339,7 @@ struct BackEnd : public jit::BackEnd {
     uintptr_t dest = reinterpret_cast<uintptr_t>(jmp + 8);
     if ((dest & 7) != 0) {
       dest += 4;
-      assert((dest & 7) == 0);
+      assertx((dest & 7) == 0);
     }
     return *reinterpret_cast<TCA*>(dest);
   }
@@ -390,9 +355,13 @@ struct BackEnd : public jit::BackEnd {
     uintptr_t dest = reinterpret_cast<uintptr_t>(jmp + 12);
     if ((dest & 7) != 0) {
       dest += 4;
-      assert((dest & 7) == 0);
+      assertx((dest & 7) == 0);
     }
     return *reinterpret_cast<TCA*>(dest);
+  }
+
+  ConditionCode jccCondCode(TCA) override {
+    not_implemented();
   }
 
   TCA callTarget(TCA call) override {
@@ -406,7 +375,7 @@ struct BackEnd : public jit::BackEnd {
     uintptr_t dest = reinterpret_cast<uintptr_t>(blr + 8);
     if ((dest & 7) != 0) {
       dest += 4;
-      assert((dest & 7) == 0);
+      assertx((dest & 7) == 0);
     }
     return *reinterpret_cast<TCA*>(dest);
   }
@@ -431,16 +400,18 @@ struct BackEnd : public jit::BackEnd {
     a.   Br   (rAsm);
     if (!a.isFrontierAligned(8)) {
       a. Nop  ();
-      assert(a.isFrontierAligned(8));
+      assertx(a.isFrontierAligned(8));
     }
     a.   bind (&interpReqAddr);
-    TCA interpReq =
-      emitServiceReq(codeCold, REQ_INTERPRET, sk.offset());
-    a.   dc64 (interpReq);
+    not_implemented();
     a.   bind (&after);
   }
 
   void streamPhysReg(std::ostream& os, PhysReg reg) override {
+    if (reg.isSF()) {
+      os << "statusFlags";
+      return;
+    }
     auto prefix = reg.isGP() ? (vixl::Register(reg).size() == vixl::kXRegSize
                                 ? 'x' : 'w')
                   : (vixl::FPRegister(reg).size() == vixl::kSRegSize
@@ -455,43 +426,55 @@ struct BackEnd : public jit::BackEnd {
     Decoder dec;
     PrintDisassembler disasm(os, indent + 4, dumpIR, color(ANSI_COLOR_BROWN));
     dec.AppendVisitor(&disasm);
-    assert(begin <= end);
+    assertx(begin <= end);
     for (; begin < end; begin += kInstructionSize) {
       dec.Decode(Instruction::Cast(begin));
     }
   }
 
   void genCodeImpl(IRUnit& unit, AsmInfo*) override;
+
+private:
+  void do_moveToAlign(CodeBlock& cb, MoveToAlignFlags alignment) override {
+    // TODO(2967396) implement properly
+  }
+
+  bool do_isSmashable(Address frontier, int nBytes, int offset) override {
+    // See prepareForSmash().
+    return true;
+  }
+
+  void do_prepareForSmash(CodeBlock& cb, int nBytes, int offset) override {
+    // Don't do anything. We don't smash code on ARM; we smash non-executable
+    // data -- an 8-byte pointer -- that's embedded in the instruction stream.
+    // As long as that data is 8-byte aligned, it's safe to smash. All
+    // instructions are 4 bytes wide, so we'll just emit a single nop if needed
+    // to align the data.  This is done in emitSmashableJump.
+  }
 };
 
-std::unique_ptr<jit::BackEnd> newBackEnd() {
-  return std::unique_ptr<jit::BackEnd>{ folly::make_unique<BackEnd>() };
 }
 
-static size_t genBlock(IRUnit& unit, Vout& v, Vasm& vasm,
-                       CodegenState& state, Block* block) {
+std::unique_ptr<jit::BackEnd> newBackEnd() {
+  return folly::make_unique<BackEnd>();
+}
+
+static size_t genBlock(CodegenState& state, Vout& v, Vout& vc, Block* block) {
   FTRACE(6, "genBlock: {}\n", block->id());
-  CodeGenerator cg(unit, v, vasm.cold(), vasm.frozen(), state);
+  CodeGenerator cg(state, v, vc);
   size_t hhir_count{0};
-  for (IRInstruction& instr : *block) {
-    IRInstruction* inst = &instr;
+  for (IRInstruction& inst : *block) {
     hhir_count++;
-
-    if (instr.is(EndGuards)) state.pastGuards = true;
-
-    vasm.main().setOrigin(inst);
-    vasm.cold().setOrigin(inst);
-    vasm.frozen().setOrigin(inst);
-
-    cg.cgInst(inst);
+    if (inst.is(EndGuards)) state.pastGuards = true;
+    v.setOrigin(&inst);
+    vc.setOrigin(&inst);
+    cg.cgInst(&inst);
   }
   return hhir_count;
 }
 
 void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
   Timer _t(Timer::codeGen);
-  CodegenState state(unit, asmInfo);
-
   CodeBlock& mainCodeIn   = mcg->code.main();
   CodeBlock& coldCodeIn   = mcg->code.cold();
   CodeBlock* frozenCode   = &mcg->code.frozen();
@@ -524,24 +507,21 @@ void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
       mcg->code.unlock();
     };
 
-    if (RuntimeOption::EvalHHIRGenerateAsserts) {
-      emitTraceCall(mainCode, unit.bcOff());
-    }
-
-    auto const linfo = layoutBlocks(unit);
-    Vasm vasm(&state.meta);
+    CodegenState state(unit, asmInfo, *frozenCode);
+    auto const blocks = rpoSortCfg(unit);
+    Vasm vasm;
     auto& vunit = vasm.unit();
     // create the initial set of vasm numbered the same as hhir blocks.
     for (uint32_t i = 0, n = unit.numBlocks(); i < n; ++i) {
       state.labels[i] = vunit.makeBlock(AreaIndex::Main);
     }
     // create vregs for all relevant SSATmps
-    assignRegs(unit, vunit, state, linfo.blocks, this);
-    vunit.roots.push_back(state.labels[unit.entry()]);
+    assignRegs(unit, vunit, state, blocks);
+    vunit.entry = state.labels[unit.entry()];
     vasm.main(mainCode);
     vasm.cold(coldCode);
     vasm.frozen(*frozenCode);
-    for (auto block : linfo.blocks) {
+    for (auto block : blocks) {
       auto& v = block->hint() == Block::Hint::Unlikely ? vasm.cold() :
                block->hint() == Block::Hint::Unused ? vasm.frozen() :
                vasm.main();
@@ -550,19 +530,19 @@ void BackEnd::genCodeImpl(IRUnit& unit, AsmInfo* asmInfo) {
       auto b = state.labels[block];
       vunit.blocks[b].area = v.area();
       v.use(b);
-      hhir_count += genBlock(unit, v, vasm, state, block);
-      assert(v.closed());
-      assert(vasm.main().empty() || vasm.main().closed());
-      assert(vasm.cold().empty() || vasm.cold().closed());
-      assert(vasm.frozen().empty() || vasm.frozen().closed());
+      hhir_count += genBlock(state, v, vasm.cold(), block);
+      assertx(v.closed());
+      assertx(vasm.main().empty() || vasm.main().closed());
+      assertx(vasm.cold().empty() || vasm.cold().closed());
+      assertx(vasm.frozen().empty() || vasm.frozen().closed());
     }
     printUnit(kInitialVasmLevel, "after initial vasm generation", vunit);
-    assert(check(vunit));
-    vasm.finishARM(arm::abi, state.asmInfo);
+    assertx(check(vunit));
+    finishARM(vasm.unit(), vasm.areas(), arm::abi, state.asmInfo);
   }
 
-  assert(coldCodeIn.frontier() == coldStart);
-  assert(mainCodeIn.frontier() == mainStart);
+  assertx(coldCodeIn.frontier() == coldStart);
+  assertx(mainCodeIn.frontier() == mainStart);
   coldCodeIn.skip(coldCode.frontier() - coldCodeIn.frontier());
   mainCodeIn.skip(mainCode.frontier() - mainCodeIn.frontier());
   if (asmInfo) {

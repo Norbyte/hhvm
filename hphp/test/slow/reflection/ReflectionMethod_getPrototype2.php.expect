@@ -1,5 +1,9 @@
-Awaitable::getWaitHandle
+HH\Awaitable::getWaitHandle
+Method HH\WaitHandle::join does not have a prototype
+HH\Awaitable::getWaitHandle
+Method HH\WaitableWaitHandle::join does not have a prototype
 HH\Iterator::next
-Method BlockableWaitHandle::getContextIdx does not have a prototype
-Awaitable::getWaitHandle
-WaitableWaitHandle::getContextIdx
+Method Generator::getOrigFuncName does not have a prototype
+Method SimpleXMLElementChild::__construct does not have a prototype
+ArrayAccess::offsetSet
+ArrayAccess::offsetSet

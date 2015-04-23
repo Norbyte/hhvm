@@ -22,8 +22,9 @@ open Utils
  * mapped here in ifuns to a freshly created unique integer identifier.
  *)
 type env = {
+  itcopt    : TypecheckerOptions.t;
   iclasses  : ((Pos.t * Ident.t) SMap.t) * (String.t SMap.t);
-  ifuns     : (Pos.t * Ident.t) SMap.t;
+  ifuns     : ((Pos.t * Ident.t) SMap.t) * (String.t SMap.t);
   itypedefs : (Pos.t * Ident.t) SMap.t;
   iconsts   : (Pos.t * Ident.t) SMap.t;
 }
@@ -32,7 +33,7 @@ type env = {
 val canon_key: String.t -> String.t
 
 (* The empty naming environment *)
-val empty: env
+val empty: TypecheckerOptions.t -> env
 
 (* Function building the original naming environment.
  * This pass "declares" all the global names. The only checks done
@@ -47,6 +48,9 @@ val make_env:
       classes:Ast.id list ->
       typedefs:Ast.id list ->
       consts:Ast.id list -> env
+
+(* Access the typechecker options from the env *)
+val typechecker_options: env -> TypecheckerOptions.t
 
 (* Solves the local names within a function *)
 val fun_: env -> Ast.fun_ -> Nast.fun_
@@ -91,6 +95,6 @@ val is_null:   string
 val is_resource:  string
 
 val ndecl_file:
-  string -> FileInfo.t ->
-  Errors.t * SSet.t * env ->
-  Errors.t * SSet.t * env
+  Relative_path.t -> FileInfo.t ->
+  Errors.t * Relative_path.Set.t * env ->
+  Errors.t * Relative_path.Set.t * env

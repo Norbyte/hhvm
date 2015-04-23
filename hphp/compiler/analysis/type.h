@@ -17,12 +17,13 @@
 #ifndef incl_HPHP_TYPE_H_
 #define incl_HPHP_TYPE_H_
 
-#include "hphp/compiler/hphp.h"
 #include <map>
-#include "hphp/compiler/json.h"
-#include "hphp/util/functional.h"
-#include "hphp/runtime/base/types.h"
 
+#include "hphp/compiler/hphp.h"
+#include "hphp/compiler/json.h"
+#include "hphp/runtime/base/datatype.h"
+#include "hphp/runtime/base/types.h"
+#include "hphp/util/functional.h"
 
 class TestCodeRun;
 class TestCodeError;
@@ -106,9 +107,6 @@ public:
   static TypePtr Any;
   static TypePtr Some;
 
-  typedef hphp_string_imap<TypePtr> TypePtrMap;
-  static const TypePtrMap &GetTypeHintTypes(bool hhType);
-
   /**
    * Uncertain types: types that are ambiguous yet.
    */
@@ -124,8 +122,9 @@ public:
   /**
    * Map Runtime DataType to analysis Type
    */
-  static TypePtr FromDataType(DataType dt, TypePtr unknown) {
-    switch (dt) {
+  static TypePtr FromDataType(MaybeDataType dt, TypePtr unknown) {
+    if (!dt) return unknown;
+    switch (*dt) {
       case DataType::KindOfNull:     return Type::Null;
       case DataType::KindOfBoolean:  return Type::Boolean;
       case DataType::KindOfInt64:    return Type::Int64;
@@ -135,40 +134,20 @@ public:
       case DataType::KindOfArray:    return Type::Array;
       case DataType::KindOfObject:   return Type::Object;
       case DataType::KindOfResource: return Type::Resource;
-      default:
+
+      case DataType::KindOfUninit:
+      case DataType::KindOfRef:
+      case DataType::KindOfClass:
         return unknown;
     }
+    not_reached();
   }
-
-  /**
-   * Whether a type can be used as another type.
-   */
-  static bool IsLegalCast(AnalysisResultConstPtr ar, TypePtr from, TypePtr to);
 
   /**
    * Find the intersection between two sets of types.
    */
   static TypePtr Intersection(AnalysisResultConstPtr ar,
                               TypePtr from, TypePtr to);
-
-  /**
-   * Whether or not this type is mapped to type Variant
-   * in the runtime
-   */
-  static bool IsMappedToVariant(TypePtr t);
-
-  /**
-   * Whether or not a cast is needed during code generation.
-   */
-  static bool IsCastNeeded(AnalysisResultConstPtr ar, TypePtr from, TypePtr to);
-
-  /**
-   * When a variable's type is t1, and it's used as t2, do we need to
-   * coerce variable's type? Normally, if t2 can be legally casted to t1,
-   * this returns false.
-   */
-  static bool IsCoercionNeeded(AnalysisResultConstPtr ar,
-                               TypePtr t1, TypePtr t2);
 
   /**
    * When a variable is assigned with two types, what type a variable
@@ -209,15 +188,6 @@ public:
    */
   static bool IsExactType(KindOf kindOf);
 
-  static bool HasFastCastMethod(TypePtr t);
-
-  /**
-   *  Returns the name of the method used to fast cast from
-   *  variant to dst
-   */
-  static std::string GetFastCastMethod(
-      TypePtr dst, bool allowRef, bool forConst);
-
 private:
   Type(KindOf kindOf, const std::string &name);
 
@@ -230,32 +200,14 @@ public:
   bool isExactType() const { return IsExactType(m_kindOf); }
   bool mustBe(KindOf kindOf) const { return !(m_kindOf & ~kindOf); }
   bool couldBe(KindOf kindOf) const { return m_kindOf & kindOf; }
-  bool isSubsetOf(TypePtr t) const {
-    return m_kindOf != t->m_kindOf && mustBe(t->m_kindOf);
-  }
   KindOf getKindOf() const { return m_kindOf;}
   bool isInteger() const;
-  bool isStandardObject() const;
   bool isSpecificObject() const;
-  bool isNonConvertibleType() const; // other types cannot convert to them
-  bool isPrimitive() const {
-    return IsExactType(m_kindOf) && (m_kindOf <= KindOfDouble) &&
-      (m_kindOf != KindOfVoid);
-  }
   bool isNoObjectInvolved() const;
   const std::string &getName() const { return m_name;}
-  static TypePtr combinedArithmeticType(TypePtr t1, TypePtr t2);
 
   ClassScopePtr getClass(AnalysisResultConstPtr ar,
                          BlockScopeRawPtr scope) const;
-
-  DataType getDataType() const;
-  DataType getHhvmDataType() const;
-
-  /**
-   * Type hint names in PHP.
-   */
-  std::string getPHPName();
 
   /**
    * Debug dump.
@@ -279,20 +231,7 @@ public:
    */
   void count(std::map<std::string, int> &counts);
 
-  /**
-   * Must not be invoked concurrently
-   */
-  static void InitTypeHintMap();
 private:
-
-  /**
-   * Must not be invoked concurrently
-   */
-  static void ResetTypeHintTypes();
-
-  static TypePtrMap s_TypeHintTypes;
-  static TypePtrMap s_HHTypeHintTypes;
-
   const KindOf m_kindOf;
   const std::string m_name;
 };

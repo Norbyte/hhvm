@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "hphp/runtime/debugger/break_point.h"
 #include "hphp/runtime/debugger/debugger.h"
 #include "hphp/runtime/debugger/debugger_client_settings.h"
 #include "hphp/runtime/base/debuggable.h"
@@ -32,11 +33,11 @@
 #include "hphp/util/mutex.h"
 
 namespace HPHP {
+///////////////////////////////////////////////////////////////////////////////
 
-class StringBuffer;
+struct StringBuffer;
 
 namespace Eval {
-
 ///////////////////////////////////////////////////////////////////////////////
 
 struct DebuggerCommand;
@@ -44,8 +45,7 @@ struct CmdInterrupt;
 
 using DebuggerCommandPtr = std::shared_ptr<DebuggerCommand>;
 
-class DebuggerClient {
-public:
+struct DebuggerClient {
   static int LineWidth;
   static int CodeBlockSize;
   static int ScrollBlockSize;
@@ -105,12 +105,29 @@ public:
   };
   static const char **GetCommands();
 
-  typedef std::vector<std::string> LiveList;
-  typedef boost::shared_array<LiveList> LiveListsPtr;
-  static LiveListsPtr CreateNewLiveLists() {
-    return LiveListsPtr(new LiveList[DebuggerClient::AutoCompleteCount]);
-  }
-  std::vector<std::string> getAllCompletions(std::string const &text);
+  using LiveList = std::vector<std::string>;
+
+  /*
+   * Exists just so that we can do:
+   *
+   *   std::shared_ptr<LiveLists> m_acLiveLists;
+   *   auto& list = m_acLiveLists->get(i);
+   *
+   * instead of:
+   *
+   *   std::shared_ptr<std::array<LiveList, AutoCompleteCount>> m_acLiveLists;
+   *   auto& list = (*m_acLiveLists)[i];
+   */
+  struct LiveLists {
+    LiveList& get(size_t i) {
+      assert(i < DebuggerClient::AutoCompleteCount);
+      return lists[i];
+    }
+
+    LiveList lists[DebuggerClient::AutoCompleteCount];
+  };
+
+  std::vector<std::string> getAllCompletions(const std::string& text);
 
   /**
    * Helpers
@@ -175,21 +192,31 @@ public:
   void tutorial(const char *text);
   void setTutorial(int mode);
 
-  // Returns the source code string that the debugger is currently
-  // evaluating.
-  const std::string &getCode() const { return m_code;}
+  // Returns the source code string that the debugger is currently evaluating.
+  const std::string& getCode() const {
+    return m_code;
+  }
+
   void swapHelp();
 
-  /**
+  const std::string& getCommand() const {
+    return m_command;
+  }
+
+  /*
    * Test if argument matches specified. "index" is 1-based.
    */
-  const std::string &getCommand() const { return m_command;}
-  bool arg(int index, const char *s);
-  int argCount() { return m_args.size();}
+  bool arg(int index, const char *s) const;
+  size_t argCount() {
+    return m_args.size();
+  }
+
   std::string argValue(int index);
   // The entire line after that argument, un-escaped.
   std::string lineRest(int index);
-  std::vector<std::string> *args() { return &m_args;}
+  std::vector<std::string>* args() {
+    return &m_args;
+  }
 
   /**
    * Send the commmand to server's DebuggerProxy and expect same type of command
@@ -261,9 +288,9 @@ public:
   /**
    * Watch expressions.
    */
-  typedef std::pair<const char *, std::string> Watch;
-  typedef std::shared_ptr<Watch> WatchPtr;
-  typedef std::vector<WatchPtr> WatchPtrVec;
+  using Watch = std::pair<const char*, std::string>;
+  using WatchPtr = std::shared_ptr<Watch>;
+  using WatchPtrVec = std::vector<WatchPtr>;
   WatchPtrVec &getWatches() { return m_watches;}
   void addWatch(const char *fmt, const std::string &php);
 
@@ -287,7 +314,9 @@ public:
   void addCompletion(const char **list);
   void addCompletion(const char *name);
   void addCompletion(const std::vector<std::string> &items);
-  void setLiveLists(LiveListsPtr liveLists) { m_acLiveLists = liveLists; }
+  void setLiveLists(const std::shared_ptr<LiveLists>& liveLists) {
+    m_acLiveLists = liveLists;
+  }
 
   void init(const DebuggerClientOptions &options);
   void clearCachedLocal() {
@@ -357,12 +386,30 @@ private:
   int m_acLen;
   int m_acIndex;
   int m_acPos;
-  std::vector<const char **> m_acLists;
-  std::vector<const char *> m_acStrings;
+
+  /*
+   * XXX: This type sits on a throne of lies.
+   *
+   * This is actually:
+   *
+   * union Terrible {
+   *   const char** list;
+   *   AutoComplete ac;
+   * };
+   *
+   * std::vector<Terrible> m_acLists;
+   *
+   * There is no tag to differentiate the two cases of Terrible, the const
+   * char** elements are cast to ints and compared to AutoComplete values
+   * directly.
+   */
+  std::vector<const char**> m_acLists;
+
+  std::vector<const char*> m_acStrings;
   std::vector<std::string> m_acItems;
   bool m_acLiveListsDirty;
-  LiveListsPtr m_acLiveLists;
   bool m_acProtoTypePrompted;
+  std::shared_ptr<LiveLists> m_acLiveLists;
 
   std::string m_line;
   // The current command to process.
@@ -378,8 +425,9 @@ private:
   std::shared_ptr<Macro> m_macroRecording;
   std::shared_ptr<Macro> m_macroPlaying;
 
-  std::vector<std::shared_ptr<DMachineInfo>>
-    m_machines; // All connected machines. 0th is local.
+  // All connected machines. 0th is local.
+  std::vector<std::shared_ptr<DMachineInfo>> m_machines;
+
   std::shared_ptr<DMachineInfo> m_machine; // Current machine
   std::string m_rpcHost; // Current RPC host
 

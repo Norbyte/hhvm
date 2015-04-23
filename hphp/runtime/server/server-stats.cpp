@@ -22,11 +22,11 @@
 #include <list>
 #include <iostream>
 
-#include "folly/json.h"
-#include "folly/Conv.h"
-#include "folly/FBVector.h"
-#include "folly/Range.h"
-#include "folly/String.h"
+#include <folly/json.h>
+#include <folly/Conv.h>
+#include <folly/FBVector.h>
+#include <folly/Range.h>
+#include <folly/String.h>
 
 #include "hphp/runtime/server/http-server.h"
 #include "hphp/runtime/base/runtime-option.h"
@@ -37,10 +37,10 @@
 #include "hphp/runtime/base/datetime.h"
 #include "hphp/runtime/base/array-init.h"
 #include "hphp/util/compatibility.h"
+#include "hphp/util/hardware-counter.h"
 #include "hphp/util/process.h"
 #include "hphp/util/timer.h"
 #include "hphp/util/text-util.h"
-#include "hphp/runtime/base/hardware-counter.h"
 #include "hphp/runtime/server/writer.h"
 namespace HPHP {
 //////////////////////////////////////////////////////////////////////
@@ -468,32 +468,20 @@ void ServerStats::Report(string &output, Writer::Format format,
 
     w->writeFileHeader();
     w->beginObject("stats");
-    for (auto const& s : slots) {
-      if (s->m_time) {
-        w->beginObject("slot");
-        w->writeEntry("time", s->m_time * RuntimeOption::StatsSlotDuration);
-      }
-      w->beginList("pages");
-      for (auto const& page : s->m_pages) {
-        auto const& ps = page.second;
-        w->beginObject("page");
-        w->writeEntry("url", ps.m_url);
-        w->writeEntry("code", ps.m_code);
-        w->writeEntry("hit", ps.m_hit);
 
-        w->beginObject("details");
-        for (auto const& kvpair : ps.m_values) {
-          w->writeEntry(kvpair.first->getString().c_str(), kvpair.second);
-        }
-        w->endObject("details");
-
-        w->endObject("page");
-      }
-      w->endList("pages");
-      if (s->m_time) {
-        w->endObject("slot");
-      }
+    if (format != Writer::Format::JSON) {
+      // In JSON, this would create multiple entries with the same 'slot' key.
+      // This isn't valid, and most implementations can't read it.
+      //   https://github.com/facebook/hhvm/issues/3331
+      ReportSlots(w, slots);
+    } else {
+      assert(format == Writer::Format::JSON);
+      // Create a list instead :)
+      w->beginList("slots");
+      ReportSlots(w, slots);
+      w->endList("slots");
     }
+
     w->endObject("stats");
     w->writeFileFooter();
 
@@ -501,6 +489,35 @@ void ServerStats::Report(string &output, Writer::Format format,
   }
 
   output = out.str();
+}
+
+void ServerStats::ReportSlots(Writer* w, const std::list<TimeSlot*> &slots) {
+  for (auto const& s : slots) {
+    if (s->m_time) {
+      w->beginObject("slot");
+      w->writeEntry("time", s->m_time * RuntimeOption::StatsSlotDuration);
+    }
+    w->beginList("pages");
+    for (auto const& page : s->m_pages) {
+      auto const& ps = page.second;
+      w->beginObject("page");
+      w->writeEntry("url", ps.m_url);
+      w->writeEntry("code", ps.m_code);
+      w->writeEntry("hit", ps.m_hit);
+
+      w->beginObject("details");
+      for (auto const& kvpair : ps.m_values) {
+        w->writeEntry(kvpair.first->getString().c_str(), kvpair.second);
+      }
+      w->endObject("details");
+
+      w->endObject("page");
+    }
+    w->endList("pages");
+    if (s->m_time) {
+      w->endObject("slot");
+    }
+  }
 }
 
 static std::string format_duration(timeval &duration) {
@@ -563,10 +580,10 @@ void ServerStats::ReportStatus(std::string &output, Writer::Format format) {
   timeval up;
   up.tv_sec = now - HttpServer::StartTime;
   up.tv_usec = 0;
-  w->writeEntry("now", DateTime(now).
-                toString(DateTime::DateFormatCookie).data());
-  w->writeEntry("start", DateTime(HttpServer::StartTime).
-                toString(DateTime::DateFormatCookie).data());
+  w->writeEntry("now", makeSmartPtr<DateTime>(now)->
+                       toString(DateTime::DateFormatCookie).data());
+  w->writeEntry("start", makeSmartPtr<DateTime>(HttpServer::StartTime)->
+                         toString(DateTime::DateFormatCookie).data());
   w->writeEntry("up", format_duration(up));
   w->endObject("process");
 
@@ -600,8 +617,8 @@ void ServerStats::ReportStatus(std::string &output, Writer::Format format) {
     w->writeEntry("tid", (int64_t)ts.m_threadPid);
     w->writeEntry("req", ts.m_requestCount);
     w->writeEntry("bytes", ts.m_writeBytes);
-    w->writeEntry("start", DateTime(ts.m_start.tv_sec).
-                  toString(DateTime::DateFormatCookie).data());
+    w->writeEntry("start", makeSmartPtr<DateTime>(ts.m_start.tv_sec)->
+                           toString(DateTime::DateFormatCookie).data());
     w->writeEntry("duration", format_duration(duration));
     if (ts.m_requestCount > 0) {
       auto const stats = ts.m_mm->getStatsCopy();
@@ -816,7 +833,7 @@ void ServerStats::startRequest(const char *url, const char *clientIP,
                                const char *vhost) {
   ++m_threadStatus.m_requestCount;
 
-  m_threadStatus.m_mm = ThreadInfo::s_threadInfo->m_mm;
+  m_threadStatus.m_mm = &MM();
   gettimeofday(&m_threadStatus.m_start, 0);
   memset(&m_threadStatus.m_done, 0, sizeof(m_threadStatus.m_done));
   m_threadStatus.m_mode = ThreadMode::Processing;

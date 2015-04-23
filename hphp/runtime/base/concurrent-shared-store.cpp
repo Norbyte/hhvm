@@ -24,11 +24,12 @@
 #include "hphp/util/timer.h"
 
 #include "hphp/runtime/base/variable-serializer.h"
+#include "hphp/runtime/base/variable-unserializer.h"
 #include "hphp/runtime/base/apc-handle-defs.h"
 #include "hphp/runtime/base/apc-object.h"
 #include "hphp/runtime/base/apc-stats.h"
-#include "hphp/runtime/base/shared-store-base.h"
-#include "hphp/runtime/ext/ext_apc.h"
+#include "hphp/runtime/base/apc-file-storage.h"
+#include "hphp/runtime/ext/apc/ext_apc.h"
 #include "hphp/runtime/vm/treadmill.h"
 
 namespace HPHP {
@@ -71,31 +72,36 @@ bool StoreValue::expired() const {
 
 EntryInfo::Type EntryInfo::getAPCType(const APCHandle* handle) {
   DataType type = handle->type();
-  if (!IS_REFCOUNTED_TYPE(type)) {
-    return EntryInfo::Type::Uncounted;
-  }
+
   switch (type) {
-  case KindOfString:
-    if (handle->isUncounted()) {
-      return EntryInfo::Type::UncountedString;
-    }
-    return EntryInfo::Type::APCString;
-  case KindOfArray:
-    if (handle->isUncounted()) {
-      return EntryInfo::Type::UncountedArray;
-    }
-    if (handle->isSerializedArray()) {
-      return EntryInfo::Type::SerializedArray;
-    }
-    return EntryInfo::Type::APCArray;
-  case KindOfObject:
-    if (handle->isSerializedObj()) {
-      return EntryInfo::Type::SerializedObject;
-    }
-    return EntryInfo::Type::APCObject;
-  default:
-    return EntryInfo::Type::Unknown;
+    DT_UNCOUNTED_CASE:
+      return EntryInfo::Type::Uncounted;
+
+    case KindOfString:
+      if (handle->isUncounted()) {
+        return EntryInfo::Type::UncountedString;
+      }
+      return EntryInfo::Type::APCString;
+    case KindOfArray:
+      if (handle->isUncounted()) {
+        return EntryInfo::Type::UncountedArray;
+      }
+      if (handle->isSerializedArray()) {
+        return EntryInfo::Type::SerializedArray;
+      }
+      return EntryInfo::Type::APCArray;
+    case KindOfObject:
+      if (handle->isSerializedObj()) {
+        return EntryInfo::Type::SerializedObject;
+      }
+      return EntryInfo::Type::APCObject;
+
+    case KindOfResource:
+    case KindOfRef:
+    case KindOfClass:
+      return EntryInfo::Type::Unknown;
   }
+  not_reached();
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -229,9 +235,10 @@ void ConcurrentTableSharedStore::addToExpirationQueue(const char* key,
 bool ConcurrentTableSharedStore::handlePromoteObj(const String& key,
                                                   APCHandle* svar,
                                                   const Variant& value) {
-  size_t size = 0;
-  auto const converted = APCObject::MakeAPCObject(svar, size, value);
-  if (!converted) return false;
+  auto const pair = APCObject::MakeAPCObject(svar, value);
+  if (!pair.handle) return false;
+  auto const converted = pair.handle;
+  auto const size = pair.size;
 
   Map::accessor acc;
   if (!m_vars.find(acc, tagStringData(key.get()))) {
@@ -271,13 +278,12 @@ APCHandle* ConcurrentTableSharedStore::unserialize(const String& key,
 
     VariableUnserializer vu(sAddr, sval->getSerializedSize(), sType);
     Variant v;
-    v.unserialize(&vu);
-    size_t size = 0;
-    auto const handle = APCHandle::Create(v, size, sval->isSerializedObj());
-    sval->data = handle;
-    sval->dataSize = size;
-    APCStats::getAPCStats().addAPCValue(handle, size, true);
-    return handle;
+    unserializeVariant(v, &vu);
+    auto const pair = APCHandle::Create(v, sval->isSerializedObj());
+    sval->data = pair.handle;
+    sval->dataSize = pair.size;
+    APCStats::getAPCStats().addAPCValue(pair.handle, pair.size, true);
+    return pair.handle;
   } catch (ResourceExceededException&) {
     throw;
   } catch (Exception& e) {
@@ -373,14 +379,13 @@ int64_t ConcurrentTableSharedStore::inc(const String& key, int64_t step,
   }
 
   auto const ret = oldHandle->toLocal().toInt64() + step;
-  size_t size = 0;
-  auto const handle = APCHandle::Create(Variant(ret), size, false);
-  APCStats::getAPCStats().updateAPCValue(
-      handle, size, oldHandle, sval.dataSize, sval.expire == 0, false);
+  auto const pair = APCHandle::Create(Variant(ret), false);
+  APCStats::getAPCStats().updateAPCValue(pair.handle, pair.size,
+                                         oldHandle, sval.dataSize,
+                                         sval.expire == 0, false);
   oldHandle->unreferenceRoot(sval.dataSize);
-  sval.data = handle;
-  sval.dataSize = size;
-
+  sval.data = pair.handle;
+  sval.dataSize = pair.size;
   found = true;
   return ret;
 }
@@ -409,13 +414,13 @@ bool ConcurrentTableSharedStore::cas(const String& key, int64_t old,
     return false;
   }
 
-  size_t size = 0;
-  auto const handle = APCHandle::Create(Variant(val), size, false);
-  APCStats::getAPCStats().updateAPCValue(
-    handle, size, oldHandle, sval.dataSize, sval.expire == 0, false);
+  auto const pair = APCHandle::Create(Variant(val), false);
+  APCStats::getAPCStats().updateAPCValue(pair.handle, pair.size,
+                                         oldHandle, sval.dataSize,
+                                         sval.expire == 0, false);
   oldHandle->unreferenceRoot(sval.dataSize);
-  sval.data = handle;
-  sval.dataSize = size;
+  sval.data = pair.handle;
+  sval.dataSize = pair.size;
   return true;
 }
 
@@ -476,8 +481,7 @@ bool ConcurrentTableSharedStore::storeImpl(const String& key,
                                            bool overwrite,
                                            bool limit_ttl) {
   StoreValue *sval;
-  size_t size = 0;
-  APCHandle* svar = APCHandle::Create(value, size, false);
+  auto svar = APCHandle::Create(value, false);
   auto keyLen = key.size();
   ReadLock l(m_lock);
   char* const kcp = strdup(key.data());
@@ -507,7 +511,7 @@ bool ConcurrentTableSharedStore::storeImpl(const String& key,
           }
         );
       } else {
-        svar->unreferenceRoot(size);
+        svar.handle->unreferenceRoot(svar.size);
         return false;
       }
     } else {
@@ -523,19 +527,19 @@ bool ConcurrentTableSharedStore::storeImpl(const String& key,
       if (sval->expire == 0 && adjustedTtl != 0) {
         APCStats::getAPCStats().removeAPCValue(
           sval->dataSize, current, true, sval->expired());
-        APCStats::getAPCStats().addAPCValue(svar, size, false);
+        APCStats::getAPCStats().addAPCValue(svar.handle, svar.size, false);
       } else {
         APCStats::getAPCStats().updateAPCValue(
-          svar, size, current, sval->dataSize,
+          svar.handle, svar.size, current, sval->dataSize,
           sval->expire == 0, sval->expired());
       }
       current->unreferenceRoot(sval->dataSize);
     } else {
-      APCStats::getAPCStats().addAPCValue(svar, size, present);
+      APCStats::getAPCStats().addAPCValue(svar.handle, svar.size, present);
     }
 
-    sval->set(svar, adjustedTtl);
-    sval->dataSize = size;
+    sval->set(svar.handle, adjustedTtl);
+    sval->dataSize = svar.size;
     expiry = sval->expire;
   }
 
@@ -591,7 +595,7 @@ bool ConcurrentTableSharedStore::constructPrime(const String& v,
                                                 KeyValuePair& item,
                                                 bool serialized) {
   if (s_apc_file_storage.getState() !=
-      SharedStoreFileStorage::StorageState::Invalid &&
+      APCFileStorage::StorageState::Invalid &&
       (!v.get()->isStatic() || serialized)) {
     // StaticString for non-object should consume limited amount of space,
     // not worth going through the file storage
@@ -607,16 +611,16 @@ bool ConcurrentTableSharedStore::constructPrime(const String& v,
       return false;
     }
   }
-  size_t size = 0;
-  item.value = APCHandle::Create(v, size, serialized);
-  item.sSize = size;
+  auto pair = APCHandle::Create(v, serialized);
+  item.value = pair.handle;
+  item.sSize = pair.size;
   return true;
 }
 
 bool ConcurrentTableSharedStore::constructPrime(const Variant& v,
                                                 KeyValuePair& item) {
   if (s_apc_file_storage.getState() !=
-      SharedStoreFileStorage::StorageState::Invalid &&
+      APCFileStorage::StorageState::Invalid &&
       (IS_REFCOUNTED_TYPE(v.getType()))) {
     // Only do the storage for ref-counted type
     String s = apc_serialize(v);
@@ -627,15 +631,15 @@ bool ConcurrentTableSharedStore::constructPrime(const Variant& v,
       return false;
     }
   }
-  size_t size = 0;
-  item.value = APCHandle::Create(v, size, false);
-  item.sSize = size;
+  auto pair = APCHandle::Create(v, false);
+  item.value = pair.handle;
+  item.sSize = pair.size;
   return true;
 }
 
 void ConcurrentTableSharedStore::primeDone() {
   if (s_apc_file_storage.getState() !=
-      SharedStoreFileStorage::StorageState::Invalid) {
+      APCFileStorage::StorageState::Invalid) {
     s_apc_file_storage.seal();
     s_apc_file_storage.hashCheck();
     // Schedule the adviseOut instead of doing it immediately, so that the
@@ -655,11 +659,10 @@ void ConcurrentTableSharedStore::primeDone() {
       free(copy);
       return;
     }
-    size_t size = 0;
-    auto const handle = APCHandle::Create(Variant(1), size, false);
-    acc->second.set(handle, 0);
-    acc->second.dataSize = size;
-    APCStats::getAPCStats().addAPCValue(handle, size, true);
+    auto const pair = APCHandle::Create(Variant(1), false);
+    acc->second.set(pair.handle, 0);
+    acc->second.dataSize = pair.size;
+    APCStats::getAPCStats().addAPCValue(pair.handle, pair.size, true);
   }
 }
 
@@ -701,7 +704,9 @@ std::vector<EntryInfo> ConcurrentTableSharedStore::getEntriesInfo() {
       entries.emplace_back(key, inMem, size, ttl, type);
     }
   }
-
+  std::sort(entries.begin(), entries.end(),
+            [] (const EntryInfo& e1, const EntryInfo& e2) {
+              return e1.key < e2.key; });
   return entries;
 }
 
@@ -770,6 +775,46 @@ void ConcurrentTableSharedStore::dump(std::ostream& out, DumpMode dumpMode) {
   Logger::Info("dumping apc done");
 }
 
-//////////////////////////////////////////////////////////////////////
+void ConcurrentTableSharedStore::dumpRandomKeys(std::ostream &out,
+                                                uint32_t count) {
+  for (; count > 0; count--) {
+    m_vars.getRandomAPCEntry(out);
+  }
+}
 
+template<typename Key, typename T, typename HashCompare>
+void ConcurrentTableSharedStore
+      ::APCMap<Key,T,HashCompare>
+      ::getRandomAPCEntry(std::ostream &out) {
+#if TBB_VERSION_MAJOR == 4 && TBB_VERSION_MINOR == 0
+  while (this->my_size > 0) {
+    auto randIndex = rand() % this->my_size;
+    auto mahBucket = this->segment_index_of(randIndex);
+    auto segmentIndex = randIndex - this->segment_base(mahBucket);
+    auto bucketPtr = this->my_table[mahBucket];
+    {
+      bucketPtr->mutex.lock();
+      SCOPE_EXIT{ bucketPtr->mutex.unlock(); };
+      auto nodePtr = (bucketPtr + segmentIndex)->node_list;
+      if (nodePtr != nullptr &&
+          nodePtr != tbb::interface5::internal::rehash_req &&
+          nodePtr != tbb::interface5::internal::empty_rehashed) {
+        uintptr_t apcPairPtr =
+         (reinterpret_cast<uintptr_t>(nodePtr) +
+          sizeof(tbb::interface5::internal::hash_map_node_base));
+        auto apcPair =
+          (reinterpret_cast<std::pair<const char *, StoreValue>*>
+                    (apcPairPtr));
+        out << apcPair->first << "," << apcPair->second.dataSize << "\n";
+        return;
+      }
+    }
+  }
+#else
+  out << "Incompatible TBB library\n";
+#endif
+  return;
+}
+
+//////////////////////////////////////////////////////////////////////
 }

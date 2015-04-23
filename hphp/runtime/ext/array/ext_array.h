@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_EXT_ARRAY_H_
 #define incl_HPHP_EXT_ARRAY_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/array-util.h"
 #include "hphp/runtime/base/zend-collator.h"
 
@@ -273,20 +273,16 @@ Variant HHVM_FUNCTION(array_intersect_ukey,
                       const Array& args = null_array);
 bool HHVM_FUNCTION(sort,
                    VRefParam array,
-                   int sort_flags = 0,
-                   bool use_collator = false);
+                   int sort_flags = 0);
 bool HHVM_FUNCTION(rsort,
                    VRefParam array,
-                   int sort_flags = 0,
-                   bool use_collator = false);
+                   int sort_flags = 0);
 bool HHVM_FUNCTION(asort,
                    VRefParam array,
-                   int sort_flags = 0,
-                   bool use_collator = false);
+                   int sort_flags = 0);
 bool HHVM_FUNCTION(arsort,
                    VRefParam array,
-                   int sort_flags = 0,
-                   bool use_collator = false);
+                   int sort_flags = 0);
 bool HHVM_FUNCTION(ksort,
                    VRefParam array,
                    int sort_flags = 0);
@@ -319,6 +315,7 @@ Variant HHVM_FUNCTION(hphp_array_idx,
                       const Variant& search,
                       const Variant& key,
                       const Variant& def);
+TypedValue* HHVM_FN(array_multisort)(ActRec* ar);
 
 ///////////////////////////////////////////////////////////////////////////////
 

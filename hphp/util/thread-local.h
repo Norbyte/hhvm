@@ -20,7 +20,7 @@
 #include <pthread.h>
 #include "hphp/util/exception.h"
 #include <errno.h>
-#include "folly/String.h"
+#include <folly/String.h>
 #include <type_traits>
 
 namespace HPHP {
@@ -33,6 +33,10 @@ inline uintptr_t tlsBase() {
   // mrs == "move register <-- system"
   // tpidr_el0 == "thread process id register for exception level 0"
   asm ("mrs %0, tpidr_el0" : "=r" (retval));
+#elif defined (__powerpc64__)
+  asm ("xor %0,%0,%0\n\t"
+       "or  %0,%0,13\n\t"
+      : "=r" (retval));
 #else
 # error How do you access thread-local storage on this machine?
 #endif
@@ -132,19 +136,25 @@ struct ThreadLocalNode {
 };
 
 struct ThreadLocalManager {
+  template<class T>
+  static void PushTop(ThreadLocalNode<T>& node) {
+    auto key = GetManager().m_key;
+    auto tmp = pthread_getspecific(key);
+    ThreadLocalSetValue(key, &node);
+    node.m_next = tmp;
+  }
+
+ private:
   ThreadLocalManager() : m_key(0) {
     ThreadLocalCreateKey(&m_key, ThreadLocalManager::OnThreadExit);
   };
-  void * getTop() {
-    return pthread_getspecific(m_key);
-  }
-  void setTop(void * p) {
-    ThreadLocalSetValue(m_key, p);
-  }
   static void OnThreadExit(void *p);
   pthread_key_t m_key;
 
-  static ThreadLocalManager s_manager;
+  static ThreadLocalManager& GetManager() {
+    static ThreadLocalManager m;
+    return m;
+  }
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -199,8 +209,7 @@ template<typename T>
 void ThreadLocal<T>::create() {
   if (m_node.m_on_thread_exit_fn == nullptr) {
     m_node.m_on_thread_exit_fn = ThreadLocalOnThreadExit<T>;
-    m_node.m_next = ThreadLocalManager::s_manager.getTop();
-    ThreadLocalManager::s_manager.setTop((void*)(&m_node));
+    ThreadLocalManager::PushTop(m_node);
   }
   assert(m_node.m_p == nullptr);
   m_node.m_p = new T();
@@ -245,8 +254,7 @@ template<typename T>
 void ThreadLocalNoCheck<T>::create() {
   if (m_node.m_on_thread_exit_fn == nullptr) {
     m_node.m_on_thread_exit_fn = ThreadLocalOnThreadExit<T>;
-    m_node.m_next = ThreadLocalManager::s_manager.getTop();
-    ThreadLocalManager::s_manager.setTop((void*)(&m_node));
+    ThreadLocalManager::PushTop(m_node);
   }
   assert(m_node.m_p == nullptr);
   m_node.m_p = new T();

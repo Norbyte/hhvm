@@ -16,6 +16,8 @@
 open Utils
 open Typing_defs
 
+module SN = Naming_special_names
+
 (*****************************************************************************)
 (* Computes the string representing a type in an error message.
  * We generally don't want to show the whole type. If an error was due
@@ -37,32 +39,51 @@ module ErrorString = struct
     | Nast.Tnum        -> "a num (int/float)"
     | Nast.Tresource   -> "a resource"
     | Nast.Tarraykey   -> "an array key (int/string)"
+    | Nast.Tnoreturn   -> "noreturn (throws or exits)"
 
-  let rec type_ = function
+  let rec type_: type a. a ty_ -> _ = function
     | Tany               -> "an untyped value"
     | Tunresolved l      -> unresolved l
-    | Tarray (x, y, z)   -> array (x, y, z)
+    | Tarray (x, y)      -> array (x, y)
     | Ttuple _           -> "a tuple"
     | Tmixed             -> "a mixed value"
     | Toption _          -> "a nullable type"
     | Tprim tp           -> tprim tp
     | Tvar _             -> "some value"
-    | Tanon _ | Tfun _   -> "a function"
+    | Tanon _    -> "a function"
+    | Tfun _     -> "a function"
     | Tgeneric (x, y)    -> generic (x, y)
-    | Tabstract ((_, x), _, _)
+    | Tabstract ((_, x), _, _) ->
+       "an object of type "^(strip_ns x)
     | Tapply ((_, x), _) -> "an object of type "^(strip_ns x)
     | Tobject            -> "an object"
     | Tshape _           -> "a shape"
+    | Taccess (root_ty, ids) -> tconst root_ty ids
 
-  and array = function
-    | _, None, None     -> "an array"
-    | _, Some _, None   -> "an array (used like a vector)"
-    | _, Some _, Some _ -> "an array (used like a hashtable)"
-    | _                 -> assert false
 
-  and generic = function
-    | "this", Some x ->
-        type_ (snd x)^" (compatible with the type 'this')"
+  and array: type a. a ty option * a ty option -> _ = function
+    | None, None     -> "an array"
+    | Some _, None   -> "an array (used like a vector)"
+    | Some _, Some _ -> "an array (used like a hashtable)"
+    | _              -> assert false
+
+  and generic: type a. _ * (_ * a ty) option -> _ = function
+    (* special generic for the 'this' type *)
+    | "this", Some (Ast.Constraint_as, x) ->
+        "the type 'this'\n  that is compatible with "^type_ (snd x)
+    (* expression dependent types are generics starting with '<SOME_ID>' *)
+    | s, Some (_, x) when String.contains s '<' ->
+        "the expression dependent type "^s^"\n  that is compatible with "^type_ (snd x)
+    (* abstract type constants are generic types containing a '::', i.e. 'C::T' *)
+    | s, x when String.contains s ':' ->
+        let base = "the abstract type constant " in
+        let sub =
+          match x with
+          | None -> ""
+          | Some (_, x) -> "\n  that is compatible with "^type_ (snd x)
+        in
+        base^s^sub
+    (* standard, user land generics *)
     | s, _ -> "a value of generic type "^s
 
   and unresolved l =
@@ -76,6 +97,25 @@ module ErrorString = struct
     | []      -> "an undefined value"
     | [x]     -> x
     | x :: rl -> x^" or "^unresolved_ rl
+
+  and tconst: type a. a ty -> _ -> _ = fun root_ty ids ->
+    let f x =
+      let x =
+        if String.contains x '<'
+        then "this"
+        else x
+      in
+      List.fold_left (fun acc (_, sid) -> acc^"::"^sid)
+        ("the type constant "^strip_ns x) ids in
+    match snd root_ty with
+    | Tgeneric (x, _)
+    | Tapply ((_, x), _) -> f x
+    | Tabstract ((_, x), _, _) -> f x
+    | Taccess _ as x ->
+        List.fold_left (fun acc (_, sid) -> acc^"::"^sid)
+          (type_ x) ids
+     | _ ->
+         "a type constant"
 
 end
 
@@ -92,10 +132,10 @@ end
 
 module Suggest = struct
 
-  let rec type_ (_, ty) =
+  let rec type_: type a. a ty -> string = fun (_, ty) ->
     match ty with
     | Tarray _               -> "array"
-    | Tunresolved tyl        -> "..."
+    | Tunresolved _          -> "..."
     | Ttuple (l)             -> "("^list l^")"
     | Tany                   -> "..."
     | Tmixed                 -> "mixed"
@@ -103,7 +143,8 @@ module Suggest = struct
     | Toption ty             -> "?" ^ type_ ty
     | Tprim tp               -> prim tp
     | Tvar _                 -> "..."
-    | Tanon _ | Tfun _       -> "..."
+    | Tanon _       -> "..."
+    | Tfun _ -> "..."
     | Tapply ((_, cid), [])  -> Utils.strip_ns cid
     | Tapply ((_, cid), [x]) -> (Utils.strip_ns cid)^"<"^type_ x^">"
     | Tapply ((_, cid), l)   -> (Utils.strip_ns cid)^"<"^list l^">"
@@ -112,8 +153,20 @@ module Suggest = struct
     | Tabstract ((_, cid), l, _)   -> (Utils.strip_ns cid)^"<"^list l^">"
     | Tobject                -> "..."
     | Tshape _               -> "..."
+    | Taccess (root_ty, ids) ->
+        (match snd root_ty with
+        | Tgeneric (x, _)
+        | Tapply ((_, x), _) ->
+            List.fold_left (fun acc (_, sid) -> acc^"::"^sid)
+              (strip_ns x) ids
+        | Tabstract ((_, x), _, _) ->
+           List.fold_left (fun acc (_, sid) -> acc^"::"^sid)
+             (strip_ns x) ids
+        | _ ->
+            "..."
+        )
 
-  and list = function
+  and list: type a. a ty list -> string = function
     | []      -> ""
     | [x]     -> type_ x
     | x :: rl -> type_ x ^ ", "^ list rl
@@ -127,6 +180,7 @@ module Suggest = struct
     | Nast.Tnum    -> "num (int/float)"
     | Nast.Tresource -> "resource"
     | Nast.Tarraykey -> "arraykey (int/string)"
+    | Nast.Tnoreturn -> "noreturn"
 
 end
 
@@ -143,21 +197,27 @@ module Full = struct
     | [x] -> f x
     | x :: rl -> f x; o s; list_sep o s f rl
 
-  let rec ty st env o (_, x) = ty_ st env o x
+  let rec ty: type a. _ -> _ -> _ -> a ty -> _ =
+    fun st env o (_, x) -> ty_ st env o x
 
-  and ty_ st env o x =
-    let k = ty st env o in
-    let list = list_sep o ", " in
+  and ty_: type a. _ -> _ -> _ -> a ty_ -> _ =
+    fun st env o x ->
+    let k: type b. b ty -> _ = fun x -> ty st env o x in
+    let list: type c. (c ty -> unit) -> c ty list -> _ =
+      fun x y -> list_sep o ", " x y in
     match x with
     | Tany -> o "_"
     | Tmixed -> o "mixed"
-    | Tarray (_, None, None) -> o "array"
-    | Tarray (_, Some x, None) -> o "array<"; k x; o ">"
-    | Tarray (_, Some x, Some y) -> o "array<"; k x; o ", "; k y; o ">"
-    | Tarray (_, None, Some _) -> assert false
-    | Tabstract ((_, s), [], _)
+    | Tarray (None, None) -> o "array"
+    | Tarray (Some x, None) -> o "array<"; k x; o ">"
+    | Tarray (Some x, Some y) -> o "array<"; k x; o ", "; k y; o ">"
+    | Tarray (None, Some _) -> assert false
+    | Tabstract ((_, s), [], _) -> o s
     | Tapply ((_, s), [])
     | Tgeneric (s, _) -> o s
+    | Taccess (root_ty, ids) ->
+        k root_ty;
+        o (List.fold_left (fun acc (_, sid) -> acc ^ "::" ^ sid) "" ids)
     | Toption x -> o "?"; k x
     | Tprim x -> prim o x
     | Tvar n when ISet.mem n st -> o "[rec]"
@@ -179,7 +239,7 @@ module Full = struct
     | Tanon _ -> o "[fun]"
     | Tunresolved tyl -> list_sep o "& " k tyl
     | Tobject -> o "object"
-    | Tshape fdm -> o "[shape]"
+    | Tshape _ -> o "[shape]"
 
   and prim o x =
     o (match x with
@@ -191,9 +251,11 @@ module Full = struct
     | Nast.Tnum    -> "num"
     | Nast.Tresource -> "resource"
     | Nast.Tarraykey -> "arraykey"
+    | Nast.Tnoreturn -> "noreturn"
     )
 
-  and fun_type st env o ft =
+  and fun_type: type a. _ -> _ -> _ -> a fun_type -> _ =
+    fun st env o ft ->
     (match ft.ft_tparams, ft.ft_arity with
       | [], Fstandard _ -> ()
       | [], _ -> o "<...>";
@@ -203,7 +265,8 @@ module Full = struct
     o "("; list_sep o ", " (fun_param st env o) ft.ft_params; o "): ";
     ty st env o ft.ft_ret
 
-  and fun_param st env o (param_name, param_type) =
+  and fun_param: type a. _ -> _ -> _ -> a fun_param -> _ =
+    fun st env o (param_name, param_type) ->
     match param_name, param_type with
     | None, _ -> ty st env o param_type
     | Some param_name, (_, Tany) -> o param_name
@@ -226,6 +289,9 @@ module Full = struct
     ty ISet.empty env add_string x;
     Buffer.contents buf
 
+  let to_string_decl (x: decl ty) =
+    let env = Typing_env.empty TypecheckerOptions.default Relative_path.default in
+    to_string env x
 end
 
 (*****************************************************************************)
@@ -235,8 +301,6 @@ end
 (*****************************************************************************)
 
 module PrintClass = struct
-
-  let tenv = Typing_env.empty ""
 
   let indent = "    "
   let bool = string_of_bool
@@ -255,17 +319,19 @@ module PrintClass = struct
     | Ast.Ctrait -> "Ctrait"
     | Ast.Cenum -> "Cenum"
 
-  let ty_opt = function
+  let constraint_ty_opt = function
     | None -> ""
-    | Some ty -> Full.to_string tenv ty
+    | Some (Ast.Constraint_as, ty) -> "as " ^ (Full.to_string_decl ty)
+    | Some (Ast.Constraint_super, ty) -> "super " ^ (Full.to_string_decl ty)
 
   let variance = function
     | Ast.Covariant -> "+"
     | Ast.Contravariant -> "-"
     | Ast.Invariant -> ""
 
-  let tparam (var, (position, name), cstr) =
-    variance var^pos position^" "^name^" "^ty_opt cstr
+  let tparam (var, (position, name), cstr_opt) =
+    variance var^pos position^" "^name^" "^
+    (constraint_ty_opt cstr_opt)
 
   let tparam_list l =
     List.fold_right (fun x acc -> tparam x^", "^acc) l ""
@@ -278,7 +344,7 @@ module PrintClass = struct
       | Vprotected _ -> "protected"
     in
     let synth = (if ce.ce_synthesized then "synthetic " else "") in
-    let type_ = Full.to_string tenv ce.ce_type in
+    let type_ = Full.to_string_decl ce.ce_type in
     synth^vis^" "^type_
 
   let class_elt_smap m =
@@ -289,6 +355,31 @@ module PrintClass = struct
   let class_elt_smap_with_breaks m =
     SMap.fold begin fun field v acc ->
       "\n"^indent^field^": "^(class_elt v)^acc
+    end m ""
+
+  let typeconst {
+    ttc_name = tc_name;
+    ttc_constraint = tc_constraint;
+    ttc_type = tc_type;
+    ttc_origin = origin;
+  } =
+    let name = snd tc_name in
+    let ty x = Full.to_string_decl x in
+    let constraint_ =
+      match tc_constraint with
+      | None -> ""
+      | Some x -> " as "^ty x
+    in
+    let type_ =
+      match tc_type with
+      | None -> ""
+      | Some x -> " = "^ty x
+    in
+    name^constraint_^type_^" (origin:"^origin^")"
+
+  let typeconst_smap m =
+    SMap.fold begin fun _ v acc ->
+      "\n("^(typeconst v)^")"^acc
     end m ""
 
   let ancestors_smap m =
@@ -306,14 +397,14 @@ module PrintClass = struct
           (if tc_members_fully_known then " " else "~"),
           " ("^class_kind tc_kind^")"
       in
-      let ty_str = Full.to_string tenv v in
+      let ty_str = Full.to_string_decl v in
       "\n"^indent^sigil^" "^ty_str^kind^acc
     end m ""
 
-  let user_attribute_smap m =
-    SMap.fold begin fun field _ acc ->
-      "("^field^": expr) "^acc
-    end m ""
+  let user_attribute_list xs =
+    List.fold_left begin fun acc { Nast.ua_name; _ } ->
+      acc^"("^snd ua_name^": expr) "
+    end "" xs
 
   let constructor (ce_opt, consist) =
     let consist_str = if consist then " (consistent in hierarchy)" else "" in
@@ -331,6 +422,7 @@ module PrintClass = struct
     let tc_name = c.tc_name in
     let tc_tparams = tparam_list c.tc_tparams in
     let tc_consts = class_elt_smap c.tc_consts in
+    let tc_typeconsts = typeconst_smap c.tc_typeconsts in
     let tc_cvars = class_elt_smap c.tc_cvars in
     let tc_scvars = class_elt_smap c.tc_scvars in
     let tc_methods = class_elt_smap_with_breaks c.tc_methods in
@@ -342,7 +434,7 @@ module PrintClass = struct
     let tc_req_ancestors = ancestors_smap c.tc_req_ancestors in
     let tc_req_ancestors_extends = sset c.tc_req_ancestors_extends in
     let tc_extends = sset c.tc_extends in
-    let tc_user_attributes = user_attribute_smap c.tc_user_attributes in
+    let tc_user_attributes = user_attribute_list c.tc_user_attributes in
     "tc_need_init: "^tc_need_init^"\n"^
     "tc_members_fully_known: "^tc_members_fully_known^"\n"^
     "tc_abstract: "^tc_abstract^"\n"^
@@ -351,6 +443,7 @@ module PrintClass = struct
     "tc_name: "^tc_name^"\n"^
     "tc_tparams: "^tc_tparams^"\n"^
     "tc_consts: "^tc_consts^"\n"^
+    "tc_typeconsts: "^tc_typeconsts^"\n"^
     "tc_cvars: "^tc_cvars^"\n"^
     "tc_scvars: "^tc_scvars^"\n"^
     "tc_methods: "^tc_methods^"\n"^
@@ -367,15 +460,11 @@ end
 
 module PrintFun = struct
 
-  let bool = string_of_bool
-  let int = string_of_int
-  let tenv = PrintClass.tenv
-
   let fparam (sopt, ty) =
     let s = match sopt with
       | None -> "[None]"
       | Some s -> s in
-    s ^ " " ^ (Full.to_string tenv ty) ^ ", "
+    s ^ " " ^ (Full.to_string_decl ty) ^ ", "
 
   let farity = function
     | Fstandard (min, max) -> Printf.sprintf "non-variadic: %d to %d" min max
@@ -388,14 +477,12 @@ module PrintFun = struct
 
   let fun_type f =
     let ft_pos = PrintClass.pos f.ft_pos in
-    let ft_unsafe = bool f.ft_unsafe in
-    let ft_abstract = bool f.ft_abstract in
+    let ft_abstract = string_of_bool f.ft_abstract in
     let ft_arity = farity f.ft_arity in
     let ft_tparams = PrintClass.tparam_list f.ft_tparams in
     let ft_params = fparams f.ft_params in
-    let ft_ret = Full.to_string tenv f.ft_ret in
+    let ft_ret = Full.to_string_decl f.ft_ret in
     "ft_pos: "^ft_pos^"\n"^
-    "ft_unsafe: "^ft_unsafe^"\n"^
     "ft_abstract: "^ft_abstract^"\n"^
     "ft_arity: "^ft_arity^"\n"^
     "ft_tparams: "^ft_tparams^"\n"^
@@ -404,13 +491,34 @@ module PrintFun = struct
     ""
 end
 
+module PrintTypedef = struct
+
+  let typedef = function
+    | Typing_env.Typedef.Error -> "[Error]"
+    | Typing_env.Typedef.Ok (_vis, tparaml, constr_opt, ty, pos) ->
+      let tparaml_s = PrintClass.tparam_list tparaml in
+      let constr_s = match constr_opt with
+        | None -> "[None]"
+        | Some constr -> Full.to_string_decl constr in
+      let ty_s = Full.to_string_decl ty in
+      let pos_s = PrintClass.pos pos in
+      "ty: "^ty_s^"\n"^
+      "tparaml: "^tparaml_s^"\n"^
+      "constraint: "^constr_s^"\n"^
+      "pos: "^pos_s^"\n"^
+      ""
+
+end
+
 (*****************************************************************************)
 (* User API *)
 (*****************************************************************************)
 
-let error ty = ErrorString.type_ ty
-let suggest ty = Suggest.type_ ty
+let error: type a. a ty_ -> _ = fun ty -> ErrorString.type_ ty
+let suggest: type a. a ty -> _ =  fun ty -> Suggest.type_ ty
 let full env ty = Full.to_string env ty
 let full_strip_ns env ty = Full.to_string_strip_ns env ty
 let class_ c = PrintClass.class_type c
+let gconst gc = Full.to_string_decl gc
 let fun_ f = PrintFun.fun_type f
+let typedef td = PrintTypedef.typedef td

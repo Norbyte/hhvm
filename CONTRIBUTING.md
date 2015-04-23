@@ -10,7 +10,13 @@ All the open issues tagged [PHP5 incompatibility](https://github.com/facebook/hh
 
 Before changes can be accepted a [Contributor Licensing Agreement](http://code.facebook.com/cla) must be completed. You will be prompted to accept the CLA when you submit your first pull request. If you prefer a hard copy, you can print the [pdf](https://github.com/facebook/hhvm/raw/master/hphp/doc/FB_Individual_CLA.pdf), sign it, scan it, and send it to <cla@fb.com>.
 
-Please add appropriate test cases as you make changes, and make sure that they pass locally before submitting your pull request; see [here](hphp/test/README.md) for more information. All the tests are ran via Phabricator, however testing locally greatly speeds up the process of accepting your changes.
+Please add appropriate test cases as you make changes, and make sure that they pass locally before submitting your pull request; see [here](hphp/test/README.md) for more information.  All the tests are run via Phabricator, however testing locally greatly speeds up the process of accepting your changes.
+
+### Stable Version Updates
+
+We maintain up to three [stable branches](https://github.com/facebook/hhvm/wiki/Release%20Schedule) at once (the current release plus two [LTS branches](https://github.com/facebook/hhvm/wiki/Long-term-support-%28LTS%29)). To get a fix into one of those branches, first get accepted into master, as described above. Fixes are merged into master and then merged backwards into stable releases as appropriate.
+
+Then, submit another PR against the relevant stable branch(es) cherry-picking your change into that branch, with any changes needed to properly backport. Make sure to explain in the PR summary why the change should be considered for inclusion in the stable branch -- basically, make the case for why the issue the change is fixing is worse than the possible risk of what the change might break (and thus what *we* will be responsible for debugging, fixing, and maintaining).
 
 ## Quick Links
 

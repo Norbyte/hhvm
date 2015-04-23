@@ -17,7 +17,7 @@
 #ifndef incl_HPHP_ZEND_CUSTOM_ELEMENT_H_
 #define incl_HPHP_ZEND_CUSTOM_ELEMENT_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 
 namespace HPHP {
 
@@ -26,12 +26,10 @@ namespace HPHP {
  * extensions. Allows an arbitrary destructor to be called when the resource is
  * freed.
  */
-class ZendCustomElement : public ResourceData {
-public:
+struct ZendCustomElement : ResourceData {
   typedef void (*DtorFunc)(void *pDest);
 
-  ZendCustomElement(void * data, unsigned int data_size, void ** dest,
-      DtorFunc destructor);
+  ZendCustomElement(void* data, unsigned data_size, DtorFunc destructor);
 
   CLASSNAME_IS("ZendCustomElement");
   virtual const String& o_getClassNameHook() const { return classnameof(); }
@@ -40,10 +38,10 @@ public:
   void * data() { return m_data; }
 
   virtual ~ZendCustomElement();
-
+  DECLARE_RESOURCE_ALLOCATION_NO_SWEEP(ZendCustomElement);
 private:
   DtorFunc m_destructor;
-  void * m_data;
+  void* m_data;
 };
 
 }

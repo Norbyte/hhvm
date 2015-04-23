@@ -36,15 +36,14 @@ struct FrameData {
   // in ext_hotprofiler.cpp does the same.
   int64_t memory_usage : 63;
   bool is_func_begin : 1; // Whether or not this is an enter event
-  // If is_func_begin, then this will be the serialized aruments. Otherwise it
+  // If is_func_begin, then this will be the serialized arguments. Otherwise it
   // will be the serialized return value
   const StringData* context_str;
 };
 
 // TODO(#3704) Allow user to set maximum buffer size
-class XDebugProfiler : public Profiler {
-public:
-  explicit XDebugProfiler() {}
+struct XDebugProfiler : Profiler {
+  explicit XDebugProfiler() : Profiler(true) {}
   ~XDebugProfiler() {
     if (m_profilingEnabled) {
       writeProfilingResults();

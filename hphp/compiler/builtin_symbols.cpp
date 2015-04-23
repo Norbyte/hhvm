@@ -97,9 +97,7 @@ int BuiltinSymbols::NumGlobalNames() {
 const StaticString
   s_fb_call_user_func_safe("fb_call_user_func_safe"),
   s_fb_call_user_func_safe_return("fb_call_user_func_safe_return"),
-  s_fb_call_user_func_array_safe("fb_call_user_func_array_safe"),
-  s_is_callable("is_callable"),
-  s_call_user_func_array("call_user_func_array");
+  s_fb_call_user_func_array_safe("fb_call_user_func_array_safe");
 
 FunctionScopePtr BuiltinSymbols::ImportFunctionScopePtr(AnalysisResultPtr ar,
                  ClassInfo *cls, ClassInfo::MethodInfo *method) {
@@ -129,10 +127,6 @@ FunctionScopePtr BuiltinSymbols::ImportFunctionScopePtr(AnalysisResultPtr ar,
       f->setRefParam(idx);
     }
     f->setParamType(ar, idx, Type::FromDataType(pinfo->argType, Type::Any));
-    if (pinfo->valueLen) {
-      f->setParamDefault(idx, pinfo->value, pinfo->valueLen,
-                         std::string(pinfo->valueText, pinfo->valueTextLen));
-    }
   }
 
   if (method->returnType != KindOfNull) {
@@ -149,10 +143,6 @@ FunctionScopePtr BuiltinSymbols::ImportFunctionScopePtr(AnalysisResultPtr ar,
         method->name.same(s_fb_call_user_func_safe_return) ||
         method->name.same(s_fb_call_user_func_array_safe)) {
       f->setOptFunction(hphp_opt_fb_call_user_func);
-    } else if (method->name.same(s_is_callable)) {
-      f->setOptFunction(hphp_opt_is_callable);
-    } else if (method->name.same(s_call_user_func_array)) {
-      f->setOptFunction(hphp_opt_call_user_func);
     }
   }
 
@@ -168,9 +158,7 @@ FunctionScopePtr BuiltinSymbols::ImportFunctionScopePtr(AnalysisResultPtr ar,
   }
 
   // This block of code is not needed, if BlockScope directly takes flags.
-  if (attrs & ClassInfo::MixedVariableArguments) {
-    f->setVariableArgument(-1);
-  } else if (attrs & ClassInfo::RefVariableArguments) {
+  if (attrs & ClassInfo::RefVariableArguments) {
     f->setVariableArgument(1);
   } else if (attrs & ClassInfo::VariableArguments) {
     f->setVariableArgument(0);
@@ -180,9 +168,6 @@ FunctionScopePtr BuiltinSymbols::ImportFunctionScopePtr(AnalysisResultPtr ar,
   }
   if (attrs & ClassInfo::FunctionIsFoldable) {
     f->setIsFoldable();
-  }
-  if (attrs & ClassInfo::ContextSensitive) {
-    f->setContextSensitive(true);
   }
   if (attrs & ClassInfo::NoFCallBuiltin) {
     f->setNoFCallBuiltin();
@@ -248,6 +233,12 @@ void BuiltinSymbols::ImportNativeConstants(AnalysisResultPtr ar,
     dest->add(cnsPair.first->data(),
               Type::FromDataType(cnsPair.second.m_type, Type::Variant),
               e, ar, e);
+
+    if ((cnsPair.second.m_type == KindOfUninit) &&
+         cnsPair.second.m_data.pref) {
+      // Callback based constant
+      dest->setDynamic(ar, cnsPair.first->data(), true);
+    }
   }
 }
 
@@ -256,17 +247,8 @@ void BuiltinSymbols::ImportExtConstants(AnalysisResultPtr ar,
                                         ClassInfo *cls) {
   LocationPtr loc(new Location);
   for (auto cinfo : cls->getConstantsVec()) {
-    ExpressionPtr e;
-    TypePtr t;
-    if (cinfo->isDeferred()) {
-      // We make an assumption that if the constant is a callback type
-      // (e.g. STDIN, STDOUT, STDERR) then it will return an Object.
-      // Otherwise, if it's deferred (SID, PHP_SAPI, etc.) it'll be a String.
-      t = cinfo->isCallback() ? Type::Object : Type::String;
-    } else {
-      t = Type::FromDataType(cinfo->getValue().getType(), Type::Variant);
-      e = Expression::MakeScalarExpression(ar, ar, loc, cinfo->getValue());
-    }
+    auto t = Type::FromDataType(cinfo->getValue().getType(), Type::Variant);
+    auto e = Expression::MakeScalarExpression(ar, ar, loc, cinfo->getValue());
     dest->add(cinfo->name.data(), t, e, ar, e);
   }
 }

@@ -18,7 +18,7 @@ import urllib2
 
 # The version that we will be importing the tests from.
 # Must be a valid, released version from php download site
-zend_version = "5.6.0"
+zend_version = "5.6.1"
 
 # Don't even pull these into the repo.
 # We want running the bad tests to still complete.
@@ -100,6 +100,11 @@ flaky_tests = (
     # our build machines have no members in group 0...
     '/ext/posix/tests/posix_getgrgid.php',
 
+    # Checking stat of ' ' races with mkdir_variation1
+    '/ext/standard/tests/file/lstat_stat_variation22.php',
+    '/ext/standard/tests/file/copy_variation3.php',
+    '/ext/standard/tests/file/file_exists_variation1.php',
+
     # concurrency issues
     '/ext/mysql/tests/001.php',
     '/ext/mysql/tests/bug47438.php',
@@ -176,6 +181,9 @@ flaky_tests = (
     '/ext/ftp/tests/ftp_nb_fget_basic1.php',
 
     # flaky: t3851970
+    '/ext/sockets/tests/socket_write_params.php',
+    '/ext/sockets/tests/socket_bind_params.php',
+    '/ext/sockets/tests/socket_getpeername.php',
     '/ext/session/tests/009.php',
     '/ext/standard/tests/file/bug39538.php',
     '/ext/standard/tests/file/bug53848.php',
@@ -201,6 +209,11 @@ flaky_tests = (
 
     # a new process can crop up
     '/ext/posix/tests/posix_kill_basic.php',
+
+    # Using PHP7 versions of these tests
+    '/ext/session/tests/session_set_save_handler_class_002.php',
+    '/ext/session/tests/session_set_save_handler_class_016.php',
+    '/ext/session/tests/session_set_save_handler_iface_001.php',
 
     # unsure why
     '/ext/standard/tests/file/symlink_link_linkinfo_is_link_variation4.php',
@@ -230,6 +243,90 @@ flaky_tests = (
 
     # Something could be on sending on that UDP port
     '/ext/standard/tests/network/bug20134.php',
+
+    # These pass with a proper proxy setup, which our build machines don't seem
+    # to have. i.e., the internet is attempted to be used and that is bad
+    '/ext/soap/tests/bugs/bug40609.php',
+    '/ext/soap/tests/schema/schema060.php',
+    '/ext/soap/tests/schema/schema084.php',
+    '/ext/soap/tests/schema/schema008.php',
+    '/ext/soap/tests/schema/schema070.php',
+    '/ext/soap/tests/schema/schema076.php',
+    '/ext/soap/tests/schema/schema034.php',
+    '/ext/soap/tests/schema/schema027.php',
+    '/ext/soap/tests/schema/schema037.php',
+    '/ext/soap/tests/schema/schema028.php',
+    '/ext/soap/tests/schema/schema080.php',
+    '/ext/soap/tests/schema/schema033.php',
+    '/ext/soap/tests/schema/schema031.php',
+    '/ext/soap/tests/schema/schema075.php',
+    '/ext/soap/tests/schema/schema015.php',
+    '/ext/soap/tests/schema/schema018.php',
+    '/ext/soap/tests/schema/schema069.php',
+    '/ext/soap/tests/schema/schema065.php',
+    '/ext/soap/tests/schema/schema019.php',
+    '/ext/soap/tests/schema/schema061.php',
+    '/ext/soap/tests/schema/schema074.php',
+    '/ext/soap/tests/schema/schema071.php',
+    '/ext/soap/tests/schema/schema077.php',
+    '/ext/soap/tests/schema/schema017.php',
+    '/ext/soap/tests/schema/schema005.php',
+    '/ext/soap/tests/schema/schema058.php',
+    '/ext/soap/tests/schema/schema003.php',
+    '/ext/soap/tests/schema/schema079.php',
+    '/ext/soap/tests/schema/schema032.php',
+    '/ext/soap/tests/schema/schema047.php',
+    '/ext/soap/tests/schema/schema004.php',
+    '/ext/soap/tests/schema/schema016.php',
+    '/ext/soap/tests/schema/schema045.php',
+    '/ext/soap/tests/schema/schema039.php',
+    '/ext/soap/tests/schema/schema026.php',
+    '/ext/soap/tests/schema/schema038.php',
+    '/ext/soap/tests/schema/schema001.php',
+    '/ext/soap/tests/schema/schema050.php',
+    '/ext/soap/tests/schema/schema041.php',
+    '/ext/soap/tests/schema/schema083.php',
+    '/ext/soap/tests/schema/schema011.php',
+    '/ext/soap/tests/schema/schema062.php',
+    '/ext/soap/tests/schema/schema029.php',
+    '/ext/soap/tests/schema/schema073.php',
+    '/ext/soap/tests/schema/schema025.php',
+    '/ext/soap/tests/schema/schema044.php',
+    '/ext/soap/tests/schema/schema023.php',
+    '/ext/soap/tests/schema/schema014.php',
+    '/ext/soap/tests/schema/schema052.php',
+    '/ext/soap/tests/schema/schema024.php',
+    '/ext/soap/tests/schema/schema072.php',
+    '/ext/soap/tests/schema/schema006.php',
+    '/ext/soap/tests/schema/schema082.php',
+    '/ext/soap/tests/schema/schema053.php',
+    '/ext/soap/tests/schema/schema085.php',
+    '/ext/soap/tests/schema/schema049.php',
+    '/ext/soap/tests/schema/schema063.php',
+    '/ext/soap/tests/schema/schema040.php',
+    '/ext/soap/tests/schema/schema043.php',
+    '/ext/soap/tests/schema/schema066.php',
+    '/ext/soap/tests/schema/schema048.php',
+    '/ext/soap/tests/schema/schema046.php',
+    '/ext/soap/tests/schema/schema007.php',
+    '/ext/soap/tests/schema/schema056.php',
+    '/ext/soap/tests/schema/schema067.php',
+    '/ext/soap/tests/schema/schema042.php',
+    '/ext/soap/tests/schema/schema059.php',
+    '/ext/soap/tests/schema/schema054.php',
+    '/ext/soap/tests/schema/schema036.php',
+    '/ext/soap/tests/schema/schema057.php',
+    '/ext/soap/tests/schema/schema002.php',
+    '/ext/soap/tests/schema/schema013.php',
+    '/ext/soap/tests/schema/schema051.php',
+    '/ext/soap/tests/schema/schema009.php',
+    '/ext/soap/tests/schema/schema078.php',
+    '/ext/soap/tests/schema/schema081.php',
+    '/ext/soap/tests/schema/schema030.php',
+    '/ext/soap/tests/schema/schema055.php',
+    '/ext/soap/tests/schema/schema021.php',
+    '/ext/soap/tests/schema/schema035.php',
+    '/ext/standard/tests/network/http-stream.php',
 )
 
 # Tests that work but not in repo mode
@@ -256,6 +353,8 @@ norepo_tests = (
     '/Zend/tests/class_alias_013.php',
     '/Zend/tests/class_constants_003.php',
     '/Zend/tests/class_exists_001.php',
+    '/Zend/tests/closure_040.php',
+    '/Zend/tests/closure_042.php',
     '/Zend/tests/constants_005.php',
     '/Zend/tests/errmsg_007.php',
     '/Zend/tests/errmsg_026.php',
@@ -297,6 +396,7 @@ norepo_tests = (
     ####################################
     '/ext/reflection/tests/bug64936.php',
     '/ext/reflection/tests/bug29268.php',
+    '/ext/reflection/tests/traits005.php',
     '/ext/sqlite3/tests/bug47159.php',
     '/ext/sqlite3/tests/sqlite3_01_open.php',
     '/ext/sqlite3/tests/sqlite3_02_create.php',
@@ -336,6 +436,8 @@ norepo_tests = (
     '/ext/standard/tests/file/file_get_contents_file_put_contents_variation2.php',
     '/ext/standard/tests/file/file_get_contents_variation1.php',
     '/ext/standard/tests/file/readfile_variation6.php',
+    '/ext/standard/tests/file/unlink_variation8.php',
+    '/ext/standard/tests/file/unlink_variation10.php',
     '/ext/standard/tests/general_functions/is_callable_error.php',
     '/ext/standard/tests/general_functions/is_numeric.php',
     '/ext/standard/tests/math/abs.php',
@@ -442,11 +544,15 @@ norepo_tests = (
     '/tests/lang/static_variation_001.php',
     '/tests/lang/static_variation_002.php',
 
+    # This test passes "by accident".
+    'ext/dom/tests/DOMNode_hasChildNodes.php',
+
     # These tests use eval(), which is banned in repo mode.
     '/Zend/tests/bug31102.php',
     '/Zend/tests/bug33116.php',
     '/Zend/tests/bug36513.php',
     '/Zend/tests/bug43128.php',
+    '/Zend/tests/bug47714.php',
     '/Zend/tests/bug54624.php',
     '/Zend/tests/bug60444.php',
     '/Zend/tests/bug62907.php',
@@ -718,6 +824,8 @@ other_files = (
     '/ext/soap/tests/bugs/bug38055.wsdl',
     '/ext/soap/tests/bugs/bug38067.wsdl',
     '/ext/soap/tests/bugs/bug38536.wsdl',
+    '/ext/soap/tests/bugs/bug40609.wsdl',
+    '/ext/soap/tests/bugs/bug40609.phpt',
     '/ext/soap/tests/bugs/bug41337.wsdl',
     '/ext/soap/tests/bugs/bug42326.wsdl',
     '/ext/soap/tests/bugs/bug42692.wsdl',
@@ -1032,8 +1140,8 @@ def walk(filename, dest_subdir):
 
             exp = re.sub(r'(?:Parse|Fatal)\\? error\\?:.*',
                     '\nFatal error: '+match_rest_of_line, exp)
-            exp = re.sub(r'Catchable\\? fatal\\? error\\?:.*',
-                    '\nFatal error: '+match_rest_of_line, exp)
+            exp = re.sub(r'(?:Catchable fatal)\\? error\\?:.*',
+                    '\nCatchable fatal error: '+match_rest_of_line, exp)
             exp = re.sub(r'Warning\\?:.*',
                     '\nWarning: '+match_rest_of_line, exp)
             exp = re.sub(r'Notice\\?:.*',
@@ -1144,7 +1252,10 @@ def walk(filename, dest_subdir):
             test += '?>\n'
         if not test.endswith('\n'):
             test += '\n'
-        test += sections['CLEAN']
+        if not sections['CLEAN'].startswith('<?'):
+            sections['CLEAN'] = '<?php\n' + sections['CLEAN']
+        disable_errors = "<?php error_reporting(0); ?>\n"
+        test += disable_errors + sections['CLEAN']
 
     # If you put an exception in here, please send a pull request upstream to
     # php-src. Then when it gets merged kill your hack.
@@ -1177,6 +1288,11 @@ def walk(filename, dest_subdir):
         test = test.replace('"*"', '__DIR__."/../../../../../../sample_dir/*"')
         test = test.replace('opendir(".")', 'opendir(__DIR__."/../../../../../../sample_dir/")')
         test = test.replace('is_dir($file)', 'is_dir(__DIR__."/../../../../../../sample_dir/".$file)')
+    if '/ext/standard/tests/file/touch_variation1.php' in full_dest_filename:
+        test = test.replace('touch.dat', 'touch_variation1.dat')
+    if '/ext/standard/tests/file/bug45181.php' in full_dest_filename:
+        test = test.replace('chdir("bug45181_x");', '$origdir = getcwd();\nchdir("bug45181_x");')
+        test = test.replace('rmdir("bug45181_x");', 'rmdir($origdir . "/bug45181_x");')
     if '/ext/standard/tests/file/fgets_socket_variation1.php' in full_dest_filename:
         test = test.replace("<?php", "<?php\n$port = rand(50000, 65535);")
         test = test.replace("31337'", "'.$port")
@@ -1218,6 +1334,9 @@ def walk(filename, dest_subdir):
         test = test.replace('.clean', '')
     if '/ext/phar/tests/' in full_dest_filename:
         test = test.replace('.clean', '')
+    if ('/ext/readline/tests/readline_info_001.php' in full_dest_filename) or \
+       ('/ext/readline/tests/libedit_info_001.php' in full_dest_filename):
+        test = test.replace('readline_info(', '@readline_info(')
     if '/ext/standard/tests/file/file_get_contents_variation1.php' in full_dest_filename:
         test = test.replace('afile.txt', 'file_get_contents_variation1.txt')
     if '/ext/standard/tests/file/readfile_variation6.php' in full_dest_filename:
@@ -1252,7 +1371,8 @@ def walk(filename, dest_subdir):
        '/ext/xmlreader/tests/008.php' in full_dest_filename or
        '/ext/xmlreader/tests/012.php' in full_dest_filename or
        '/ext/dom/tests/bug37456.php' in full_dest_filename or
-       '/ext/dom/tests/bug67081.php' in full_dest_filename):
+       '/ext/dom/tests/bug67081.php' in full_dest_filename or
+       '/ext/xsl/tests/bug53965.php' in full_dest_filename):
         open(full_dest_filename + '.ini', 'w').write(
                 'hhvm.libxml.ext_entity_whitelist = "file"')
     if '/ext/xsl/tests/xslt008.php' in full_dest_filename:

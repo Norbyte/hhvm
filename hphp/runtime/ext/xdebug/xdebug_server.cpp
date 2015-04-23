@@ -16,12 +16,16 @@
 */
 
 #include "hphp/runtime/ext/xdebug/xdebug_server.h"
+
+#include "hphp/runtime/ext/xdebug/chrome.h"
 #include "hphp/runtime/ext/xdebug/xdebug_command.h"
 #include "hphp/runtime/ext/xdebug/xdebug_hook_handler.h"
 #include "hphp/runtime/ext/xdebug/xdebug_utils.h"
 
+#include "hphp/runtime/base/externals.h"
 #include "hphp/runtime/base/thread-info.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/string/ext_string.h"
+#include "hphp/util/timer.h"
 #include "hphp/util/network.h"
 
 #include <fcntl.h>
@@ -34,7 +38,7 @@ namespace HPHP {
 // Helpers
 
 // Globals
-const static StaticString
+const StaticString
   s_SERVER("_SERVER"),
   s_GET("_GET"),
   s_COOKIE("_COOKIE");
@@ -74,7 +78,7 @@ static const char* getXDebugErrorString(XDebugServer::ErrorCode error) {
       return "error evaluating code";
     case XDebugServer::ERROR_INVALID_EXPRESSION:
       return "invalid expression";
-    case XDebugServer::ERROR_PROPERTY_NON_EXISTANT:
+    case XDebugServer::ERROR_PROPERTY_NON_EXISTENT:
       return "can not get property";
     case XDebugServer::ERROR_STACK_DEPTH_INVALID:
       return "stack depth invalid";
@@ -130,7 +134,7 @@ const char* getXDebugReasonString(XDebugServer::Reason reason) {
 // Construction/Destruction
 
 // Properties of $_SERVER to grab the client addr from
-const static StaticString
+const StaticString
   s_HTTP_X_FORWARDED_FOR("HTTP_X_FORWARDED_FOR"),
   s_REMOTE_ADDR("REMOTE_ADDR");
 
@@ -311,7 +315,7 @@ void XDebugServer::closeLog() {
 // Statics
 
 // Server session properties
-static const StaticString
+const StaticString
   s_SESSION_START("XDEBUG_SESSION_START"),
   s_SESSION_STOP("XDEBUG_SESSION_STOP"),
   s_SESSION("XDEBUG_SESSION");
@@ -352,9 +356,13 @@ void XDebugServer::onRequestInit() {
     String sess_start = sess_start_var.toString();
     cookie.set(s_SESSION,  sess_start);
     if (transport != nullptr) {
-      transport->setCookie(s_SESSION,
-                           sess_start,
-                           XDEBUG_GLOBAL(RemoteCookieExpireTime));
+      int64_t expire = XDEBUG_GLOBAL(RemoteCookieExpireTime);
+      if (expire > 0) {
+        timespec ts;
+        Timer::GetRealtimeTime(ts);
+        expire += ts.tv_sec;
+      }
+      transport->setCookie(s_SESSION, sess_start, expire);
     }
   }
 }
@@ -399,7 +407,7 @@ void XDebugServer::detach() {
 // Header for sent messages
 #define XML_MSG_HEADER "<?xml version=\"1.0\" encoding=\"iso-8859-1\"?>\n"
 
-static const StaticString
+const StaticString
   s_SCRIPT_FILENAME("SCRIPT_FILENAME"), // Needed $_SERVER variable
   s_DBGP_COOKIE("DBGP_COOKIE"); // Needed $_ENV variable
 
@@ -464,11 +472,11 @@ bool XDebugServer::initDbgp() {
       break;
   }
   // Create the response
-  xdebug_xml_node* response = xdebug_xml_node_init("init");
+  auto response = xdebug_xml_node_init("init");
   addXmlns(*response);
 
   // Add the engine info
-  xdebug_xml_node* child = xdebug_xml_node_init("engine");
+  auto child = xdebug_xml_node_init("engine");
   xdebug_xml_add_attribute(child, "version", XDEBUG_VERSION);
   xdebug_xml_add_text(child, XDEBUG_NAME, 0);
   xdebug_xml_add_child(response, child);
@@ -526,7 +534,7 @@ void XDebugServer::deinitDbgp() {
     setStatus(Status::STOPPING, Reason::OK);
 
     // Send the xml shutdown response
-    xdebug_xml_node* response = xdebug_xml_node_init("response");
+    auto response = xdebug_xml_node_init("response");
     addXmlns(*response);
     addStatus(*response);
     if (m_lastCommand != nullptr) {
@@ -546,7 +554,14 @@ void XDebugServer::deinitDbgp() {
 }
 
 void XDebugServer::sendMessage(xdebug_xml_node& xml) {
-  // Convert xml to an xdebug_str
+  if (RuntimeOption::XDebugChrome) {
+    auto const response = dbgp_to_chrome(&xml);
+    // Write the trailing NUL character.
+    write(m_socket, response.data(), response.size() + 1);
+    return;
+  }
+
+  // Convert xml to an xdebug_str.
   xdebug_str xml_message = {0, 0, nullptr};
   xdebug_xml_return_node(&xml, &xml_message);
   size_t msg_len = xml_message.l + sizeof(XML_MSG_HEADER) - 1;
@@ -555,26 +570,22 @@ void XDebugServer::sendMessage(xdebug_xml_node& xml) {
   log("-> %s\n\n", xml_message.d);
   logFlush();
 
-  // Format the message
-  xdebug_str* message;
-  xdebug_str_ptr_init(message);
-  xdebug_str_add(message, xdebug_sprintf("%d", msg_len, 1), 1);
-  xdebug_str_addl(message, "\0", 1, 0);
-  xdebug_str_add(message, XML_MSG_HEADER, 0);
-  xdebug_str_add(message, xml_message.d, 0);
-  xdebug_str_addl(message, "\0", 1, 0);
-  xdebug_str_dtor(xml_message);
+  StringBuffer buf;
+  buf.append(static_cast<int64_t>(msg_len));
+  buf.append('\0');
+  buf.append(XML_MSG_HEADER);
+  buf.append(xml_message.d);
+  buf.append('\0');
 
-  // Write the message
-  write(m_socket, message->d, message->l);
-  xdebug_str_ptr_dtor(message);
+  write(m_socket, buf.data(), buf.size());
+  return;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Commands
 
 // elements in ExecutionContext::getCallerInfo
-const static StaticString
+const StaticString
   s_FILE("file"),
   s_LINE("line");
 
@@ -585,7 +596,7 @@ bool XDebugServer::breakpoint(const Variant& filename,
   setStatus(Status::BREAK, Reason::OK);
 
   // Initialize the response node
-  xdebug_xml_node* response = xdebug_xml_node_init("response");
+  auto response = xdebug_xml_node_init("response");
   addXmlns(*response);
   addStatus(*response);
   if (m_lastCommand != nullptr) {
@@ -593,20 +604,27 @@ bool XDebugServer::breakpoint(const Variant& filename,
   }
 
   // Grab the c strings
-  char* filename_str = filename.isNull() ?
-    nullptr : filename.toString().get()->mutableData();
-  char* exception_str = exception.isNull() ?
-    nullptr : exception.toString().get()->mutableData();
-  char* message_str = message.isNull() ?
-    nullptr : message.toString().get()->mutableData();
-  char* line_str = xdebug_sprintf("%d", line);
+  auto to_c_str = [] (const Variant& var) {
+    return !var.isString() ? nullptr : var.toString().data();
+  };
+
+  auto filename_str = to_c_str(filename);
+  auto exception_str = to_c_str(exception);
+  auto message_str = to_c_str(message);
+  auto line_str = xdebug_sprintf("%d", line);
 
   // Create the message node
-  xdebug_xml_node* msg = xdebug_xml_node_init("xdebug:message");
+  auto msg = xdebug_xml_node_init("xdebug:message");
   xdebug_xml_add_attribute_ex(msg, "lineno", line_str, 0, 1);
   if (filename_str != nullptr) {
     filename_str = XDebugUtils::pathToUrl(filename_str); // output file format
-    xdebug_xml_add_attribute_ex(msg, "filename", filename_str, 0, 1);
+    xdebug_xml_add_attribute_ex(
+      msg,
+      "filename",
+      filename_str,
+      0 /* freeAttr */,
+      1 /* freeVal */
+    );
   }
   if (exception_str != nullptr) {
     xdebug_xml_add_attribute(msg, "exception", exception_str);
@@ -672,12 +690,12 @@ bool XDebugServer::doCommandLoop() {
     }
 
     // Initialize the response
-    xdebug_xml_node* response = xdebug_xml_node_init("response");
+    auto response = xdebug_xml_node_init("response");
     addXmlns(*response);
 
     try {
       // Parse the command and store it as the last command
-      XDebugCommand* cmd = parseCommand();
+      auto cmd = parseCommand();
       if (m_lastCommand != nullptr) {
         delete m_lastCommand;
       }
@@ -713,7 +731,7 @@ bool XDebugServer::readInput() {
     }
 
     // Read into the buffer
-    size_t res = recv(m_socket, (void*) &m_buffer[bytes_read], bytes_left, 0);
+    auto const res = recv(m_socket, &m_buffer[bytes_read], bytes_left, 0);
     if (res <= 0) {
       return false;
     }
@@ -727,29 +745,38 @@ XDebugCommand* XDebugServer::parseCommand() {
   log("<- %s\n", m_buffer);
   logFlush();
 
-  // Attempt to parse the input. parseInput will initialize cmd_str and args
+  // Attempt to parse the input.  parseInput will initialize cmd_str and args.
   String cmd_str;
   Array args;
-  parseInput(cmd_str, args);
+
+  // If we're being sent chrome debugger commands, then convert them to dbgp
+  // first.
+  std::string chrome_input;
+  folly::StringPiece input(m_buffer);
+  if (RuntimeOption::XDebugChrome) {
+    chrome_input = chrome_to_dbgp(input);
+    input = chrome_input;
+  }
+
+  parseInput(input, cmd_str, args);
 
   // Create the command from the command string & args
   return XDebugCommand::fromString(*this, cmd_str, args);
 }
 
-void XDebugServer::parseInput(String& cmd, Array& args) {
+void XDebugServer::parseInput(folly::StringPiece in, String& cmd, Array& args) {
   // Always start with a blank array
   args = Array::Create();
 
   // Find the first space in the command. Everything before is assumed to be the
   // command string
-  char* ptr = strchr(m_buffer, ' ');
+  auto ptr = strchr(const_cast<char*>(in.data()), ' ');
   if (ptr != nullptr) {
-    size_t size = ptr - m_buffer;
-    StringData* cmd_data = StringData::Make(m_buffer, size, CopyString);
-    cmd = String(cmd_data);
-  } else if (m_buffer[0] != '\0') {
+    size_t size = ptr - in.data();
+    cmd = String(StringData::Make(in.data(), size, CopyString));
+  } else if (in[0] != '\0') {
     // There are no spaces, the entire string is the command
-    cmd = String(m_buffer, CopyString);
+    cmd = String(in.data(), CopyString);
     return;
   } else {
     throw ERROR_PARSE;
@@ -827,7 +854,7 @@ void XDebugServer::parseInput(String& cmd, Array& args) {
         if (args[opt].isNull()) {
           size_t size = ptr - value;
           StringData* val_data = StringData::Make(value, size, CopyString);
-          args.set(opt, f_stripcslashes(String(val_data)));
+          args.set(opt, HHVM_FN(stripcslashes)(String(val_data)));
           state = ParseState::SKIP_CHAR;
         } else {
           throw ERROR_DUP_ARG;

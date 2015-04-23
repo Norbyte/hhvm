@@ -18,7 +18,9 @@
 #include "hphp/runtime/ext/filter/ext_filter.h"
 #include "hphp/runtime/ext/filter/logical_filters.h"
 #include "hphp/runtime/ext/filter/sanitizing_filters.h"
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/request-event-handler.h"
+#include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/php-globals.h"
 
 namespace HPHP {
@@ -122,6 +124,14 @@ struct FilterRequestData final : RequestEventHandler {
     return empty_array();
   }
 
+  void scanRoots(IMarker& mark) {
+    mark(m_GET);
+    mark(m_POST);
+    mark(m_COOKIE);
+    mark(m_SERVER);
+    mark(m_ENV);
+  }
+
 private:
   Array m_GET;
   Array m_POST;
@@ -134,16 +144,16 @@ IMPLEMENT_STATIC_REQUEST_LOCAL(FilterRequestData, s_filter_request_data);
 #define REGISTER_CONSTANT(name)                                                \
   Native::registerConstant<KindOfInt64>(s_##name.get(), k_##name)              \
 
-static class FilterExtension : public Extension {
+static class FilterExtension final : public Extension {
 public:
   FilterExtension() : Extension("filter", "0.11.0") {}
 
-  virtual void moduleLoad(const IniSetting::Map& ini, Hdf config) {
+  void moduleLoad(const IniSetting::Map& ini, Hdf config) override {
     HHVM_FE(__SystemLib_filter_input_get_var);
     HHVM_FE(_filter_snapshot_globals);
   }
 
-  virtual void moduleInit() {
+  void moduleInit() override {
     REGISTER_CONSTANT(INPUT_POST);
     REGISTER_CONSTANT(INPUT_GET);
     REGISTER_CONSTANT(INPUT_COOKIE);
@@ -206,9 +216,15 @@ public:
     loadSystemlib();
   }
 
-  virtual void requestInit() {
+  void requestInit() override {
     // warm up the s_filter_request_data
     s_filter_request_data->requestInit();
+  }
+
+  void scanRoots(IMarker& m) override {
+    if (s_filter_request_data.getInited()) {
+      s_filter_request_data->scanRoots(m);
+    }
   }
 } s_filter_extension;
 

@@ -22,9 +22,9 @@
 #include <string>
 #include <vector>
 
-#include "hphp/runtime/base/complex-types.h"
 
 #include "hphp/util/trace.h"
+#include "hphp/util/dataflow-worklist.h"
 
 #include "hphp/hhbbc/interp-state.h"
 #include "hphp/hhbbc/interp.h"
@@ -34,6 +34,7 @@
 #include "hphp/hhbbc/unit-util.h"
 #include "hphp/hhbbc/class-util.h"
 #include "hphp/hhbbc/func-util.h"
+#include "hphp/hhbbc/options-util.h"
 
 namespace HPHP { namespace HHBBC {
 
@@ -45,10 +46,8 @@ TRACE_SET_MOD(hhbbc);
 
 const StaticString s_86pinit("86pinit");
 const StaticString s_86sinit("86sinit");
-const StaticString s_AsyncGenerator("AsyncGenerator");
+const StaticString s_AsyncGenerator("HH\\AsyncGenerator");
 const StaticString s_Generator("Generator");
-const StaticString s_http_response_header("http_response_header");
-const StaticString s_php_errormsg("php_errormsg");
 
 //////////////////////////////////////////////////////////////////////
 
@@ -115,18 +114,6 @@ State entry_state(const Index& index,
 
   auto afterParamsLocId = uint32_t{0};
   for (; locId < ctx.func->locals.size(); ++locId, ++afterParamsLocId) {
-    auto name = ctx.func->locals[locId]->name;
-
-    /*
-     * These can be set by various builtin calls, so we never try to track
-     * their type.
-     */
-    if (name && (name->isame(s_http_response_header.get()) ||
-                 name->isame(s_php_errormsg.get()))) {
-      ret.locals[locId] = TGen;
-      continue;
-    }
-
     /*
      * Some of the closure locals are mapped to used variables or static
      * locals.  The types of use vars are looked up from the index, but we
@@ -147,6 +134,14 @@ State entry_state(const Index& index,
     ret.locals[locId] = TUninit;
   }
 
+  // Finally, make sure any volatile locals are set to Gen, even if they are
+  // parameters.
+  for (auto locId = uint32_t{0}; locId < ctx.func->locals.size(); ++locId) {
+    if (is_volatile_local(ctx.func, borrow(ctx.func->locals[locId]))) {
+      ret.locals[locId] = TGen;
+    }
+  }
+
   return ret;
 }
 
@@ -160,11 +155,12 @@ State entry_state(const Index& index,
  * with these parameter locals already initialized (although the normal php
  * emitter can't do this), but that case will be discovered when iterating.
  */
-std::set<uint32_t> prepare_incompleteQ(const Index& index,
-                                       FuncAnalysis& ai,
-                                       ClassAnalysis* clsAnalysis,
-                                       const std::vector<Type>* knownArgs) {
-  auto incompleteQ     = std::set<uint32_t>{};
+dataflow_worklist<uint32_t>
+prepare_incompleteQ(const Index& index,
+                    FuncAnalysis& ai,
+                    ClassAnalysis* clsAnalysis,
+                    const std::vector<Type>* knownArgs) {
+  auto incompleteQ     = dataflow_worklist<uint32_t>(ai.rpoBlocks.size());
   auto const ctx       = ai.ctx;
   auto const numParams = ctx.func->params.size();
 
@@ -186,7 +182,7 @@ std::set<uint32_t> prepare_incompleteQ(const Index& index,
       for (auto i = knownArgs->size(); i < numParams; ++i) {
         if (auto const dv = ctx.func->params[i].dvEntryPoint) {
           ai.bdata[dv->id].stateIn = entryState;
-          incompleteQ.insert(rpoId(ai, dv));
+          incompleteQ.push(rpoId(ai, dv));
           return true;
         }
       }
@@ -195,7 +191,7 @@ std::set<uint32_t> prepare_incompleteQ(const Index& index,
 
     if (!useDvInit) {
       ai.bdata[ctx.func->mainEntry->id].stateIn = entryState;
-      incompleteQ.insert(rpoId(ai, ctx.func->mainEntry));
+      incompleteQ.push(rpoId(ai, ctx.func->mainEntry));
     }
 
     return incompleteQ;
@@ -204,7 +200,7 @@ std::set<uint32_t> prepare_incompleteQ(const Index& index,
   for (auto paramId = uint32_t{0}; paramId < numParams; ++paramId) {
     if (auto const dv = ctx.func->params[paramId].dvEntryPoint) {
       ai.bdata[dv->id].stateIn = entryState;
-      incompleteQ.insert(rpoId(ai, dv));
+      incompleteQ.push(rpoId(ai, dv));
       for (auto locId = paramId; locId < numParams; ++locId) {
         ai.bdata[dv->id].stateIn.locals[locId] = TUninit;
       }
@@ -212,7 +208,7 @@ std::set<uint32_t> prepare_incompleteQ(const Index& index,
   }
 
   ai.bdata[ctx.func->mainEntry->id].stateIn = entryState;
-  incompleteQ.insert(rpoId(ai, ctx.func->mainEntry));
+  incompleteQ.push(rpoId(ai, ctx.func->mainEntry));
 
   return incompleteQ;
 }
@@ -239,6 +235,9 @@ FuncAnalysis do_analyze_collect(const Index& index,
                                 const std::vector<Type>* knownArgs) {
   auto const ctx = adjust_closure_context(inputCtx);
   FuncAnalysis ai(ctx);
+
+  Trace::Bump bumper{Trace::hhbbc, kTraceFuncBump,
+    is_trace_function(ctx.cls, ctx.func)};
   FTRACE(2, "{:-^70}\n-- {}\n", "Analyze", show(ctx));
 
   /*
@@ -279,8 +278,7 @@ FuncAnalysis do_analyze_collect(const Index& index,
    * means less iterations.
    */
   while (!incompleteQ.empty()) {
-    auto const blk = ai.rpoBlocks[*begin(incompleteQ)];
-    incompleteQ.erase(begin(incompleteQ));
+    auto const blk = ai.rpoBlocks[incompleteQ.pop()];
 
     if (nonWideVisits[blk->id]++ > options.analyzeFuncWideningLimit) {
       nonWideVisits[blk->id] = 0;
@@ -312,7 +310,7 @@ FuncAnalysis do_analyze_collect(const Index& index,
         needsWiden ? widen_into(ai.bdata[target.id].stateIn, st)
                    : merge_into(ai.bdata[target.id].stateIn, st);
       if (changed) {
-        incompleteQ.insert(rpoId(ai, &target));
+        incompleteQ.push(rpoId(ai, &target));
       }
       FTRACE(4, "target new {}",
         state_string(*ctx.func, ai.bdata[target.id].stateIn));

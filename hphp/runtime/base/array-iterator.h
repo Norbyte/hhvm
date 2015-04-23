@@ -20,12 +20,11 @@
 #include <array>
 #include <cstdint>
 
-#include "hphp/util/tls-pod-bag.h"
-#include "hphp/runtime/base/types.h"
-#include "hphp/runtime/base/smart-ptr.h"
-#include "hphp/runtime/base/complex-types.h"
+#include "hphp/runtime/base/array-data-defs.h"
 #include "hphp/runtime/base/smart-containers.h"
-#include "hphp/runtime/base/mixed-array.h"
+#include "hphp/runtime/base/smart-ptr.h"
+#include "hphp/runtime/base/type-variant.h"
+#include "hphp/util/tls-pod-bag.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -38,10 +37,12 @@ class c_ImmVector;
 class c_ImmSet;
 class c_Pair;
 struct Iter;
+struct MixedArray;
 
 enum class IterNextIndex : uint16_t {
   ArrayPacked = 0,
   ArrayMixed,
+  ArrayStruct,
   Array,
   Vector,
   ImmVector,
@@ -94,7 +95,7 @@ struct ArrayIter {
   explicit ArrayIter(ObjectData* obj);
   ArrayIter(ObjectData* obj, NoInc);
   explicit ArrayIter(const Object& obj);
-  explicit ArrayIter(const Cell& c);
+  explicit ArrayIter(Cell);
   explicit ArrayIter(const Variant& v);
 
   // Copy ctor
@@ -297,7 +298,7 @@ private:
   template <bool incRef>
   void objInit(ObjectData* obj);
 
-  void cellInit(const Cell& c);
+  void cellInit(Cell);
 
   static void VectorInit(ArrayIter* iter, ObjectData* obj);
   static void MapInit(ArrayIter* iter, ObjectData* obj);
@@ -309,49 +310,9 @@ private:
   static void IteratorObjInit(ArrayIter* iter, ObjectData* obj);
 
   typedef void(*InitFuncPtr)(ArrayIter*,ObjectData*);
-  static const InitFuncPtr initFuncTable[Collection::MaxNumTypes];
+  static const InitFuncPtr initFuncTable[];
 
   void destruct();
-
-  BaseVector* getVector() const {
-    assert(hasCollection());
-    assert(getCollectionType() == Collection::VectorType ||
-           getCollectionType() == Collection::ImmVectorType);
-    return (BaseVector*)((intptr_t)m_obj & ~1);
-  }
-  BaseMap* getMap() const {
-    assert(hasCollection());
-    assert(Collection::isMapType(getCollectionType()));
-    return (BaseMap*)((intptr_t)m_obj & ~1);
-  }
-  BaseSet* getSet() const {
-    assert(hasCollection());
-    assert(getCollectionType() == Collection::SetType ||
-           getCollectionType() == Collection::ImmSetType);
-    return (BaseSet*)((intptr_t)m_obj & ~1);
-  }
-  c_Pair* getPair() const {
-    assert(hasCollection() && getCollectionType() == Collection::PairType);
-    return (c_Pair*)((intptr_t)m_obj & ~1);
-  }
-  c_ImmVector* getImmVector() const {
-    assert(hasCollection() &&
-           getCollectionType() == Collection::ImmVectorType);
-
-    return (c_ImmVector*)((intptr_t)m_obj & ~1);
-  }
-  c_ImmSet* getImmSet() {
-    assert(hasCollection() && getCollectionType() == Collection::ImmSetType);
-    return (c_ImmSet*)((intptr_t)m_obj & ~1);
-  }
-  Collection::Type getCollectionType() const {
-    ObjectData* obj = getObject();
-    return obj->getCollectionType();
-  }
-  ObjectData* getIteratorObj() const {
-    assert(hasIteratorObj());
-    return getObject();
-  }
 
   void setArrayData(const ArrayData* ad) {
     assert((intptr_t(ad) & 1) == 0);
@@ -610,6 +571,13 @@ private:
  */
 struct MIterTable {
   struct Ent { ArrayData* array; MArrayIter* iter; };
+
+  void clear() {
+    ents.fill({nullptr, nullptr});
+    if (!extras.empty()) {
+      extras.release_if([] (const MIterTable::Ent& e) { return true; });
+    }
+  }
 
   std::array<Ent,7> ents;
   // Slow path: we expect this `extras' list to rarely be allocated.

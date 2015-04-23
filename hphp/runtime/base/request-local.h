@@ -64,7 +64,12 @@ struct RequestLocal {
     }
     if (!m_node.m_p->getInited()) {
       m_node.m_p->setInited(true);
-      m_node.m_p->requestInit();
+      try {
+        m_node.m_p->requestInit();
+      } catch (...) {
+        m_node.m_p->setInited(false);
+        throw;
+      }
       // this registration makes sure m_p->requestShutdown() will be called
       g_context->registerRequestEventHandler(m_node.m_p);
     }
@@ -98,8 +103,7 @@ template<typename T>
 void RequestLocal<T>::create() {
   if (m_node.m_on_thread_exit_fn == nullptr) {
     m_node.m_on_thread_exit_fn = RequestLocal<T>::OnThreadExit;
-    m_node.m_next = ThreadLocalManager::s_manager.getTop();
-    ThreadLocalManager::s_manager.setTop((void*)(&m_node));
+    ThreadLocalManager::PushTop(m_node);
   }
   assert(m_node.m_p == nullptr);
   m_node.m_p = new T();
@@ -135,7 +139,12 @@ public:
     T *obj = m_tlsObjects.get();
     if (!obj->getInited()) {
       obj->setInited(true);
-      obj->requestInit();
+      try {
+        obj->requestInit();
+      } catch (...) {
+        obj->setInited(false);
+        throw;
+      }
 
       // this registration makes sure obj->requestShutdown() will be called
       g_context->registerRequestEventHandler(obj);

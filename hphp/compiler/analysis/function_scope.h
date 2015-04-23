@@ -86,10 +86,7 @@ public:
   FunctionScope(bool method, const std::string &name, bool reference);
   void setParamCounts(AnalysisResultConstPtr ar,
                       int minParam, int numDeclParam);
-  void setParamSpecs(AnalysisResultPtr ar);
   void setParamName(int index, const std::string &name);
-  void setParamDefault(int index, const char* value, int64_t len,
-                       const std::string &text);
   void setRefParam(int index);
   bool hasRefParam(int max) const;
 
@@ -117,8 +114,6 @@ public:
   bool isDynamicInvoke() const { return m_dynamicInvoke; }
   void setDynamicInvoke();
   bool hasImpl() const;
-  void setDirectInvoke() { m_directInvoke = true; }
-  bool hasDirectInvoke() const { return m_directInvoke; }
   bool isParamCoerceMode() const;
   bool mayContainThis();
   bool isClosure() const;
@@ -127,14 +122,6 @@ public:
   bool isAsync() const { return m_async; }
   void setAsync(bool f) { m_async = f; }
 
-  bool needsClassParam();
-
-  void setInlineSameContext(bool f) { m_inlineSameContext = f; }
-  bool getInlineSameContext() const { return m_inlineSameContext; }
-  void setContextSensitive(bool f) { m_contextSensitive = f; }
-  bool getContextSensitive() const { return m_contextSensitive; }
-  void setInlineAsExpr(bool f) { m_inlineAsExpr = f; }
-  bool getInlineAsExpr() const { return m_inlineAsExpr; }
   int nextInlineIndex() { return ++m_inlineIndex; }
 
   bool usesLSB() const { return !m_noLSB; }
@@ -204,7 +191,6 @@ public:
   bool usesVariableArgumentFunc() const;
   bool isReferenceVariableArgument() const;
   void setVariableArgument(int reference);
-  bool isMixedVariableArgument() const;
 
   /**
    * Whether this function has no side effects
@@ -265,25 +251,16 @@ public:
    * Note that for generators and async functions, this is different
    * from what caller actually gets when calling the function.
    */
-  void pushReturnType();
   void setReturnType(AnalysisResultConstPtr ar, TypePtr type);
   TypePtr getReturnType() const {
-    return m_prevReturn ? m_prevReturn : m_returnType;
+    return m_returnType;
   }
-  bool popReturnType();
-  void resetReturnType();
-
-  void addRetExprToFix(ExpressionPtr e);
-  void clearRetExprs();
-  void fixRetExprs();
 
   void setOptFunction(FunctionOptPtr fn) { m_optFunction = fn; }
   FunctionOptPtr getOptFunction() const { return m_optFunction; }
 
   /**
    * Whether this is a virtual function that needs to go through invoke().
-   * A perfect virtual will be generated as C++ virtual function without
-   * going through invoke(), but rather directly generated as obj->foo().
    * "Overriding" is only being used by magic methods, enforcing parameter
    * and return types.
    */
@@ -291,8 +268,6 @@ public:
   bool isVirtual() const { return m_virtual;}
   void setHasOverride() { m_hasOverride = true; }
   bool hasOverride() const { return m_hasOverride; }
-  void setPerfectVirtual();
-  bool isPerfectVirtual() const { return m_perfectVirtual;}
   void setOverriding(TypePtr returnType, TypePtr param1 = TypePtr(),
                      TypePtr param2 = TypePtr());
   bool isOverriding() const { return m_overriding;}
@@ -315,27 +290,12 @@ public:
   bool isPersistent() const { return m_persistent; }
   void setPersistent(bool p) { m_persistent = p; }
 
-  bool isInlined() const { return m_inlineable; }
-  void disableInline() { m_inlineable = false; }
-
-  /* Whether we need to worry about the named return value optimization
-     for this function */
-  void setNRVOFix(bool flag) { m_nrvoFix = flag; }
-  bool getNRVOFix() const { return m_nrvoFix; }
-
   /* Indicates if a function may need to use a VarEnv or varargs (aka
    * extraArgs) at run time */
   bool mayUseVV() const;
 
-  /**
-   * Whether this function matches the specified one with same number of
-   * parameters and types and defaults, so to qualify for perfect virtuals.
-   */
-  bool matchParams(FunctionScopePtr func);
-
   TypePtr setParamType(AnalysisResultConstPtr ar, int index, TypePtr type);
   TypePtr getParamType(int index);
-  TypePtr getParamTypeSpec(int index) { return m_paramTypeSpecs[index]; }
 
   typedef hphp_hash_map<std::string, ExpressionPtr, string_hashi,
     string_eqstri> UserAttributeMap;
@@ -363,10 +323,6 @@ public:
   }
   bool isMagicMethod() const {
     return m_magicMethod;
-  }
-
-  void setStmtCloned(StatementPtr stmt) {
-    m_stmtCloned = stmt;
   }
 
   void setClosureVars(ExpressionListPtr closureVars) {
@@ -444,12 +400,8 @@ private:
   int m_attribute;
   std::vector<std::string> m_paramNames;
   TypePtrVec m_paramTypes;
-  TypePtrVec m_paramTypeSpecs;
-  std::vector<std::string> m_paramDefaults;
-  std::vector<std::string> m_paramDefaultTexts;
   std::vector<bool> m_refs;
   TypePtr m_returnType;
-  TypePtr m_prevReturn;
   ModifierExpressionPtr m_modifiers;
   UserAttributeMap m_userAttributes;
 
@@ -458,7 +410,6 @@ private:
   unsigned m_refReturn : 1; // whether it's "function &get_reference()"
   unsigned m_virtual : 1;
   unsigned m_hasOverride : 1;
-  unsigned m_perfectVirtual : 1;
   unsigned m_dynamic : 1;
   unsigned m_dynamicInvoke : 1;
   unsigned m_overriding : 1; // overriding a virtual function
@@ -467,15 +418,9 @@ private:
   unsigned m_pseudoMain : 1;
   unsigned m_magicMethod : 1;
   unsigned m_system : 1;
-  unsigned m_inlineable : 1;
   unsigned m_containsThis : 1; // contains a usage of $this?
   unsigned m_containsBareThis : 2; // $this outside object-context,
                                    // 2 if in reference context
-  unsigned m_nrvoFix : 1;
-  unsigned m_inlineAsExpr : 1;
-  unsigned m_inlineSameContext : 1;
-  unsigned m_contextSensitive : 1;
-  unsigned m_directInvoke : 1;
   unsigned m_generator : 1;
   unsigned m_async : 1;
   unsigned m_noLSB : 1;
@@ -485,10 +430,8 @@ private:
   unsigned m_localRedeclaring : 1;
 
   int m_redeclaring; // multiple definition of the same function
-  StatementPtr m_stmtCloned; // cloned method body stmt
   int m_inlineIndex;
   FunctionOptPtr m_optFunction;
-  ExpressionPtrVec m_retExprsToFix;
   ExpressionListPtr m_closureVars;
   ExpressionListPtr m_closureValues;
   ReadWriteMutex m_inlineMutex;

@@ -42,6 +42,11 @@ function f3(?:xhp:hello $x) {
 }
 $rf = new ReflectionFunction('f3');
 printFunc($rf);
+function f4(): noreturn {
+  throw Exception('f4 doesn\'t return');
+}
+$rf = new ReflectionFunction('f4');
+printFunc($rf);
 function f100(): int {
 }
 $rf = new ReflectionFunction('f100');
@@ -137,16 +142,16 @@ class TC {
 }
 $rc = new ReflectionClass('TC');
 printClass($rc);
-function ff(Vector<int> $i, ?string $s, @C $c, array $a) {
+function ff(Vector<int> $i, ?string $s, @C $c,
+            array $a, arraykey $k, this $t) {
 }
 $rf = new ReflectionFunction('ff');
 $rps = $rf->getParameters();
 foreach ($rps as $rp) {
   var_dump($rp->getTypeText());
-  if ($rp->getClass() != null) {
-      var_dump($rp->getClass()->getName());
-    }
- else {
-      var_dump("");
-    }
+  if ($rp->getClass() !== null) {
+    var_dump($rp->getClass()->getName());
+  } else {
+    var_dump("");
+  }
 }

@@ -17,36 +17,38 @@
 #define incl_HPHP_JIT_CODE_GEN_ARM_H
 
 #include "hphp/vixl/a64/macro-assembler-a64.h"
-#include <vector>
+
+#include "hphp/runtime/vm/jit/arg-group.h"
+#include "hphp/runtime/vm/jit/block.h"
+#include "hphp/runtime/vm/jit/code-gen-x64.h"
+#include "hphp/runtime/vm/jit/code-gen.h"
+#include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/runtime/vm/jit/translator.h"
+#include "hphp/runtime/vm/jit/vasm.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 
 #include "hphp/util/data-block.h"
-#include "hphp/runtime/vm/jit/block.h"
-#include "hphp/runtime/vm/jit/translator.h"
-#include "hphp/runtime/vm/jit/mc-generator.h"
-#include "hphp/runtime/vm/jit/arg-group.h"
-#include "hphp/runtime/vm/jit/code-gen.h"
+
+#include <vector>
 
 namespace HPHP { namespace jit { namespace arm {
+///////////////////////////////////////////////////////////////////////////////
 
-struct CodeGenerator : public jit::CodeGenerator {
-
-  CodeGenerator(const IRUnit& unit, Vout& main, Vout& cold, Vout& frozen,
-                CodegenState& state)
-    : m_unit(unit)
+struct CodeGenerator {
+  CodeGenerator(CodegenState& state, Vout& main, Vout& cold)
+    : m_xcg{state, main, cold}
+    , m_state(state)
     , m_vmain(main)
     , m_vcold(cold)
-    , m_vfrozen(frozen)
-    , m_state(state)
   {}
 
-  virtual ~CodeGenerator() {}
-  void cgInst(IRInstruction* inst) override;
+  void cgInst(IRInstruction* inst);
 
  private:
   const Func* curFunc() const { return m_curInst->marker().func(); }
   bool resumed() const { return m_curInst->marker().resumed(); }
 
-  void emitCompareInt(IRInstruction* inst);
+  Vreg emitCompareInt(IRInstruction* inst);
   void emitCompareIntAndSet(IRInstruction* inst, ConditionCode cond);
 
   CallDest callDest(Vreg reg0) const;
@@ -70,7 +72,7 @@ struct CodeGenerator : public jit::CodeGenerator {
   void emitDecRefMem(Vout&, Type type, Vreg base, int offset);
 
   template <class JmpFn>
-  void emitReffinessTest(IRInstruction* inst, JmpFn doJcc);
+  void emitReffinessTest(IRInstruction* inst, Vreg sf, JmpFn doJcc);
 
   template<class Loc, class JmpFn>
   void emitTypeTest(Vout& v, Type type, Vreg typeReg, Loc dataSrc, JmpFn doJcc);
@@ -99,18 +101,23 @@ struct CodeGenerator : public jit::CodeGenerator {
 
   Vout& vmain() { return m_vmain; }
   Vout& vcold() { return m_vcold; }
-  Vout& vfrozen() { return m_vfrozen; }
 
  private:
-  const IRUnit&         m_unit;
+  /*
+   * TODO(4894527): this is a temporary measure while we merge the two
+   * CodeGenerator implementations. We call through to the x64 CodeGenerator for
+   * opcodes where the two platforms can use identical vasm implementations.
+   */
+  x64::CodeGenerator    m_xcg;
+
+  CodegenState&         m_state;
   Vout&                 m_vmain;
   Vout&                 m_vcold;
-  Vout&                 m_vfrozen;
-  CodegenState&         m_state;
   IRInstruction*        m_curInst{nullptr};
   jit::vector<Vloc>     m_slocs, m_dlocs;
 };
 
+///////////////////////////////////////////////////////////////////////////////
 }}}
 
 #endif

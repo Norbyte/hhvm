@@ -23,7 +23,7 @@
 #include <boost/mpl/has_xxx.hpp>
 #include <algorithm>
 
-#include "folly/Hash.h"
+#include <folly/Hash.h>
 
 #include "hphp/util/tiny-vector.h"
 #include "hphp/runtime/vm/hhbc.h"
@@ -77,10 +77,11 @@ struct MElem {
     case MEL:  /* fallthrough */
     case MPL:  return immLoc == o.immLoc;
     case MET:  /* fallthrough */
-    case MPT:  return immStr == o.immStr;
+    case MPT:  /* fallthrough */
+    case MQT:  return immStr == o.immStr;
     case MEI:  return immInt == o.immInt;
     case MW:   return true;
-    case NumMemberCodes:
+    case InvalidMemberCode:
       break;
     }
     not_reached();
@@ -334,11 +335,12 @@ namespace bc {
 
 #define POP_CVUMANY uint32_t numPop() const { return arg1; }  \
                     Flavor popFlavor(uint32_t i) const {      \
-                      not_reached();                          \
+                      return Flavor::CVU;                     \
                     }
 
 #define PUSH_UV  if (i == 0) return TUninit
 #define PUSH_CV  if (i == 0) return TInitCell
+#define PUSH_CUV if (i == 0) return TCell
 #define PUSH_AV  if (i == 0) return TCls
 #define PUSH_VV  if (i == 0) return TRef
 #define PUSH_FV  if (i == 0) return TInitGen
@@ -399,6 +401,7 @@ OPCODES
 
 #undef PUSH_UV
 #undef PUSH_CV
+#undef PUSH_CUV
 #undef PUSH_AV
 #undef PUSH_VV
 #undef PUSH_FV
@@ -543,7 +546,7 @@ struct Bytecode {
   // Note: assuming bc::Nop is empty and has trivial dtor/ctor.
 
   Bytecode(const Bytecode& o) : op(Op::Nop) { *this = o; }
-  Bytecode(Bytecode&& o) : op(Op::Nop) { *this = std::move(o); }
+  Bytecode(Bytecode&& o) noexcept : op(Op::Nop) { *this = std::move(o); }
 
   Bytecode& operator=(const Bytecode& o) {
     destruct();

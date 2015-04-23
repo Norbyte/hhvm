@@ -25,11 +25,10 @@
 #include <boost/variant.hpp>
 #include <tbb/concurrent_hash_map.h>
 
-#include "folly/Optional.h"
-#include "folly/Hash.h"
+#include <folly/Optional.h>
+#include <folly/Hash.h>
 
 #include "hphp/util/either.h"
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/repo-auth-type-array.h"
 #include "hphp/runtime/vm/type-constraint.h"
 
@@ -165,6 +164,15 @@ struct Class {
    * Returns the name of this class.  Non-null guarantee.
    */
   SString name() const;
+
+  /*
+   * Whether this class could possibly be an interface or a trait.
+   *
+   * When returning false, it is known that this class is not an interface
+   * or a trait. When returning true, it's possible that this class is not
+   * an interface or trait but the system cannot tell.
+   */
+  bool couldBeInterfaceOrTrait() const;
 
   /*
    * Returns whether this type has the no override attribute, that is, if it
@@ -416,8 +424,20 @@ struct Index {
    * This function returns a subtype of Cell, although TypeConstraints
    * at runtime can match reference parameters.  The caller should
    * make sure to handle that case.
+   *
+   * For soft constraints (@), this function returns Cell.
+   *
+   * For some non-soft constraints (such as "Stringish"), this
+   * function may return a Type that is a strict supertype of the
+   * constraint's type.
    */
   Type lookup_constraint(Context, const TypeConstraint&) const;
+
+  /*
+   * If this function returns true, it is safe to assume that Type t
+   * will always satisfy TypeConstraint tc at run time.
+   */
+  bool satisfies_constraint(Context, Type t, const TypeConstraint& tc) const;
 
   /*
    * Lookup what the best known Type for a class constant would be,
@@ -574,6 +594,7 @@ private:
                             borrowed_ptr<const php::Class>) const;
   bool could_be_related(borrowed_ptr<const php::Class>,
                         borrowed_ptr<const php::Class>) const;
+  Type satisfies_constraint_helper(Context, const TypeConstraint&) const;
 
 private:
   std::unique_ptr<IndexData> const m_data;
@@ -587,6 +608,10 @@ private:
  * how it is used.
  */
 struct PublicSPropIndexer {
+  explicit PublicSPropIndexer(borrowed_ptr<const Index> index)
+    : m_index(index)
+  {}
+
   /*
    * Called by the interpreter during analyze_func_collect when a
    * PublicSPropIndexer is active.  This function must be called anywhere the
@@ -599,7 +624,7 @@ struct PublicSPropIndexer {
    * This routine may be safely called concurrently by multiple analysis
    * threads.
    */
-  void merge(Type cls, Type name, Type val);
+  void merge(Context ctx, Type cls, Type name, Type val);
 
 private:
   friend struct Index;
@@ -621,6 +646,7 @@ private:
   using KnownMap = tbb::concurrent_hash_map<KnownKey,Type>;
 
 private:
+  borrowed_ptr<const Index> m_index;
   std::atomic<bool> m_everything_bad{false};
   UnknownMap m_unknown;
   KnownMap m_known;

@@ -69,15 +69,6 @@ static BlockScopeRawPtr originalScope(StaticClassName *scn) {
   return dynamic_cast<Statement*>(scn)->getScope();
 }
 
-void StaticClassName::resolveStatic(const string &name) {
-  always_assert(isStatic());
-  m_static = m_self = m_parent = false;
-  m_present = false;
-  m_class.reset();
-  m_origClassName = name;
-  m_className = toLower(name);
-}
-
 ClassScopePtr StaticClassName::resolveClass() {
   m_present = false;
   m_unknown = true;
@@ -106,11 +97,8 @@ ClassScopePtr StaticClassName::resolveClass() {
   if (cls) {
     m_unknown = false;
     if (cls->isVolatile()) {
-      ClassScopeRawPtr c = scope->getContainingFile()->resolveClass(cls);
-      if (!c) {
-        c = scope->getContainingClass();
-        if (c && c->getName() != m_className) c.reset();
-      }
+      ClassScopeRawPtr c = scope->getContainingClass();
+      if (c && c->getName() != m_className) c.reset();
       m_present = c.get() != 0;
       if (cls->isRedeclaring()) {
         cls = c;
@@ -121,49 +109,6 @@ ClassScopePtr StaticClassName::resolveClass() {
     }
   }
   return cls;
-}
-
-ClassScopePtr StaticClassName::resolveClassWithChecks() {
-  ClassScopePtr cls = resolveClass();
-  if (!m_class && !cls) {
-    Construct *self = dynamic_cast<Construct*>(this);
-    BlockScopeRawPtr scope = self->getScope();
-    if (isRedeclared()) {
-      scope->getVariables()->setAttribute(VariableTable::NeedGlobalPointer);
-    } else if (scope->isFirstPass()) {
-      ClassScopeRawPtr cscope = scope->getContainingClass();
-      if (!cscope ||
-          !cscope->isTrait() ||
-          (!isSelf() && !isParent())) {
-        Compiler::Error(Compiler::UnknownClass, self->shared_from_this());
-      }
-    }
-  }
-  return cls;
-}
-
-bool StaticClassName::checkPresent() {
-  if (m_self || m_parent || m_static) return true;
-  BlockScopeRawPtr scope = originalScope(this);
-  FileScopeRawPtr currentFile = scope->getContainingFile();
-  if (currentFile) {
-    AnalysisResultPtr ar = currentFile->getContainingProgram();
-    ClassScopeRawPtr cls = ar->findClass(m_className);
-    if (!cls) return false;
-    if (!cls->isVolatile()) return true;
-    if (currentFile->resolveClass(cls)) return true;
-    if (currentFile->checkClass(m_className)) return true;
-  }
-
-  if (ClassScopePtr self = scope->getContainingClass()) {
-    if (m_className == self->getName() ||
-        self->derivesFrom(scope->getContainingProgram(), m_className,
-                          true, false)) {
-      return true;
-    }
-  }
-
-  return false;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

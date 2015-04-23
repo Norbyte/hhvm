@@ -9,7 +9,7 @@ node's purpose. Listed values are defaults, unless examples.
   Log {
     Level = None (default) | Error | Warning | Info | Verbose
     NoSilencer = false
-    AlwaysLogUnhandledExceptions = true
+    AlwaysLogUnhandledExceptions = false
     RuntimeErrorReportingLevel = 8191
     ForceErrorReportingLevel = 0
     Header = false
@@ -85,7 +85,7 @@ flood error logs.
     # Bitmask of error constants to upgrade to E_USER_ERROR. Only E_WARNING,
     # E_USER_WARNING, E_NOTICE, and E_USER_NOTICE are supported.
     UpgradeLevel = 0 (default)
-    CallUserHandlerOnFatals = true
+    CallUserHandlerOnFatals = false
     MaxLoopCount = 0
     NoInfiniteRecursionDetection = false
     WarnTooManyArguments = false
@@ -99,12 +99,12 @@ flood error logs.
 = Resource Limits
 
   ResourceLimit {
-    CoreFileSize = 0          # in bytes
+    CoreFileSize = 0           # in bytes
     MaxSocket = 0
-    SocketDefaultTimeout = 5  # in seconds
+    SocketDefaultTimeout = 60  # in seconds
     MaxRSS = 0
-    MaxRSSPollingCycle = 0    # in seconds, how often to check max memory
-    DropCacheCycle = 0        # in seconds, how often to drop disk cache
+    MaxRSSPollingCycle = 0     # in seconds, how often to check max memory
+    DropCacheCycle = 0         # in seconds, how often to drop disk cache
     MaxSQLRowCount = 0
     SerializationSizeLimit = 0
     StringOffsetLimit = 10 * 1024 * 1024
@@ -159,7 +159,7 @@ flood error logs.
 
     # Forcing $_SERVER['SERVER_NAME'] to come from request header
     ForceServerNameToHeader = false
-    
+
     # Print file paths traversed onto the 404 page
     PathDebug = false
 
@@ -204,7 +204,6 @@ How long to wait for dangling server to respond.
       Cookie =      # if this cookie is present: "name" or "name=value"
       Param =       # if this parameter in query string is present
     }
-    EnableMagicQuotesGpc = false
     EnableKeepAlive = true
     EnableOutputBuffering = false
     OutputHandler =
@@ -596,6 +595,8 @@ next requests.
     CoreDumpEmail = email address
     CoreDumpReport = true
     CoreDumpReportDirectory = /tmp
+
+    StackTraceTimeout = 0
   }
 
 - FullBacktrace, ServerErrorMessage, TranslateSource
@@ -612,6 +613,12 @@ We can easily gdb that way to debug any problems. Watch error log for recorded
 file's location. ClearInputOnSuccess can automatically delete requests that
 had 200 responses and it's useful to capture 500 errors on production without
 capturing good responses.
+
+- StackTraceTimeout
+
+This specifies the maximum number of seconds spent for generating a stack trace
+when hhvm is crashed. The default is 0 which means no timeout. This can be set
+to prevent from deadlocks in the backtrace handler.
 
 - APCSize
 
@@ -784,6 +791,27 @@ disabled by setting TypedResults to false.
    BacktraceLimit = 100000
    RecursionLimit = 100000
   }
+
+- Eval.PCRETableSize
+
+The number of patterns which can be stored in the PCRE cache.
+
+- Eval.PCRECacheType
+
+May be "static", for a very fast cache which never evicts, "lru", for a cache
+which evicts the least-recently used item when full, or "scalable" for a cache
+which is slightly slower than "lru" at low concurrency but much faster for a
+high-concurrency tight-loop workload.
+
+Default: scalable.
+
+- Eval.PCREExpireInterval
+
+If Eval.PCRECacheType is set to "static", then setting this to an integer
+number of seconds will cause the cache to be regularly cleared after the
+specified number of seconds.
+
+For "lru" and "scalable" type caches, this is not necessary and not supported.
 
 =  Tier overwrites
 

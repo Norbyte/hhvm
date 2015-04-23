@@ -17,12 +17,13 @@
 #ifndef incl_HPHP_APC_HANDLE_H_
 #define incl_HPHP_APC_HANDLE_H_
 
-#include "hphp/runtime/base/types.h"
 #include <atomic>
-#include "hphp/util/lock.h"
-#include "hphp/util/hash.h"
+
 #include "hphp/util/atomic.h"
-#include "hphp/runtime/base/complex-types.h"
+#include "hphp/util/hash.h"
+#include "hphp/util/lock.h"
+
+#include "hphp/runtime/base/type-variant.h"
 
 #if (defined(__APPLE__) || defined(__APPLE_CC__)) && (defined(__BIG_ENDIAN__) || defined(__LITTLE_ENDIAN__))
 # if defined(__LITTLE_ENDIAN__)
@@ -84,15 +85,17 @@ namespace HPHP {
  *
  */
 struct APCHandle {
+  struct Pair {
+    APCHandle* handle;
+    size_t size;
+  };
+
   /*
    * Create an instance of an APC object according to the type of source and
    * the various flags. This is the only entry point to create APC entities.
    */
-  static APCHandle* Create(const Variant& source,
-                           size_t& size,
-                           bool serialized,
-                           bool inner = false,
-                           bool unserializeObj = false);
+  static Pair Create(const Variant& source, bool serialized,
+                     bool inner = false, bool unserializeObj = false);
 
   /*
    * Memory management API.
@@ -207,30 +210,21 @@ private:
   }
 
   void realDecRef() const {
-    assert(m_count.load());
+    assert(m_count.load() > 0);
     if (m_count > 1) {
       assert(IS_REFCOUNTED_TYPE(m_type));
-      --m_count;
-    } else {
-      assert(m_count.load() == 1);
-      const_cast<APCHandle*>(this)->deleteShared();
+      if (--m_count) return;
     }
+    const_cast<APCHandle*>(this)->deleteShared();
   }
 
   void deleteShared();
 
 private:
-#if PACKED_TV
-  std::atomic<uint8_t> m_obj_attempted{false};
-  DataType m_type;
-  uint8_t m_flags{0};
-  mutable std::atomic<uint32_t> m_count{1};
-#else
   DataType m_type;
   std::atomic<uint8_t> m_obj_attempted{false};
   uint8_t m_flags{0};
   mutable std::atomic<uint32_t> m_count{1};
-#endif
 };
 
 ///////////////////////////////////////////////////////////////////////////////

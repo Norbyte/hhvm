@@ -418,14 +418,17 @@ bool UnitEmitter::insert(UnitOrigin unitOrigin, RepoTxn& txn) {
   try {
     {
       m_lineTable = createLineTable(m_sourceLocTab, m_bclen);
-      urp.insertUnit(repoId).insert(*this, txn, m_sn, m_md5, m_bc, m_bclen);
+      urp.insertUnit[repoId].insert(*this, txn, m_sn, m_md5, m_bc,
+                                    m_bclen);
     }
     int64_t usn = m_sn;
+    urp.insertUnitLineTable(repoId, txn, usn, m_lineTable);
     for (unsigned i = 0; i < m_litstrs.size(); ++i) {
-      urp.insertUnitLitstr(repoId).insert(txn, usn, i, m_litstrs[i]);
+      urp.insertUnitLitstr[repoId].insert(txn, usn, i, m_litstrs[i]);
     }
     for (unsigned i = 0; i < m_arrays.size(); ++i) {
-      urp.insertUnitArray(repoId).insert(txn, usn, i, m_arrays[i].serialized);
+      urp.insertUnitArray[repoId].insert(txn, usn, i,
+                                         m_arrays[i].serialized);
     }
     for (auto& fe : m_fes) {
       fe->commit(txn);
@@ -441,7 +444,7 @@ bool UnitEmitter::insert(UnitOrigin unitOrigin, RepoTxn& txn) {
           not_reached();
         case MergeKind::Class: break;
         case MergeKind::ReqDoc: {
-          urp.insertUnitMergeable(repoId).insert(
+          urp.insertUnitMergeable[repoId].insert(
             txn, usn, i,
             m_mergeableStmts[i].first, m_mergeableStmts[i].second, nullptr);
           break;
@@ -450,7 +453,7 @@ bool UnitEmitter::insert(UnitOrigin unitOrigin, RepoTxn& txn) {
         case MergeKind::PersistentDefine:
         case MergeKind::Global: {
           int ix = m_mergeableStmts[i].second;
-          urp.insertUnitMergeable(repoId).insert(
+          urp.insertUnitMergeable[repoId].insert(
             txn, usn, i,
             m_mergeableStmts[i].first,
             m_mergeableValues[ix].first, &m_mergeableValues[ix].second);
@@ -465,7 +468,7 @@ bool UnitEmitter::insert(UnitOrigin unitOrigin, RepoTxn& txn) {
                           ? m_sourceLocTab[i + 1].first
                           : m_bclen;
 
-        urp.insertUnitSourceLoc(repoId)
+        urp.insertUnitSourceLoc[repoId]
            .insert(txn, usn, endOff, e.line0, e.char0, e.line1, e.char1);
       }
     }
@@ -616,18 +619,16 @@ std::unique_ptr<Unit> UnitEmitter::create() {
   /*
    * What's going on is we're going to have a m_lineTable if this UnitEmitter
    * was loaded from the repo, and no m_sourceLocTab (it's demand-loaded by
-   * unit.cpp because it's only used for the debugger).
+   * unit.cpp because it's only used for the debugger).  Don't bother creating
+   * the line table here, because we can retrieve it from the repo later.
    *
    * On the other hand, if this unit was just created by parsing a php file (or
-   * whatnot), we'll have a m_sourceLocTab.  We'll normally have a m_lineTable
-   * also, because of side-effects of UnitEmitter::insert, but this code still
-   * needs to check in case commit() was not called, because you're required to
-   * always have a m_lineTable.
+   * whatnot) which was not committed to the repo, we'll have a m_sourceLocTab.
+   * In this case we should populate m_lineTable (otherwise we might lose line
+   * info altogether, since it may not be backed by a repo).
    */
-  if (m_lineTable.size() == 0) {
-    u->m_lineTable = createLineTable(m_sourceLocTab, m_bclen);
-  } else {
-    u->m_lineTable = m_lineTable;
+  if (m_sourceLocTab.size() != 0) {
+    stashLineTable(u.get(), createLineTable(m_sourceLocTab, m_bclen));
   }
 
   for (size_t i = 0; i < m_feTab.size(); ++i) {
@@ -660,14 +661,20 @@ std::unique_ptr<Unit> UnitEmitter::create() {
     kVerifyVerboseSystem || getenv("HHVM_VERIFY_VERBOSE");
 
   const bool isSystemLib = u->filepath()->empty() ||
-    boost::ends_with(u->filepath()->data(), "systemlib.php");
+    boost::contains(u->filepath()->data(), "systemlib");
   const bool doVerify =
     kVerify || boost::ends_with(u->filepath()->data(), "hhas");
   if (doVerify) {
-    Verifier::checkUnit(
-      u.get(),
-      isSystemLib ? kVerifyVerboseSystem : kVerifyVerbose
-    );
+    auto const verbose = isSystemLib ? kVerifyVerboseSystem : kVerifyVerbose;
+    auto const ok = Verifier::checkUnit(u.get(), verbose);
+
+    if (!ok && !verbose) {
+      std::cerr << folly::format(
+        "Verification failed for unit {}. Re-run with HHVM_VERIFY_VERBOSE{}=1 "
+        "to see more details.\n",
+        u->filepath()->data(), isSystemLib ? "_SYSTEM" : ""
+      );
+    }
   }
 
   return u;
@@ -678,9 +685,7 @@ void UnitEmitter::serdeMetaData(SerDe& sd) {
   sd(m_mainReturn)
     (m_mergeOnly)
     (m_isHHFile)
-    (m_lineTable)
     (m_typeAliases)
-    (m_preloadPriority)
     ;
 }
 
@@ -689,18 +694,12 @@ void UnitEmitter::serdeMetaData(SerDe& sd) {
 // UnitRepoProxy.
 
 UnitRepoProxy::UnitRepoProxy(Repo& repo)
-  : RepoProxy(repo)
+    : RepoProxy(repo)
 #define URP_OP(c, o) \
-  , m_##o##Local(repo, RepoIdLocal), m_##o##Central(repo, RepoIdCentral)
+    , o{c##Stmt(repo, 0), c##Stmt(repo, 1)}
     URP_OPS
 #undef URP_OP
-{
-#define URP_OP(c, o) \
-  m_##o[RepoIdLocal] = &m_##o##Local; \
-  m_##o[RepoIdCentral] = &m_##o##Central;
-  URP_OPS
-#undef URP_OP
-}
+{}
 
 UnitRepoProxy::~UnitRepoProxy() {
 }
@@ -709,8 +708,8 @@ void UnitRepoProxy::createSchema(int repoId, RepoTxn& txn) {
   {
     std::stringstream ssCreate;
     ssCreate << "CREATE TABLE " << m_repo.table(repoId, "Unit")
-             << "(unitSn INTEGER PRIMARY KEY, md5 BLOB, bc BLOB, data BLOB, "
-                "UNIQUE (md5));";
+             << "(unitSn INTEGER PRIMARY KEY, md5 BLOB, preload INTEGER, "
+                "bc BLOB, data BLOB, UNIQUE (md5));";
     txn.exec(ssCreate.str());
   }
   {
@@ -744,6 +743,12 @@ void UnitRepoProxy::createSchema(int repoId, RepoTxn& txn) {
                 " PRIMARY KEY (unitSn, pastOffset));";
     txn.exec(ssCreate.str());
   }
+  {
+    std::stringstream ssCreate;
+    ssCreate << "CREATE TABLE " << m_repo.table(repoId, "UnitLineTable")
+             << "(unitSn INTEGER PRIMARY KEY, data BLOB);";
+    txn.exec(ssCreate.str());
+  }
 }
 
 bool UnitRepoProxy::loadHelper(UnitEmitter& ue,
@@ -753,7 +758,7 @@ bool UnitRepoProxy::loadHelper(UnitEmitter& ue,
   // Look for a repo that contains a unit with matching MD5.
   int repoId;
   for (repoId = RepoIdCount - 1; repoId >= 0; --repoId) {
-    if (!getUnit(repoId).get(ue, md5)) {
+    if (!getUnit[repoId].get(ue, md5)) {
       break;
     }
   }
@@ -763,11 +768,12 @@ bool UnitRepoProxy::loadHelper(UnitEmitter& ue,
     return false;
   }
   try {
-    getUnitLitstrs(repoId).get(ue);
-    getUnitArrays(repoId).get(ue);
-    m_repo.pcrp().getPreClasses(repoId).get(ue);
-    getUnitMergeables(repoId).get(ue);
-    m_repo.frp().getFuncs(repoId).get(ue);
+    getUnitLitstrs[repoId].get(ue);
+    getUnitArrays[repoId].get(ue);
+    m_repo.pcrp().getPreClasses[repoId].get(ue);
+    getUnitMergeables[repoId].get(ue);
+    getUnitLineTable(repoId, ue.m_sn, ue.m_lineTable);
+    m_repo.frp().getFuncs[repoId].get(ue);
   } catch (RepoExc& re) {
     TRACE(0,
           "Repo error loading '%s' (0x%016" PRIx64 "%016"
@@ -803,12 +809,17 @@ void UnitRepoProxy::InsertUnitStmt
 
   if (!prepared()) {
     std::stringstream ssInsert;
+    /*
+     * Do not put preload into data; its needed to choose the
+     * units in preloadRepo.
+     */
     ssInsert << "INSERT INTO " << m_repo.table(m_repoId, "Unit")
-             << " VALUES(NULL, @md5, @bc, @data);";
+             << " VALUES(NULL, @md5, @preload, @bc, @data);";
     txn.prepare(*this, ssInsert.str());
   }
   RepoTxnQuery query(txn, *this);
   query.bindMd5("@md5", md5);
+  query.bindInt("@preload", ue.m_preloadPriority);
   query.bindBlob("@bc", (const void*)bc, bclen);
   const_cast<UnitEmitter&>(ue).serdeMetaData(dataBlob);
   query.bindBlob("@data", dataBlob, /* static */ true);
@@ -822,7 +833,7 @@ bool UnitRepoProxy::GetUnitStmt
     RepoTxn txn(m_repo);
     if (!prepared()) {
       std::stringstream ssSelect;
-      ssSelect << "SELECT unitSn,bc,data FROM "
+      ssSelect << "SELECT unitSn,preload,bc,data FROM "
                << m_repo.table(m_repoId, "Unit")
                << " WHERE md5 == @md5;";
       txn.prepare(*this, ssSelect.str());
@@ -834,11 +845,13 @@ bool UnitRepoProxy::GetUnitStmt
       return true;
     }
     int64_t unitSn;                     /**/ query.getInt64(0, unitSn);
-    const void* bc; size_t bclen;       /**/ query.getBlob(1, bc, bclen);
-    BlobDecoder dataBlob =              /**/ query.getBlob(2);
+    int preloadPriority;                /**/ query.getInt(1, preloadPriority);
+    const void* bc; size_t bclen;       /**/ query.getBlob(2, bc, bclen);
+    BlobDecoder dataBlob =              /**/ query.getBlob(3);
 
     ue.m_repoId = m_repoId;
     ue.m_sn = unitSn;
+    ue.m_preloadPriority = preloadPriority;
     ue.setBc(static_cast<const unsigned char*>(bc), bclen);
     ue.serdeMetaData(dataBlob);
 
@@ -1010,6 +1023,46 @@ void UnitRepoProxy::GetUnitMergeablesStmt
       }
     }
   } while (!query.done());
+  txn.commit();
+}
+
+void UnitRepoProxy::insertUnitLineTable(int repoId,
+                                        RepoTxn& txn,
+                                        int64_t unitSn,
+                                        LineTable& lineTable) {
+  RepoStmt stmt(m_repo);
+  stmt.prepare(
+    folly::format(
+      "INSERT INTO {} VALUES(@unitSn, @data);",
+      m_repo.table(repoId, "UnitLineTable")
+    ).str());
+
+  RepoTxnQuery query(txn, stmt);
+  BlobEncoder dataBlob;
+  dataBlob.encode(lineTable);
+  query.bindInt64("@unitSn", unitSn);
+  query.bindBlob("@data", dataBlob, /* static */ true);
+  query.exec();
+}
+
+void UnitRepoProxy::getUnitLineTable(int repoId,
+                                     int64_t unitSn,
+                                     LineTable& lineTable) {
+  RepoStmt stmt(m_repo);
+  stmt.prepare(
+    folly::format(
+      "SELECT data FROM {} WHERE unitSn == @unitSn;",
+      m_repo.table(repoId, "UnitLineTable")
+    ).str());
+
+  RepoTxn txn(m_repo);
+  RepoTxnQuery query(txn, stmt);
+  query.bindInt64("@unitSn", unitSn);
+  query.step();
+  if (query.row()) {
+    BlobDecoder dataBlob = query.getBlob(0);
+    dataBlob.decode(lineTable);
+  }
   txn.commit();
 }
 

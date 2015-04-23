@@ -81,6 +81,7 @@ bool Lease::acquire(bool blocking /* = false */ ) {
                     (expireDiff > 0 && m_owner != pthread_self()))) {
     return false;
   }
+
   checkRank(RankWriteLease);
   if (0 == (blocking ?
             pthread_mutex_lock(&m_lock) :
@@ -114,7 +115,7 @@ bool Lease::acquire(bool blocking /* = false */ ) {
 }
 
 void Lease::drop(int64_t hintExpireDelay) {
-  assert(amOwner());
+  assertx(amOwner());
   TRACE(4, "thr%" PRIx64 ": dropping lease, called by %p,%p\n",
         Process::GetThreadIdForTrace(), __builtin_return_address(0),
         __builtin_return_address(1));
@@ -144,8 +145,8 @@ LeaseHolderBase::~LeaseHolderBase() {
 }
 
 bool LeaseHolderBase::acquire() {
-  assert(!m_acquired);
-  assert(m_haveLock == m_lease.amOwner());
+  assertx(!m_acquired);
+  assertx(m_haveLock == m_lease.amOwner());
   if (m_haveLock) {
     return true;
   }

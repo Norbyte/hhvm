@@ -15,9 +15,9 @@
    +----------------------------------------------------------------------+
 */
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/runtime-error.h"
-#include "hphp/runtime/ext/ext_math.h"
+#include "hphp/runtime/ext/std/ext_std_math.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -33,15 +33,10 @@ namespace HPHP {
 
 class MCrypt : public SweepableResourceData {
 public:
-  explicit MCrypt(MCRYPT td) : m_td(td), m_init(false) {
-  }
+  explicit MCrypt(MCRYPT td) : m_td(td), m_init(false) {}
 
   ~MCrypt() {
     MCrypt::close();
-  }
-
-  void sweep() FOLLY_OVERRIDE {
-    close();
   }
 
   void close() {
@@ -56,9 +51,14 @@ public:
   // overriding ResourceData
   virtual const String& o_getClassNameHook() const { return classnameof(); }
 
+  DECLARE_RESOURCE_ALLOCATION(MCrypt)
+
+public:
   MCRYPT m_td;
   bool m_init;
 };
+
+IMPLEMENT_RESOURCE_ALLOCATION(MCrypt)
 
 typedef enum {
   RANDOM = 0,
@@ -155,13 +155,13 @@ static Variant php_mcrypt_do_crypt(const String& cipher, const String& key,
     block_size = mcrypt_enc_get_block_size(td);
     data_size = (((data.size() - 1) / block_size) + 1) * block_size;
     s = String(data_size, ReserveString);
-    data_s = (char*)s.bufferSlice().ptr;
+    data_s = (char*)s.mutableData();
     memset(data_s, 0, data_size);
     memcpy(data_s, data.data(), data.size());
   } else { /* It's not a block algorithm */
     data_size = data.size();
     s = String(data_size, ReserveString);
-    data_s = (char*)s.bufferSlice().ptr;
+    data_s = (char*)s.mutableData();
     memcpy(data_s, data.data(), data.size());
   }
 
@@ -189,7 +189,7 @@ static Variant php_mcrypt_do_crypt(const String& cipher, const String& key,
 
 static Variant mcrypt_generic(const Resource& td, const String& data,
                               bool dencrypt) {
-  MCrypt *pm = td.getTyped<MCrypt>();
+  auto pm = cast<MCrypt>(td);
   if (!pm->m_init) {
     raise_warning("Operation disallowed prior to mcrypt_generic_init().");
     return false;
@@ -208,13 +208,13 @@ static Variant mcrypt_generic(const Resource& td, const String& data,
     block_size = mcrypt_enc_get_block_size(pm->m_td);
     data_size = (((data.size() - 1) / block_size) + 1) * block_size;
     s = String(data_size, ReserveString);
-    data_s = (unsigned char *)s.bufferSlice().ptr;
+    data_s = (unsigned char *)s.mutableData();
     memset(data_s, 0, data_size);
     memcpy(data_s, data.data(), data.size());
   } else { /* It's not a block algorithm */
     data_size = data.size();
     s = String(data_size, ReserveString);
-    data_s = (unsigned char *)s.bufferSlice().ptr;
+    data_s = (unsigned char *)s.mutableData();
     memcpy(data_s, data.data(), data.size());
   }
 
@@ -245,11 +245,11 @@ Variant HHVM_FUNCTION(mcrypt_module_open, const String& algorithm,
     return false;
   }
 
-  return Resource(new MCrypt(td));
+  return Variant(makeSmartPtr<MCrypt>(td));
 }
 
 bool HHVM_FUNCTION(mcrypt_module_close, const Resource& td) {
-  td.getTyped<MCrypt>()->close();
+  cast<MCrypt>(td)->close();
   return true;
 }
 
@@ -378,7 +378,7 @@ Variant HHVM_FUNCTION(mcrypt_create_iv, int size, int source /* = 0 */) {
     n = size;
     while (size) {
       // Use userspace rand() function because it handles auto-seeding
-      iv[--size] = (char)f_rand(0, 255);
+      iv[--size] = (char)HHVM_FN(rand)(0, 255);
     }
   }
   return String(iv, n, AttachString);
@@ -508,26 +508,26 @@ Variant HHVM_FUNCTION(mcrypt_get_key_size, const String& cipher,
 }
 
 String HHVM_FUNCTION(mcrypt_enc_get_algorithms_name, const Resource& td) {
-  char *name = mcrypt_enc_get_algorithms_name(td.getTyped<MCrypt>()->m_td);
+  char *name = mcrypt_enc_get_algorithms_name(cast<MCrypt>(td)->m_td);
   String ret(name, CopyString);
   mcrypt_free(name);
   return ret;
 }
 
 int64_t HHVM_FUNCTION(mcrypt_enc_get_block_size, const Resource& td) {
-  return mcrypt_enc_get_block_size(td.getTyped<MCrypt>()->m_td);
+  return mcrypt_enc_get_block_size(cast<MCrypt>(td)->m_td);
 }
 
 int64_t HHVM_FUNCTION(mcrypt_enc_get_iv_size, const Resource& td) {
-  return mcrypt_enc_get_iv_size(td.getTyped<MCrypt>()->m_td);
+  return mcrypt_enc_get_iv_size(cast<MCrypt>(td)->m_td);
 }
 
 int64_t HHVM_FUNCTION(mcrypt_enc_get_key_size, const Resource& td) {
-  return mcrypt_enc_get_key_size(td.getTyped<MCrypt>()->m_td);
+  return mcrypt_enc_get_key_size(cast<MCrypt>(td)->m_td);
 }
 
 String HHVM_FUNCTION(mcrypt_enc_get_modes_name, const Resource& td) {
-  char *name = mcrypt_enc_get_modes_name(td.getTyped<MCrypt>()->m_td);
+  char *name = mcrypt_enc_get_modes_name(cast<MCrypt>(td)->m_td);
   String ret(name, CopyString);
   mcrypt_free(name);
   return ret;
@@ -536,7 +536,7 @@ String HHVM_FUNCTION(mcrypt_enc_get_modes_name, const Resource& td) {
 Array HHVM_FUNCTION(mcrypt_enc_get_supported_key_sizes, const Resource& td) {
   int count = 0;
   int *key_sizes =
-    mcrypt_enc_get_supported_key_sizes(td.getTyped<MCrypt>()->m_td, &count);
+    mcrypt_enc_get_supported_key_sizes(cast<MCrypt>(td)->m_td, &count);
 
   Array ret = Array::Create();
   for (int i = 0; i < count; i++) {
@@ -547,25 +547,25 @@ Array HHVM_FUNCTION(mcrypt_enc_get_supported_key_sizes, const Resource& td) {
 }
 
 bool HHVM_FUNCTION(mcrypt_enc_is_block_algorithm_mode, const Resource& td) {
-  return mcrypt_enc_is_block_algorithm_mode(td.getTyped<MCrypt>()->m_td) == 1;
+  return mcrypt_enc_is_block_algorithm_mode(cast<MCrypt>(td)->m_td) == 1;
 }
 
 bool HHVM_FUNCTION(mcrypt_enc_is_block_algorithm, const Resource& td) {
-  return mcrypt_enc_is_block_algorithm(td.getTyped<MCrypt>()->m_td) == 1;
+  return mcrypt_enc_is_block_algorithm(cast<MCrypt>(td)->m_td) == 1;
 }
 
 bool HHVM_FUNCTION(mcrypt_enc_is_block_mode, const Resource& td) {
-  return mcrypt_enc_is_block_mode(td.getTyped<MCrypt>()->m_td) == 1;
+  return mcrypt_enc_is_block_mode(cast<MCrypt>(td)->m_td) == 1;
 }
 
 int64_t HHVM_FUNCTION(mcrypt_enc_self_test, const Resource& td) {
-  return mcrypt_enc_self_test(td.getTyped<MCrypt>()->m_td);
+  return mcrypt_enc_self_test(cast<MCrypt>(td)->m_td);
 }
 
 int64_t HHVM_FUNCTION(mcrypt_generic_init, const Resource& td,
                                            const String& key,
                                            const String& iv) {
-  MCrypt *pm = td.getTyped<MCrypt>();
+  auto pm = cast<MCrypt>(td);
   int max_key_size = mcrypt_enc_get_key_size(pm->m_td);
   int iv_size = mcrypt_enc_get_iv_size(pm->m_td);
 
@@ -593,7 +593,7 @@ int64_t HHVM_FUNCTION(mcrypt_generic_init, const Resource& td,
     raise_warning("Iv size incorrect; supplied length: %d, needed: %d",
                     iv.size(), iv_size);
   }
-  memcpy(iv_s, iv.data(), iv_size);
+  memcpy(iv_s, iv.data(), std::min(iv_size, iv.size()));
 
   mcrypt_generic_deinit(pm->m_td);
   int result = mcrypt_generic_init(pm->m_td, key_s, key_size, iv_s);
@@ -614,8 +614,10 @@ int64_t HHVM_FUNCTION(mcrypt_generic_init, const Resource& td,
       raise_warning("Unknown error");
       break;
     }
+  } else {
+    pm->m_init = true;
   }
-  pm->m_init = true;
+
   free(iv_s);
   free(key_s);
   return result;
@@ -631,7 +633,7 @@ Variant HHVM_FUNCTION(mdecrypt_generic, const Resource& td,
 }
 
 bool HHVM_FUNCTION(mcrypt_generic_deinit, const Resource& td) {
-  MCrypt *pm = td.getTyped<MCrypt>();
+  auto pm = cast<MCrypt>(td);
   if (mcrypt_generic_deinit(pm->m_td) < 0) {
     raise_warning("Could not terminate encryption specifier");
     return false;
@@ -688,10 +690,10 @@ const StaticString s_MCRYPT_TWOFISH("MCRYPT_TWOFISH");
 const StaticString s_MCRYPT_WAKE("MCRYPT_WAKE");
 const StaticString s_MCRYPT_XTEA("MCRYPT_XTEA");
 
-class McryptExtension : public Extension {
+class McryptExtension final : public Extension {
  public:
   McryptExtension() : Extension("mcrypt") {}
-  virtual void moduleInit() {
+  void moduleInit() override {
     Native::registerConstant<KindOfStaticString>(
       s_MCRYPT_3DES.get(), StaticString("tripledes").get()
     );

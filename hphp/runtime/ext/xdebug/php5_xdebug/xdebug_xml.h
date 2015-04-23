@@ -25,34 +25,32 @@
 namespace HPHP {
 ////////////////////////////////////////////////////////////////////////////////
 
-typedef struct _xdebug_xml_attribute xdebug_xml_attribute;
-typedef struct _xdebug_xml_text_node xdebug_xml_text_node;
-typedef struct _xdebug_xml_node xdebug_xml_node;
+struct String;
 
-struct _xdebug_xml_attribute {
+struct xdebug_xml_attribute {
   char *name;
   char *value;
   int   name_len;
   int   value_len;
-  struct _xdebug_xml_attribute *next;
+  xdebug_xml_attribute *next;
   int   free_name;
   int   free_value;
 };
 
 /* todo: support multiple text nodes inside an element */
-struct _xdebug_xml_text_node {
+struct xdebug_xml_text_node {
   char *text;
   int   free_value;
   int   encode;
   int   text_len;
 };
 
-struct _xdebug_xml_node {
+struct xdebug_xml_node {
   char *tag;
-  struct _xdebug_xml_text_node *text;
-  struct _xdebug_xml_attribute *attribute;
-  struct _xdebug_xml_node      *child;
-  struct _xdebug_xml_node      *next;
+  xdebug_xml_text_node *text;
+  xdebug_xml_attribute *attribute;
+  xdebug_xml_node      *child;
+  xdebug_xml_node      *next;
   int   free_tag;
 };
 
@@ -74,20 +72,25 @@ void xdebug_xml_add_attribute_exl(xdebug_xml_node* xml, char *attribute,
                                   int free_value);
 
 inline void xdebug_xml_add_attribute_ex(xdebug_xml_node* xml,
-                                        char* attr, char* val,
+                                        const char* attr, const char* val,
                                         int freeAttr, int freeVal) {
-  xdebug_xml_add_attribute_exl(xml, attr, strlen(attr),
-                               val, strlen(val),
-                               freeAttr, freeVal);
+  // const_cast is safe since we are not freeing the strings or writing into
+  // them.
+  xdebug_xml_add_attribute_exl(
+    xml,
+    const_cast<char*>(attr),
+    strlen(attr),
+    const_cast<char*>(val),
+    strlen(val),
+    freeAttr,
+    freeVal
+  );
 }
 
 // This is not a solution, just a temporary fix
 inline void xdebug_xml_add_attribute(xdebug_xml_node* xml,
                                      const char* attr, const char* val) {
-  // const-cast is okay since we are not freeing the passed values
-  xdebug_xml_add_attribute_ex(xml,
-                              const_cast<char*>(attr),
-                              const_cast<char*>(val), 0, 0);
+  xdebug_xml_add_attribute_ex(xml, attr, val, 0, 0);
 }
 
 // Duplicates the passed values before adding the attribute. This is not a
@@ -116,7 +119,7 @@ void xdebug_xml_add_child(xdebug_xml_node *xml, xdebug_xml_node *child);
 // Adding text
 void xdebug_xml_add_text_ex(xdebug_xml_node *xml, char *text, int length,
                             int free_text, int encode);
-void xdebug_xml_add_text(xdebug_xml_node *xml, char *text, int free = 1);
+void xdebug_xml_add_text(xdebug_xml_node *xml, const char* text, int free = 1);
 void xdebug_xml_add_text_encode(xdebug_xml_node *xml, char *text);
 
 inline void xdebug_xml_add_textl(xdebug_xml_node* xml, char* text, int length) {
@@ -127,6 +130,8 @@ inline void xdebug_xml_add_text_encodel(xdebug_xml_node* xml, char* tag,
                                         int length) {
   xdebug_xml_add_text_ex(xml, tag, length, 1, 1);
 }
+
+String xdebug_xmlize(const char*, size_t);
 
 ////////////////////////////////////////////////////////////////////////////////
 }

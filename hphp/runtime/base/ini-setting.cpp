@@ -16,8 +16,9 @@
 
 #include "hphp/runtime/base/ini-setting.h"
 
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/builtin-functions.h"
-#include "hphp/runtime/base/hphp-system.h"
+#include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/type-conversions.h"
 #include "hphp/runtime/base/zend-strtod.h"
@@ -26,8 +27,11 @@
 
 #include "hphp/runtime/ext/std/ext_std_misc.h"
 #include "hphp/runtime/ext/extension.h"
+#include "hphp/runtime/ext/extension-registry.h"
 
 #include "hphp/util/lock.h"
+
+#include <glob.h>
 
 #define __STDC_LIMIT_MACROS
 #include <cstdint>
@@ -98,12 +102,17 @@ static Variant dynamic_to_variant(const folly::dynamic& v) {
       return v.data();
     case folly::dynamic::Type::ARRAY:
     case folly::dynamic::Type::OBJECT:
-      ArrayInit ret(v.size(), ArrayInit::Mixed{});
+      ArrayInit arr_init(v.size(), ArrayInit::Mixed{});
       for (auto& item : v.items()) {
-        ret.add(dynamic_to_variant(item.first),
+        arr_init.add(dynamic_to_variant(item.first),
                 dynamic_to_variant(item.second));
       }
-      return ret.toArray();
+      Array ret = arr_init.toArray();
+      // Sort the array since folly::dynamic has a tendency to iterate from
+      // back to front. This way a var_dump of the array, for example, looks
+      // ordered.
+      ret.sort(Array::SortNaturalAscending, true, false);
+      return ret;
   }
   not_reached();
 }
@@ -112,7 +121,6 @@ static folly::dynamic variant_to_dynamic(const Variant& v) {
   switch (v.getType()) {
     case KindOfUninit:
     case KindOfNull:
-    default:
       return nullptr;
     case KindOfBoolean:
       return v.toBoolean();
@@ -125,13 +133,17 @@ static folly::dynamic variant_to_dynamic(const Variant& v) {
       return v.toString().data();
     case KindOfArray:
     case KindOfObject:
-    case KindOfResource:
+    case KindOfResource: {
       folly::dynamic ret = folly::dynamic::object;
       for (ArrayIter iter(v.toArray()); iter; ++iter) {
         ret.insert(variant_to_dynamic(iter.first()),
                    variant_to_dynamic(iter.second()));
       }
       return ret;
+    }
+    case KindOfRef:
+    case KindOfClass:
+      break;
   }
   not_reached();
 }
@@ -271,6 +283,23 @@ bool ini_on_update(const folly::dynamic& value, std::set<std::string>& p) {
   return true;
 }
 
+bool ini_on_update(const folly::dynamic& value,
+                   std::set<std::string, stdltistr>& p) {
+  INI_ASSERT_ARR(value);
+  for (auto& v : value.values()) {
+    p.insert(v.data());
+  }
+  return true;
+}
+
+bool ini_on_update(const folly::dynamic& value,
+                   boost::container::flat_set<std::string>& p) {
+  INI_ASSERT_ARR(value);
+  for (auto& v : value.values()) {
+    p.insert(v.data());
+  }
+  return true;
+}
 
 bool ini_on_update(const folly::dynamic& value, std::vector<std::string>& p) {
   INI_ASSERT_ARR(value);
@@ -282,6 +311,15 @@ bool ini_on_update(const folly::dynamic& value, std::vector<std::string>& p) {
 
 bool ini_on_update(const folly::dynamic& value,
                    std::map<std::string, std::string>& p) {
+  INI_ASSERT_ARR(value);
+  for (auto& pair : value.items()) {
+    p[pair.first.data()] = pair.second.data();
+  }
+  return true;
+}
+
+bool ini_on_update(const folly::dynamic& value,
+                   hphp_string_imap<std::string>& p) {
   INI_ASSERT_ARR(value);
   for (auto& pair : value.items()) {
     p[pair.first.data()] = pair.second.data();
@@ -345,6 +383,14 @@ folly::dynamic ini_get(std::map<std::string, std::string>& p) {
   return ret;
 }
 
+folly::dynamic ini_get(hphp_string_imap<std::string>& p) {
+  folly::dynamic ret = folly::dynamic::object;
+  for (auto& pair : p) {
+    ret.insert(pair.first, pair.second);
+  }
+  return ret;
+}
+
 folly::dynamic ini_get(Array& p) {
   folly::dynamic ret = folly::dynamic::object;
   for (ArrayIter iter(p); iter; ++iter) {
@@ -356,8 +402,27 @@ folly::dynamic ini_get(Array& p) {
 
 folly::dynamic ini_get(std::set<std::string>& p) {
   folly::dynamic ret = folly::dynamic::object;
+  auto idx = 0;
   for (auto& s : p) {
-    ret.push_back(s);
+    ret.insert(idx++, s);
+  }
+  return ret;
+}
+
+folly::dynamic ini_get(std::set<std::string, stdltistr>& p) {
+  folly::dynamic ret = folly::dynamic::object;
+  auto idx = 0;
+  for (auto& s : p) {
+    ret.insert(idx++, s);
+  }
+  return ret;
+}
+
+folly::dynamic ini_get(boost::container::flat_set<std::string>& p) {
+  folly::dynamic ret = folly::dynamic::object;
+  auto idx = 0;
+  for (auto& s : p) {
+    ret.insert(idx++, s);
   }
   return ret;
 }
@@ -369,6 +434,64 @@ folly::dynamic ini_get(std::vector<std::string>& p) {
     ret.insert(idx++, s);
   }
   return ret;
+}
+
+const folly::dynamic* ini_iterate(const folly::dynamic &ini,
+                                  const std::string &name) {
+  // This should never happen, but handle it anyway.
+  if (ini == nullptr) {
+    return nullptr;
+  }
+
+  // If for some reason we are passed a string (i.e., a leaf value),
+  // just return it back
+  if (ini.isString()) {
+    return &ini;
+  }
+
+  // If we just passed in a name that already has a value like:
+  //   hhvm.server.apc.ttl_limit
+  //   max_execution_time
+  // then we just return the value now.
+  // i.e., a value that didn't look like
+  //   hhvm.a.b[c][d], where name = hhvm.a.b.c.d
+  //   c[d] (where ini is already hhvm.a.b), where name = c.d
+  auto* value = ini.get_ptr(name);
+  if (value) {
+    return value;
+  }
+
+  // Otherwise, we split on the dots (if any) to see if we can get a real value
+  std::vector<std::string> dot_parts;
+  folly::split('.', name, dot_parts);
+
+  int dot_loc = 0;
+  int dot_parts_size = dot_parts.size();
+  std::string part = dot_parts[0];
+  // If this is null, then all the loops below will be skipped and
+  // we will return it as null.
+  value = ini.get_ptr(part);
+  // Loop through the dot parts, getting a pointer to each
+  // We may need to concatenate dots to be able to get a real value
+  // e.g., if someone passed in hhvm.a.b.c.d, which in ini was equal
+  // to hhvm.a.b[c][d], then we would start with hhvm and get null,
+  // then hhvm.a and get null, then hhvm.a.b and actually get an object
+  // to point to.
+  while (!value && dot_loc < dot_parts_size - 1) {
+    dot_loc++;
+    part = part + "." + dot_parts[dot_loc];
+    value = ini.get_ptr(part);
+  }
+  // Get to the last dot part and get its value, if it exists
+  for (int i = dot_loc + 1; i < dot_parts_size; i++) {
+    if (value) {
+      part = dot_parts[i];
+      value = value->get_ptr(part);
+    } else { // If we reach a bad point, just return null
+      return nullptr;
+    }
+  }
+  return value;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -407,7 +530,7 @@ void IniSetting::ParserCallback::makeArray(Variant& hash,
                                            const std::string& offset,
                                            const std::string& value) {
   assert(!offset.empty());
-  Variant val(hash, Variant::StrongBind{});
+  Variant val(Variant::StrongBind{}, hash);
   auto start = offset.c_str();
   auto p = start;
   bool last = false;
@@ -635,17 +758,46 @@ IniSetting::Map IniSetting::FromStringAsMap(const std::string& ini,
   return ret;
 }
 
-struct IniCallbackData {
+class IniCallbackData {
+public:
+  IniCallbackData() {
+    extension = nullptr;
+    mode = IniSetting::PHP_INI_NONE;
+    iniData = nullptr;
+    updateCallback = nullptr;
+    getCallback = nullptr;
+  }
+  virtual ~IniCallbackData() {
+    delete iniData;
+    iniData = nullptr;
+  }
+public:
   const Extension* extension;
   IniSetting::Mode mode;
+  UserIniData *iniData;
   std::function<bool(const folly::dynamic& value)> updateCallback;
   std::function<folly::dynamic()> getCallback;
 };
 
 typedef std::map<std::string, IniCallbackData> CallbackMap;
-// Only settable at startup
+
+//
+// These are for settings/callbacks only settable at startup.
+//
+// Empirically and surprisingly (20Jan2015):
+//   * server mode: the contents of system map are     destructed on SIGTERM
+//   * CLI    mode: the contents of system map are NOT destructed on SIGTERM
+//
 static CallbackMap s_system_ini_callbacks;
-// The script can change these during the request
+
+//
+// These are for settings/callbacks that the script
+// can change during the request.
+//
+// Empirically and surprisingly (20Jan2015), when there are N threads:
+//   * server mode: the contents of user map are     destructed N-1 times
+//   * CLI    mode: the contents of user map are NOT destructed on SIGTERM
+//
 static IMPLEMENT_THREAD_LOCAL(CallbackMap, s_user_callbacks);
 
 typedef std::map<std::string, folly::dynamic> SettingMap;
@@ -654,11 +806,11 @@ static SettingMap s_system_settings;
 // Changed during the course of the request
 static IMPLEMENT_THREAD_LOCAL(SettingMap, s_saved_defaults);
 
-class IniSettingExtension : public Extension {
+class IniSettingExtension final : public Extension {
 public:
   IniSettingExtension() : Extension("hhvm.ini", NO_EXTENSION_VERSION_YET) {}
 
-  void requestShutdown() {
+  void requestShutdown() override {
     // Put all the defaults back to the way they were before any ini_set()
     for (auto &item : *s_saved_defaults) {
       IniSetting::SetUser(item.first, item.second, IniSetting::FollyDynamic());
@@ -668,30 +820,81 @@ public:
 
 } s_ini_extension;
 
-void IniSetting::Bind(const Extension* extension, const Mode mode,
-                      const std::string& name,
-                      std::function<bool(const folly::dynamic& value)>
-                        updateCallback,
-                      std::function<folly::dynamic()> getCallback) {
+void IniSetting::Bind(
+  const Extension* extension,
+  const Mode mode,
+  const std::string& name,
+  std::function<bool(const folly::dynamic&)> updateCallback,
+  std::function<folly::dynamic()> getCallback,
+  std::function<class UserIniData *(void)> userDataCallback
+) {
   assert(!name.empty());
 
-  bool is_thread_local = (mode == PHP_INI_USER || mode == PHP_INI_ALL);
-  // For now, we require the extensions to use their own thread local memory for
-  // user-changeable settings. This means you need to use the default field to
-  // Bind and can't statically initialize them. We could conceivably let you
-  // use static memory and have our own thread local here that users can change
-  // and then reset it back to the default, but we haven't built that yet.
-  auto &data = is_thread_local ? (*s_user_callbacks)[name]
-                               : s_system_ini_callbacks[name];
-  // I would love if I could verify p is thread local or not instead of
-  // this dumb hack
-  assert(is_thread_local || !Extension::ModulesInitialised() ||
-         s_pretendExtensionsHaveNotBeenLoaded);
+  /*
+   * WATCH OUT: unlike php5, a Mode is not necessarily a bit mask.
+   * PHP_INI_ALL is NOT encoded as the union:
+   *   PHP_INI_USER|PHP_INI_PERDIR|PHP_INI_SYSTEM
+   *
+   * Note that Mode value PHP_INI_SET_USER and PHP_INI_SET_EVERY are bit
+   * sets; "SET" in this use means "bitset", and not "assignment".
+   */
+  bool is_thread_local = (
+    (mode == PHP_INI_USER) ||
+    (mode == PHP_INI_PERDIR) ||
+    (mode == PHP_INI_ALL) ||  /* See note above */
+    (mode &  PHP_INI_USER) ||
+    (mode &  PHP_INI_PERDIR) ||
+    (mode &  PHP_INI_ALL)
+    );
+
+  //
+  // When the debugger is loading its configuration, there will be some
+  // cases where Extension::ModulesInitialised(), but the name appears
+  // in neither s_user_callbacks nor s_system_ini_callbacks. The bottom
+  // line is that we can't really use ModulesInitialised() to help steer
+  // the choices here.
+  //
+
+  bool use_user = is_thread_local;
+  if (!use_user) {
+    //
+    // If it is already in the user callbacks, continue to use it from
+    // there. We don't expect it to be already there, but it has been
+    // observed during development.
+    //
+    bool in_user_callbacks =
+      (s_user_callbacks->find(name) != s_user_callbacks->end());
+    assert (!in_user_callbacks);  // See note above
+    use_user = in_user_callbacks;
+  }
+
+  //
+  // For now, we require the extensions to use their own thread local
+  // memory for user-changeable settings. This means you need to use
+  // the default field to Bind and can't statically initialize them.
+  // The main reasoning to do that is so that the extensions have the
+  // values already parsed into their types. If you are setting an int,
+  // it does the string parsing once and then when you read it, it is
+  // already an int. If we did some shared thing, we would just hand you
+  // back the strings and you'd have to parse them on every request or
+  // build some convoluted caching mechanism which is slower than just
+  // the int access.
+  //
+  // We could conceivably let you use static memory and have our own
+  // thread local here that users can change and then reset it back to
+  // the default, but we haven't built that yet.
+  //
+
+  IniCallbackData &data =
+    use_user ? (*s_user_callbacks)[name] : s_system_ini_callbacks[name];
 
   data.extension = extension;
   data.mode = mode;
   data.updateCallback = updateCallback;
   data.getCallback = getCallback;
+  if (data.iniData == nullptr && userDataCallback != nullptr) {
+    data.iniData = userDataCallback();
+  }
 }
 
 void IniSetting::Unbind(const std::string& name) {
@@ -830,7 +1033,7 @@ Array IniSetting::GetAll(const String& ext_name, bool details) {
     if (ext_name == s_core) {
       ext = IniSetting::CORE;
     } else {
-      ext = Extension::GetExtension(ext_name);
+      ext = ExtensionRegistry::get(ext_name);
       if (!ext) {
         raise_warning("Unable to find extension '%s'",
                       ext_name.toCppString().c_str());
@@ -869,6 +1072,30 @@ Array IniSetting::GetAll(const String& ext_name, bool details) {
     }
   }
   return r;
+}
+
+void add_default_config_files_globbed(
+  const char *default_config_file,
+  std::function<void (const char *filename)> cb
+) {
+  glob_t globbuf;
+  memset(&globbuf, 0, sizeof(glob_t));
+  int flags = 0;  // Use default glob semantics
+  int nret = glob(default_config_file, flags, nullptr, &globbuf);
+  if (nret == GLOB_NOMATCH ||
+      globbuf.gl_pathc == 0 ||
+      globbuf.gl_pathv == 0 ||
+      nret != 0) {
+    globfree(&globbuf);
+    return;
+  }
+
+  for (int n = 0; n < (int)globbuf.gl_pathc; n++) {
+    if (access(globbuf.gl_pathv[n], R_OK) != -1) {
+      cb(globbuf.gl_pathv[n]);
+    }
+  }
+  globfree(&globbuf);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

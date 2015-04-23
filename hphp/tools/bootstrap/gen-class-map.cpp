@@ -20,10 +20,11 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "folly/FBString.h"
-#include "folly/FBVector.h"
+#include <folly/FBString.h>
+#include <folly/FBVector.h>
 
 #include "hphp/tools/bootstrap/idl.h"
+#include <cassert>
 
 using folly::fbstring;
 using folly::fbvector;
@@ -75,7 +76,7 @@ static fbstring genDocCommentPreamble(const fbstring& name,
   if (flags & HipHopSpecific) {
     ret = "( HipHop specific )";
   } else {
-    ret = "( excerpt from http://php.net/manual/en/";
+    ret = "( excerpt from http://docs.hhvm.com/manual/en/";
     if (classname.size()) {
       ret += classname + ".";
     } else {
@@ -155,6 +156,11 @@ static void declareConstants(std::ostream &out,
       fbstring val = c.value();
       out << "extern const StaticString " << c.varname()
           << "(\"" << escapeCpp(val) << "\"," << val.size() << ");\n";
+    } else if (c.kindOf() == KindOfInt64 &&
+               std::stoll(c.value().toStdString()) ==
+               std::numeric_limits<int64_t>::min()) {
+      out << "const " << c.getCppType() << " " << c.varname()
+          << " = int64_t(-1) << 63;\n";
     } else {
       out << "const " << c.getCppType() << " " << c.varname()
           << " = " << escapeCpp(c.value()) << ";\n";
@@ -184,9 +190,9 @@ static void outputConstants(const fbstring &invocation_trace,
 
 #define FUNC_FLAG_MASK (IsProtected|IsPrivate|IsPublic|\
                         IsAbstract|IsStatic|IsFinal|\
-                        AllowIntercept|NoProfile|ContextSensitive|\
+                        AllowIntercept|NoProfile|\
                         HipHopSpecific|VariableArguments|\
-                        RefVariableArguments|MixedVariableArguments|\
+                        RefVariableArguments|\
                         NoFCallBuiltin|FunctionIsFoldable|\
                         NoInjection|NoEffect|HasOptFunction|ParamCoerceModeNull|\
                         ParamCoerceModeFalse|ZendCompat)
@@ -196,9 +202,6 @@ static void writeFunction(std::ostream& out, const PhpFunc& func) {
 
   if (flags & RefVariableArguments) {
     flags |= VariableArguments;
-  }
-  if (flags & MixedVariableArguments) {
-    flags |= RefVariableArguments | VariableArguments;
   }
   if (!func.isMethod() || !(flags & VISIBILITY_MASK)) {
     flags |= IsPublic;
@@ -254,26 +257,19 @@ static void writeFunction(std::ostream& out, const PhpFunc& func) {
 
 static void writeConstant(std::ostream& out, const PhpConst& cns) {
   auto name = cns.name();
+  if (cns.isSystem() &&
+      ((name == "STDIN") || (name == "STDOUT") ||
+       (name == "STDERR") || (name == "SID"))) {
+    assert(false); // Dynamic constants no longer supported in IDLs
+    return;
+  }
+
   out << "  \"" << escapeCpp(name) << "\", ";
   if (cns.hasValue()) {
     auto ser = cns.serialize();
     out << castLong(ser.size())
         << ", \"" << escapeCpp(ser) << "\",\n";
     return;
-  }
-
-  if (cns.isSystem()) {
-    // Special "magic" constants
-    if (name == "SID") {
-      out << "(const char *)((offsetof(EnvConstants, k_" << name << ") - "
-          << "offsetof(EnvConstants, stgv_Variant)) / sizeof(Variant)), "
-          << castLong(1) << ",\n";
-      return;
-    }
-    if ((name == "STDIN") || (name == "STDOUT") || (name == "STDERR")) {
-      out << "(const char *)&BuiltinFiles::Get" << name << ", NULL,\n";
-      return;
-    }
   }
 
   out << "(const char *)&" << cns.varname() << ", "
@@ -336,8 +332,10 @@ static void outputClassMap(const fbstring &invocation_trace,
 
   brandOutputFile(out, "gen-class-map.cpp", invocation_trace);
 
-  out << "#include \"hphp/runtime/base/base-includes.h\"\n"
+  out << "#include \"hphp/runtime/base/externals.h\"\n"
+      << "#include \"hphp/runtime/base/plain-file.h\"\n"
       << "#include \"hphp/system/constants.h\"\n"
+      << "#include \"hphp/runtime/ext/extension.h\"\n"
       << "#include \"hphp/runtime/ext/ext.h\"\n"
       << "namespace HPHP {\n";
   declareConstants(out, consts, false);

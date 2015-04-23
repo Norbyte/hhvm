@@ -33,8 +33,8 @@
 #include "hphp/util/process.h"
 #include "hphp/util/atomic.h"
 #include "hphp/util/compatibility.h"
+#include "hphp/util/hardware-counter.h"
 #include "hphp/util/timer.h"
-#include "hphp/runtime/base/hardware-counter.h"
 
 using std::endl;
 
@@ -63,6 +63,19 @@ void AccessLog::init(const std::string &defaultFormat,
   m_initialized = true;
   m_defaultFormat = defaultFormat;
   m_files = files;
+  openFiles(username);
+}
+
+void AccessLog::init(const std::string &defaultFormat,
+                     std::map<std::string, AccessLogFileData> &files,
+                     const std::string &username) {
+  Lock l(m_lock);
+  if (m_initialized) return;
+  m_initialized = true;
+  m_defaultFormat = defaultFormat;
+  for (auto it = files.begin(); it != files.end(); ++it) {
+    m_files.push_back(it->second);
+  }
   openFiles(username);
 }
 
@@ -296,7 +309,12 @@ bool AccessLog::genField(std::ostringstream &out, const char* &format,
     }
     break;
   case 'h':
-    out << transport->getRemoteHost();
+    {
+       std::string host = transport->getRemoteHost();
+       if(host.empty())
+         host = transport->getRemoteAddr();
+       out << host;
+    }
     break;
   case 'i':
     if (arg.empty()) return false;
@@ -337,20 +355,8 @@ bool AccessLog::genField(std::ostringstream &out, const char* &format,
     break;
   case 'r':
     {
-      const char *method = nullptr;
-      switch (transport->getMethod()) {
-      case Transport::Method::GET: method = "GET"; break;
-      case Transport::Method::POST:
-        if (transport->getExtendedMethod() == nullptr) {
-          method = "POST";
-        } else {
-          method = transport->getExtendedMethod();
-        }
-        break;
-      case Transport::Method::HEAD: method = "HEAD"; break;
-      default: break;
-      }
-      if (!method) return false;
+      const char *method = transport->getMethodName();
+      if (!method || !method[0]) return false;
       out << method << " ";
 
       const char *url = transport->getUrl();

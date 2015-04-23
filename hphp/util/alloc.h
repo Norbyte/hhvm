@@ -21,7 +21,7 @@
 #include <cassert>
 #include <atomic>
 
-#include "folly/Portability.h"
+#include <folly/Portability.h>
 
 #include "hphp/util/exception.h"
 
@@ -73,6 +73,19 @@ extern "C" {
 #endif
 }
 
+enum class NotNull {};
+
+/*
+ * The placement-new provided by the standard library is required by the
+ * C++ specification to perform a null check because it is marked with noexcept
+ * or throw() depending on the compiler version. This override of placement
+ * new doesn't use either of these, so it is allowed to omit the null check.
+ */
+inline void* operator new(size_t, NotNull, void* location) {
+  assert(location);
+  return location;
+}
+
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -84,11 +97,9 @@ const bool use_jemalloc =
 #endif
   ;
 
-class OutOfMemoryException : public Exception {
-public:
+struct OutOfMemoryException : Exception {
   explicit OutOfMemoryException(size_t size)
     : Exception("Unable to allocate %zu bytes of memory", size) {}
-  virtual ~OutOfMemoryException() throw() {}
   EXCEPTION_COMMON_IMPL(OutOfMemoryException);
 };
 
@@ -97,6 +108,27 @@ public:
 #ifdef USE_JEMALLOC
 extern unsigned low_arena;
 extern std::atomic<int> low_huge_pages;
+
+inline int low_mallocx_flags() {
+  // Allocate from low_arena, and bypass the implicit tcache to assure that the
+  // result actually comes from low_arena.
+#ifdef MALLOCX_TCACHE_NONE
+  return MALLOCX_ARENA(low_arena)|MALLOCX_TCACHE_NONE;
+#else
+  return MALLOCX_ARENA(low_arena);
+#endif
+}
+
+inline int low_dallocx_flags() {
+#ifdef MALLOCX_TCACHE_NONE
+  // Bypass the implicit tcache for this deallocation.
+  return MALLOCX_TCACHE_NONE;
+#else
+  // Prior to the introduction of MALLOCX_TCACHE_NONE, explicitly specifying
+  // MALLOCX_ARENA(a) caused jemalloc to bypass tcache.
+  return MALLOCX_ARENA(low_arena);
+#endif
+}
 #endif
 
 inline void* low_malloc(size_t size) {
@@ -112,7 +144,7 @@ inline void low_free(void* ptr) {
 #ifndef USE_JEMALLOC
   free(ptr);
 #else
-  dallocx(ptr, MALLOCX_ARENA(low_arena));
+  dallocx(ptr, low_dallocx_flags());
 #endif
 }
 

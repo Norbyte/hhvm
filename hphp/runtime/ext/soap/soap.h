@@ -18,7 +18,7 @@
 #ifndef PHP_SOAP_H
 #define PHP_SOAP_H
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include <map>
 #include <memory>
 #include <vector>
@@ -131,9 +131,9 @@ public:
   virtual void requestShutdown() { reset();}
 
 private:
-  std::vector<sdlPtr> m_sdls;
-  std::vector<encodeMapPtr> m_typemaps;
-  std::vector<xmlCharEncodingHandlerPtr> m_encodings;
+  hphp_hash_set<sdlPtr> m_sdls;
+  hphp_hash_set<encodeMapPtr> m_typemaps;
+  hphp_hash_set<xmlCharEncodingHandlerPtr> m_encodings;
 
   sdlPtr get_sdl_impl(const char *uri, long cache_wsdl, HttpClient *http);
   void reset();

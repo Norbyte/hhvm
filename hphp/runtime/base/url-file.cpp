@@ -16,7 +16,6 @@
 
 #include "hphp/runtime/base/url-file.h"
 #include <vector>
-#include "hphp/runtime/base/hphp-system.h"
 #include "hphp/runtime/base/runtime-error.h"
 #include "hphp/runtime/ext/pcre/ext_pcre.h"
 #include "hphp/runtime/ext/stream/ext_stream.h"
@@ -49,7 +48,7 @@ UrlFile::UrlFile(const char *method /* = "GET" */,
   m_maxRedirect = maxRedirect;
   m_timeout = timeout;
   m_ignoreErrors = ignoreErrors;
-  m_isLocal = false;
+  setIsLocal(false);
 }
 
 void UrlFile::sweep() {
@@ -61,6 +60,15 @@ void UrlFile::sweep() {
 const StaticString
   s_remove_user_pass_pattern("#://[^@]+@#"),
   s_remove_user_pass_replace("://");
+
+void UrlFile::setProxy(const String& proxy_host, int proxy_port,
+                       const String& proxy_user, const String& proxy_pass) {
+  m_proxyHost = proxy_host.c_str();
+  m_proxyPort = proxy_port;
+  m_proxyUsername = proxy_user.c_str();
+  m_proxyPassword = proxy_pass.c_str();
+}
+
 bool UrlFile::open(const String& input_url, const String& mode) {
   String url = input_url;
   const char* modestr = mode.c_str();
@@ -72,6 +80,10 @@ bool UrlFile::open(const String& input_url, const String& mode) {
   }
   HttpClient http(m_timeout, m_maxRedirect);
   m_response.clear();
+
+  if (!m_proxyHost.empty()) {
+    http.proxy(m_proxyHost, m_proxyPort, m_proxyUsername, m_proxyPassword);
+  }
 
   HeaderMap *pHeaders = nullptr;
   HeaderMap requestHeaders;
@@ -124,8 +136,8 @@ bool UrlFile::open(const String& input_url, const String& mode) {
     }
     tvDup(*tvFrom, *tvTo);
   } else if (fp->hasVarEnv()) {
-    g_context->setVar(s_http_response_header.get(),
-                      Variant(m_responseHeaders).asTypedValue());
+    fp->getVarEnv()->set(s_http_response_header.get(),
+                         Variant(m_responseHeaders).asTypedValue());
   }
 
   /*
@@ -134,7 +146,7 @@ bool UrlFile::open(const String& input_url, const String& mode) {
    * shouldn't ignore other errors.
    */
   if (code == 200 || (m_ignoreErrors && code != 0)) {
-    m_name = (std::string) url;
+    setName(url.toCppString());
     m_data = const_cast<char*>(m_response.data());
     m_len = m_response.size();
     return true;
@@ -147,13 +159,13 @@ bool UrlFile::open(const String& input_url, const String& mode) {
 int64_t UrlFile::writeImpl(const char *buffer, int64_t length) {
   assert(m_len != -1);
   throw FatalErrorException((std::string("cannot write a url stream: ") +
-                             m_name).c_str());
+                             getName()).c_str());
 }
 
 bool UrlFile::flush() {
   assert(m_len != -1);
   throw FatalErrorException((std::string("cannot flush a url stream: ") +
-                             m_name).c_str());
+                             getName()).c_str());
 }
 
 String UrlFile::getLastError() {

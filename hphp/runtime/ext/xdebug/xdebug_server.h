@@ -33,11 +33,10 @@ namespace HPHP {
 struct XDebugCommand;
 struct XDebugBreakpoint;
 
-class XDebugServer {
+struct XDebugServer {
 ////////////////////////////////////////////////////////////////////////////////
 // Construction/Destruction
 
-public:
   enum class Mode {
     REQ, // Server created during request init
     JIT // Server created on demand
@@ -115,7 +114,7 @@ public:
     ERROR_EVALUATING_CODE = 206,
     ERROR_INVALID_EXPRESSION = 207,
 
-    ERROR_PROPERTY_NON_EXISTANT = 300,
+    ERROR_PROPERTY_NON_EXISTENT = 300,
     ERROR_STACK_DEPTH_INVALID = 301,
     ERROR_CONTEXT_INVALID = 302,
 
@@ -202,10 +201,10 @@ private:
     SKIP_CHAR
   };
 
-  // Parse m_buffer- grab the command and an array of arguments. This was taken
-  // and translated from php5 xdebug in order match parsing behavior. Throws
-  // an ErrorCode on failure.
-  void parseInput(String& cmd, Array& args);
+  // Grab the command and an array of arguments from the given input string.
+  // This was taken and translated from php5 xdebug in order match parsing
+  // behavior.  Throws an ErrorCode on failure.
+  void parseInput(folly::StringPiece in, String& cmd, Array& args);
 
   const XDebugCommand* m_lastCommand = nullptr;
   char* m_buffer = nullptr;

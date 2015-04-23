@@ -177,6 +177,7 @@ using FuncTable      = std::vector<FuncEntry>;
  */
 int getLineNumber(const LineTable& table, Offset pc);
 bool getSourceLoc(const SourceLocTable& table, Offset pc, SourceLoc& sLoc);
+void stashLineTable(const Unit* unit, LineTable table);
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -549,8 +550,8 @@ public:
    * burn the Class* into the TC, since it will be defined by the time the code
    * that needs the Class* runs (via autoload or whatnot).
    */
-  static Class* lookupUniqueClass(const NamedEntity* ne);
-  static Class* lookupUniqueClass(const StringData* name);
+  static Class* lookupClassOrUniqueClass(const NamedEntity* ne);
+  static Class* lookupClassOrUniqueClass(const StringData* name);
 
   /*
    * Look up, or autoload and define, the Class in this request with name
@@ -619,14 +620,15 @@ public:
   static bool defCns(const StringData* cnsName, const TypedValue* value,
                      bool persistent = false);
 
+  using SystemConstantCallback = const Variant& (*)();
   /*
    * Define a constant with name `cnsName' which stores an arbitrary data
    * pointer in its TypedValue (with datatype KindOfUnit).
    *
    * The canonical examples are STDIN, STDOUT, and STDERR.
    */
-  static void defDynamicSystemConstant(const StringData* cnsName,
-                                       const void* data);
+  static bool defSystemConstantCallback(const StringData* cnsName,
+                                        SystemConstantCallback callback);
 
 
   /////////////////////////////////////////////////////////////////////////////
@@ -792,7 +794,6 @@ private:
   unsigned char const* m_bc{nullptr};
   Offset m_bclen{0};
   LowStringPtr m_filepath{nullptr};
-  LineTable m_lineTable;
   MergeInfo* m_mergeInfo{nullptr};
 
   int8_t m_repoId{-1};

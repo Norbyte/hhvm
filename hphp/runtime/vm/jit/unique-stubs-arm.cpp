@@ -34,12 +34,7 @@ void emitCallToExit(UniqueStubs& us) {
 
   a.   Nop   ();
   us.callToExit = a.frontier();
-  emitServiceReq(
-    mcg->code.main(),
-    SRFlags::Align | SRFlags::JmpInsteadOfRet,
-    REQ_EXIT
-  );
-
+  a.   Br    (rLinkReg);
   us.add("callToExit", us.callToExit);
 }
 
@@ -66,10 +61,10 @@ void emitResumeHelpers(UniqueStubs& us) {
   us.resumeHelperRet = a.frontier();
   a.   Str   (vixl::x30, rStashedAR[AROFF(m_savedRip)]);
   us.resumeHelper = a.frontier();
-  a.   Ldr   (rVmFp, rVmTl[RDS::kVmfpOff]);
-  a.   Ldr   (rVmSp, rVmTl[RDS::kVmspOff]);
+  a.   Ldr   (rVmFp, rVmTl[rds::kVmfpOff]);
+  a.   Ldr   (rVmSp, rVmTl[rds::kVmspOff]);
 
-  emitServiceReq(mcg->code.main(), REQ_RESUME);
+  not_implemented();
 
   us.add("resumeHelper", us.resumeHelper);
   us.add("resumeHelperRet", us.resumeHelperRet);
@@ -86,8 +81,7 @@ void emitStackOverflowHelper(UniqueStubs& us) {
   // The VM-reg-save helper will read the current BC offset out of argReg(0).
   a.  Add  (argReg(0).W(), rAsm.W(), rAsm2.W());
 
-  emitEagerVMRegSave(a, RegSaveFlags::SaveFP | RegSaveFlags::SavePC);
-  emitServiceReq(mcg->code.cold(), REQ_STACK_OVERFLOW);
+  not_implemented();
 
   us.add("stackOverflowHelper", us.stackOverflowHelper);
 }
@@ -157,42 +151,14 @@ void emitFCallArrayHelper(UniqueStubs& us) {
 }
 
 void emitFCallHelperThunk(UniqueStubs& us) {
-  TCA (*helper)(ActRec*, void*) = &fcallHelper;
   MacroAssembler a { mcg->code.main() };
-
   us.fcallHelperThunk = a.frontier();
-  vixl::Label popAndXchg, jmpRet;
-
-  a.   Mov   (argReg(0), rStashedAR);
-  a.   Mov   (argReg(1), rVmSp);
-  a.   Cmp   (rVmFp, rStashedAR);
-  a.   B     (&popAndXchg, vixl::ne);
-  emitCall(a, CppCall::direct(helper));
-  a.   Br    (rReturnReg);
-
-  a.   bind  (&popAndXchg);
-  emitXorSwap(a, rStashedAR, rVmFp);
-  // Put return address into ActRec.
-  a.   Str   (rLinkReg, rVmFp[AROFF(m_savedRip)]);
-  emitCall(a, CppCall::direct(helper));
-  // Put return address back in the link register.
-  a.   Ldr   (rLinkReg, rVmFp[AROFF(m_savedRip)]);
-  emitXorSwap(a, rStashedAR, rVmFp);
-  a.   Cmp   (rReturnReg, 0);
-  a.   B     (&jmpRet, vixl::gt);
-  a.   Neg   (rReturnReg, rReturnReg);
-  a.   Ldr   (rVmFp, rVmTl[RDS::kVmfpOff]);
-  a.   Ldr   (rVmSp, rVmTl[RDS::kVmspOff]);
-
-  a.   bind  (&jmpRet);
-
-  a.   Br    (rReturnReg);
-
+  a.   Brk   (0);
   us.add("fcallHelperThunk", us.fcallHelperThunk);
 }
 
 void emitFuncBodyHelperThunk(UniqueStubs& us) {
-  TCA (*helper)(ActRec*, void*) = &funcBodyHelper;
+  TCA (*helper)(ActRec*) = &funcBodyHelper;
   MacroAssembler a { mcg->code.main() };
 
   us.funcBodyHelperThunk = a.frontier();
@@ -242,10 +208,29 @@ void emitFunctionEnterHelper(UniqueStubs& us) {
   auto rIgnored = rAsm2;
   a.   Pop     (rVmFp, rAsm);
   a.   Pop     (rIgnored, rLinkReg);
-  a.   Ldr     (rVmSp, rVmTl[RDS::kVmspOff]);
+  a.   Ldr     (rVmSp, rVmTl[rds::kVmspOff]);
   a.   Br      (rAsm);
 
   us.add("functionEnterHelper", us.functionEnterHelper);
+}
+
+void emitBindCallStubs(UniqueStubs& uniqueStubs) {
+  for (int i = 0; i < 2; i++) {
+    auto& cb = mcg->code.cold();
+    if (!i) {
+      uniqueStubs.bindCallStub = cb.frontier();
+    } else {
+      uniqueStubs.immutableBindCallStub = cb.frontier();
+    }
+    Vauto vasm(cb);
+    auto& vf = vasm.main();
+    // Pop the return address into the actrec in rStashedAR.
+    vf << store{PhysReg{rLinkReg}, PhysReg{rStashedAR}[AROFF(m_savedRip)]};
+    auto const argv = packServiceReqArgs((int64_t)i);
+    not_implemented();
+  }
+  uniqueStubs.add("bindCallStub", uniqueStubs.bindCallStub);
+  uniqueStubs.add("immutableBindCallStub", uniqueStubs.immutableBindCallStub);
 }
 
 } // anonymous namespace
@@ -263,6 +248,7 @@ UniqueStubs emitUniqueStubs() {
     emitFCallHelperThunk,
     emitFuncBodyHelperThunk,
     emitFunctionEnterHelper,
+    emitBindCallStubs,
   };
   for (auto& f : functions) f(us);
   return us;

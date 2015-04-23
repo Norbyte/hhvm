@@ -16,6 +16,7 @@
 #include "hphp/util/arena.h"
 #include "hphp/runtime/vm/jit/region-selection.h"
 #include "hphp/runtime/vm/verifier/cfg.h"
+#include "hphp/runtime/vm/jit/containers.h"
 
 namespace HPHP { namespace jit {
 
@@ -57,6 +58,7 @@ RegionDescPtr selectMethod(const RegionContext& context) {
   using namespace HPHP::Verifier;
 
   if (!isFuncEntry(context.func, context.bcOffset)) return nullptr;
+  if (context.func->isPseudoMain()) return nullptr;
   FTRACE(1, "function entry for {}: using selectMethod\n",
          context.func->fullName()->data());
 
@@ -67,6 +69,8 @@ RegionDescPtr selectMethod(const RegionContext& context) {
   auto const graph = gb.build();
   auto const unit = context.func->unit();
 
+  jit::hash_map<Block*,RegionDesc::BlockId> blockMap;
+
   /*
    * Spit out the blocks in a RPO, but skip DV-initializer blocks
    * (i.e. start with graph->first_linear.  We don't handle those in
@@ -74,16 +78,85 @@ RegionDescPtr selectMethod(const RegionContext& context) {
    * compiler and then may branch to the main entry point.
    */
   sortRpo(graph);
-  Offset spOffset = context.spOffset;
-  for (Block* b = graph->first_linear; b != nullptr; b = b->next_rpo) {
-    auto const start  = unit->offsetOf(b->start);
-    auto const length = numInstrs(b->start, b->end);
-    SrcKey sk{context.func, start, context.resumed};
-    ret->addBlock(sk, length, spOffset);
-    spOffset = -1; // flag SP offset as unknown for all but the first block
+  {
+    auto spOffset = context.spOffset;
+    for (Block* b = graph->first_linear; b != nullptr; b = b->next_rpo) {
+      auto const start  = unit->offsetOf(b->start);
+      auto const length = numInstrs(b->start, b->end);
+      SrcKey sk{context.func, start, context.resumed};
+      auto const rblock = ret->addBlock(sk, length, spOffset, 0);
+      blockMap[b] = rblock->id();
+      // flag SP offset as unknown for all but the first block
+      spOffset = FPAbsOffset::invalid();
+    }
   }
 
-  assert(!ret->empty());
+  // Add all the ARCs.
+  for (Block* b = graph->first_linear; b != nullptr; b = b->next_rpo) {
+    auto const myId = blockMap[b];
+    auto const numSuccs = numSuccBlocks(b);
+    for (auto i = uint32_t{0}; i < numSuccs; ++i) {
+      auto const succIt = blockMap.find(b->succs[i]);
+      if (succIt != end(blockMap)) {
+        ret->addArc(myId, succIt->second);
+      }
+    }
+  }
+
+  // Compute stack depths for each block.
+  for (Block* b = graph->first_linear; b != nullptr; b = b->next_rpo) {
+    auto const myId = blockMap[b];
+    auto rblock = ret->block(myId);
+    auto sp = rblock->initialSpOffset();
+
+    // Don't add unreachable blocks to the region.
+    if (!sp.isValid()) {
+      ret->deleteBlock(myId);
+      continue;
+    }
+
+    for (InstrRange inst = blockInstrs(b); !inst.empty();) {
+      auto const pc   = inst.popFront();
+      auto const info = instrStackTransInfo(reinterpret_cast<const Op*>(pc));
+      switch (info.kind) {
+      case StackTransInfo::Kind::InsertMid:
+        ++sp;
+        break;
+      case StackTransInfo::Kind::PushPop:
+        sp += info.numPushes - info.numPops;
+        break;
+      }
+    }
+
+    for (auto idx = uint32_t{0}; idx < numSuccBlocks(b); ++idx) {
+      if (!b->succs[idx]) continue;
+      auto const succ = ret->block(blockMap[b->succs[idx]]);
+      if (succ->initialSpOffset().isValid()) {
+        always_assert_flog(
+          succ->initialSpOffset() == sp,
+          "Stack depth mismatch in region method on {}\n"
+          "  srcblkoff={}, dstblkoff={}, src={}, target={}",
+          context.func->fullName()->data(),
+          context.func->unit()->offsetOf(b->start),
+          context.func->unit()->offsetOf(b->succs[idx]->start),
+          sp.offset,
+          succ->initialSpOffset().offset
+        );
+        continue;
+      }
+      succ->setInitialSpOffset(sp);
+      FTRACE(2,
+        "spOff for {} -> {}\n",
+        context.func->unit()->offsetOf(b->succs[idx]->start),
+        sp.offset
+      );
+    }
+  }
+
+  /*
+   * Fill the first block predictions with the live types.
+   */
+  assertx(!ret->empty());
   auto const startSK = ret->start();
   for (auto& lt : context.liveTypes) {
     typedef RegionDesc::Location::Tag LTag;
@@ -94,9 +167,7 @@ RegionDescPtr selectMethod(const RegionContext& context) {
     case LTag::Local:
       if (lt.location.localId() < context.func->numParams()) {
         // Only predict objectness, not the specific class type.
-        auto const type = lt.type.strictSubtypeOf(Type::Obj)
-                           ? Type::Obj
-                           : lt.type;
+        auto const type = lt.type < TObj ? TObj : lt.type;
         ret->entry()->addPredicted(startSK, {lt.location, type});
       }
       break;

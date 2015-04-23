@@ -17,157 +17,125 @@
 #include "hphp/runtime/vm/jit/ir-unit.h"
 
 #include "hphp/runtime/vm/jit/block.h"
+#include "hphp/runtime/vm/jit/cfg.h"
 #include "hphp/runtime/vm/jit/frame-state.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
-#include "hphp/runtime/vm/jit/simplifier.h"
 #include "hphp/runtime/vm/jit/timer.h"
 
 namespace HPHP { namespace jit {
+///////////////////////////////////////////////////////////////////////////////
 
 TRACE_SET_MOD(hhir);
+
+///////////////////////////////////////////////////////////////////////////////
 
 IRUnit::IRUnit(TransContext context)
   : m_context(context)
   , m_entry(defBlock())
 {}
 
-IRInstruction* IRUnit::defLabel(unsigned numDst, BCMarker marker,
-                                const jit::vector<unsigned>& producedRefs) {
+IRInstruction* IRUnit::defLabel(unsigned numDst, BCMarker marker) {
   IRInstruction inst(DefLabel, marker);
-  IRInstruction* label = cloneInstruction(&inst);
-  always_assert(producedRefs.size() == numDst);
-  m_labelRefs[label] = producedRefs;
+  auto const label = clone(&inst);
   if (numDst > 0) {
     SSATmp* dsts = (SSATmp*) m_arena.alloc(numDst * sizeof(SSATmp));
     for (unsigned i = 0; i < numDst; ++i) {
-      new (&dsts[i]) SSATmp(m_nextOpndId++, label);
+      new (&dsts[i]) SSATmp(m_nextTmpId++, label);
     }
     label->setDsts(numDst, dsts);
   }
   return label;
 }
 
-Block* IRUnit::defBlock() {
+Block* IRUnit::defBlock(Block::Hint hint) {
   FTRACE(2, "IRUnit defining B{}\n", m_nextBlockId);
-  return new (m_arena) Block(m_nextBlockId++);
+  auto const block = new (m_arena) Block(m_nextBlockId++);
+  block->setHint(hint);
+  return block;
 }
 
-IRInstruction* IRUnit::mov(SSATmp* dst, SSATmp* src, BCMarker marker) {
-  IRInstruction* inst = gen(Mov, marker, src);
-  dst->setInstruction(inst);
-  inst->setDst(dst);
-  return inst;
-}
-
-SSATmp* IRUnit::findConst(Type type) {
-  assert(type.isConst());
+SSATmp* IRUnit::cns(Type type) {
+  assertx(type.hasConstVal() ||
+         type.subtypeOfAny(TUninit, TInitNull, TNullptr));
   IRInstruction inst(DefConst, BCMarker{});
   inst.setTypeParam(type);
   if (SSATmp* tmp = m_constTable.lookup(&inst)) {
-    assert(tmp->type().equals(type));
+    assertx(tmp->type() == type);
     return tmp;
   }
-  return m_constTable.insert(cloneInstruction(&inst)->dst());
+  return m_constTable.insert(clone(&inst)->dst());
 }
 
+///////////////////////////////////////////////////////////////////////////////
+
 /*
- * Whether the block is a part of the main code path.
+ * Returns true iff `block' ends the IR unit after finishing execution
+ * of the bytecode instruction at `sk'.
  */
-static bool isMainBlock(const Block* b) {
-  auto const hint = b->hint();
-  return hint != Block::Hint::Unlikely && hint != Block::Hint::Unused;
+static bool endsUnitAtSrcKey(const Block* block, SrcKey sk) {
+  if (!block->isExitNoThrow()) return false;
+
+  const auto& inst = block->back();
+  const auto  instSk = inst.marker().sk();
+
+  switch (inst.op()) {
+    // These instructions end a unit after executing the bytecode
+    // instruction they correspond to.
+    case InterpOneCF:
+    case JmpSSwitchDest:
+    case JmpSwitchDest:
+    case RaiseError:
+      return instSk == sk;;
+
+    // The RetCtrl is generally ending a bytecode instruction, with the
+    // exception being in an Await bytecode instruction, where we consider the
+    // end of the bytecode instruction to be the non-suspending path.
+    case RetCtrl:
+    case AsyncRetCtrl:
+      return inst.marker().sk().op() != Op::Await;
+
+    // A ReqBindJmp ends a unit and it jumps to the next instruction
+    // to execute.
+    case ReqBindJmp: {
+      auto destOffset = inst.extra<ReqBindJmp>()->dest.offset();
+      return sk.succOffsets().count(destOffset);
+    }
+
+    default:
+      return false;
+  }
 }
 
-/*
- * Whether the block appears to be the exit block of the main code
- * path of a region. This is conservative, so it may return false on
- * all blocks in a region.
- */
-static bool isMainExit(const Block* b) {
-  if (!isMainBlock(b)) return false;
-
-  if (b->next()) return false;
-
-  // The Await bytecode instruction does a RetCtrl to the scheduler,
-  // which is in a likely block.  We don't want to consider this as
-  // the main exit.
-  auto const& back = b->back();
-  if (back.op() == RetCtrl && back.marker().sk().op() == OpAwait) return false;
-
-  auto const taken = b->taken();
-  return !taken || taken->isCatch();
-}
-
-/*
- * Intended to be called after all optimizations are finished on a
- * single-entry, single-exit tracelet, this collects the types of all stack
- * slots and locals at the end of the main exit.
- */
-void IRUnit::collectPostConditions() {
-  // This function is only correct when given a single-exit region, as in
-  // TransKind::Profile.  Furthermore, its output is only used to guide
-  // formation of profile-driven regions.
-  assert(mcg->tx().mode() == TransKind::Profile);
-  assert(m_postConds.empty());
-  Timer _t(Timer::collectPostConditions);
-
-  // We want the state for the last block on the "main trace".  Figure
-  // out which that is.
+Block* findMainExitBlock(const IRUnit& unit, SrcKey lastSk) {
   Block* mainExit = nullptr;
-  Block* lastMainBlock = nullptr;
 
-  FrameState state{*this, entry()->front().marker()};
-  ITRACE(2, "collectPostConditions starting\n");
-  Trace::Indent _i;
+  FTRACE(5, "findMainExitBlock: starting on unit:\n{}\n", show(unit));
 
-  for (auto* block : rpoSortCfg(*this)) {
-    state.startBlock(block, block->front().marker());
+  for (auto block : rpoSortCfg(unit)) {
+    if (endsUnitAtSrcKey(block, lastSk)) {
+      if (mainExit == nullptr) {
+        mainExit = block;
+        continue;
+      }
 
-    for (auto& inst : *block) {
-      state.setMarker(inst.marker());
-      state.update(&inst);
-    }
+      always_assert_flog(
+        mainExit->hint() == Block::Hint::Unlikely ||
+        block->hint() == Block::Hint::Unlikely,
+        "findMainExit: 2 likely exits found: B{} and B{}\nlastSk = {}",
+        mainExit->id(), block->id(), showShort(lastSk));
 
-    if (isMainBlock(block)) lastMainBlock = block;
-
-    if (isMainExit(block)) {
-      mainExit = block;
-      break;
-    }
-
-    state.finishBlock(block);
-  }
-
-  // If we didn't find an obvious exit, then use the last block in the region.
-  always_assert(lastMainBlock != nullptr);
-  if (mainExit == nullptr) mainExit = lastMainBlock;
-
-  FTRACE(1, "mainExit: B{}\n", mainExit->id());
-
-  // state currently holds the state at the end of mainExit
-  auto const curFunc  = state.func();
-  auto const sp       = state.sp();
-  auto const spOffset = state.spOffset();
-
-  for (unsigned i = 0; i < spOffset; ++i) {
-    auto t = getStackValue(sp, i).knownType;
-    if (!t.equals(Type::StackElem)) {
-      m_postConds.push_back({ RegionDesc::Location::Stack{i, spOffset - i},
-                              t });
+      if (mainExit->hint() == Block::Hint::Unlikely) mainExit = block;
     }
   }
 
-  for (unsigned i = 0; i < curFunc->numLocals(); ++i) {
-    auto t = state.localType(i);
-    if (!t.equals(Type::Gen)) {
-      FTRACE(1, "Local {}: {}\n", i, t.toString());
-      m_postConds.push_back({ RegionDesc::Location::Local{i}, t });
-    }
-  }
+  always_assert_flog(mainExit, "findMainExit: no exit found for lastSk = {}",
+                     showShort(lastSk));
+
+  FTRACE(5, "findMainExitBlock: mainExit = B{}\n", mainExit->id());
+
+  return mainExit;
 }
 
-const PostConditions& IRUnit::postConditions() const {
-  return m_postConds;
-}
+///////////////////////////////////////////////////////////////////////////////
 
 }}

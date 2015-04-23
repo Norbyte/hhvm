@@ -21,15 +21,29 @@
 open Utils
 
 (*****************************************************************************)
+(* Parsing modes *)
+(*****************************************************************************)
+
+type file_type =
+  | PhpFile
+  | HhFile
+
+type mode =
+  | Mdecl    (* just declare signatures, don't check anything *)
+  | Mstrict  (* check everthing! *)
+  | Mpartial (* Don't fail if you see a function/class you don't know *)
+
+(*****************************************************************************)
 (* The record produced by the parsing phase. *)
 (*****************************************************************************)
 
 type id = Pos.t * string
 
 type t = {
+  file_mode : mode option;
   funs : id list;
   classes : id list;
-  types : id list;
+  typedefs : id list;
   consts : id list;
   comments : (Pos.t * string) list;
   consider_names_just_for_autoload: bool;
@@ -46,7 +60,7 @@ type names = {
   n_consts  : SSet.t;
 }
 
-type fast = names SMap.t
+type fast = names Relative_path.Map.t
 
 let empty_names = {
   n_funs    = SSet.empty;
@@ -63,11 +77,11 @@ let name_set_of_idl idl =
   List.fold_left (fun acc (_, x) -> SSet.add x acc) SSet.empty idl
 
 let simplify info =
-  let {funs; classes; types; consts; comments = _;
+  let {funs; classes; typedefs; consts; file_mode = _; comments = _;
        consider_names_just_for_autoload = _ } = info in
   let n_funs    = name_set_of_idl funs in
   let n_classes = name_set_of_idl classes in
-  let n_types   = name_set_of_idl types in
+  let n_types   = name_set_of_idl typedefs in
   let n_consts  = name_set_of_idl consts in
   {n_funs; n_classes; n_types; n_consts}
 
@@ -78,7 +92,7 @@ let merge_names t_names1 t_names2 =
    n_classes = SSet.union n_classes t_names2.n_classes;
    n_types   = SSet.union n_types t_names2.n_types;
    n_consts  = SSet.union n_consts t_names2.n_consts;
- }
+  }
 
 let simplify_fast fast =
-  SMap.map simplify fast
+  Relative_path.Map.map simplify fast

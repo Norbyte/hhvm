@@ -13,15 +13,18 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #include "hphp/runtime/server/virtual-host.h"
 
 #include <stdexcept>
 
 #include "hphp/runtime/base/comparisons.h"
+#include "hphp/runtime/base/config.h"
+#include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/preg.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/string-util.h"
-#include "hphp/runtime/base/config.h"
+#include "hphp/runtime/base/variable-serializer.h"
 #include "hphp/util/text-util.h"
 
 namespace HPHP {
@@ -37,6 +40,7 @@ VirtualHost &VirtualHost::GetDefault() {
 
 void VirtualHost::SetCurrent(VirtualHost *vhost) {
   g_context->setVirtualHost(vhost ? vhost : &VirtualHost::GetDefault());
+  UpdateSerializationSizeLimit();
 }
 
 const VirtualHost *VirtualHost::GetCurrent() {
@@ -61,6 +65,15 @@ int64_t VirtualHost::GetUploadMaxFileSize() {
     return vh->m_runtimeOption.uploadMaxFileSize;
   }
   return RuntimeOption::UploadMaxFileSize;
+}
+
+void VirtualHost::UpdateSerializationSizeLimit() {
+  const VirtualHost *vh = GetCurrent();
+  assert(vh);
+  if (vh->m_runtimeOption.serializationSizeLimit != StringData::MaxSize) {
+    VariableSerializer::serializationSizeLimit =
+      vh->m_runtimeOption.serializationSizeLimit;
+  }
 }
 
 const std::vector<std::string> &VirtualHost::GetAllowedDirectories() {
@@ -115,10 +128,18 @@ void VirtualHost::initRuntimeOption(const IniSetting::Map& ini, Hdf overwrite) {
   int64_t uploadMaxFileSize =
     Config::GetInt32(ini, overwrite["Server.Upload.UploadMaxFileSize"], -1);
   if (uploadMaxFileSize != -1) uploadMaxFileSize *= (1LL << 20);
-  Config::Get(ini, overwrite["Server.AllowedDirectories"], m_runtimeOption.allowedDirectories);
+  int64_t serializationSizeLimit =
+    Config::GetInt32(
+      ini,
+      overwrite["ResourceLimit.SerializationSizeLimit"],
+      StringData::MaxSize);
+  m_runtimeOption.allowedDirectories = Config::GetVector(
+    ini,
+    overwrite["Server.AllowedDirectories"]);
   m_runtimeOption.requestTimeoutSeconds = requestTimeoutSeconds;
   m_runtimeOption.maxPostSize = maxPostSize;
   m_runtimeOption.uploadMaxFileSize = uploadMaxFileSize;
+  m_runtimeOption.serializationSizeLimit = serializationSizeLimit;
 
   m_documentRoot = RuntimeOption::SourceRoot + m_pathTranslation;
   if (!m_documentRoot.empty() &&
@@ -236,7 +257,7 @@ void VirtualHost::init(const IniSetting::Map& ini, Hdf vh) {
 
     std::string pattern = Config::GetString(ini, hdf["pattern"], "");
     std::vector<std::string> names;
-    Config::Get(ini, hdf["params"], names);
+    names = Config::GetVector(ini, hdf["params"]);
 
     if (pattern.empty()) {
       for (unsigned int i = 0; i < names.size(); i++) {
@@ -260,7 +281,7 @@ void VirtualHost::init(const IniSetting::Map& ini, Hdf vh) {
     m_queryStringFilters.push_back(filter);
   }
 
-  Config::Get(ini, vh["ServerVariables"], m_serverVars);
+  m_serverVars = Config::GetMap(ini, vh["ServerVariables"]);
   m_serverName = Config::GetString(ini, vh["ServerName"]);
 }
 

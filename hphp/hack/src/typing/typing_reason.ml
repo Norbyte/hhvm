@@ -8,8 +8,6 @@
  *
  *)
 
-
-
 (* The reason why something is expected to have a certain type *)
 type t =
   | Rnone
@@ -21,7 +19,6 @@ type t =
   | Rforeach         of Pos.t (* Because it is iterated in a foreach loop *)
   | Rasyncforeach    of Pos.t (* Because it is iterated "await as" in foreach *)
   | Raccess          of Pos.t
-  | Rcall            of Pos.t
   | Rarith           of Pos.t
   | Rarith_ret       of Pos.t
   | Rstring2         of Pos.t
@@ -35,11 +32,12 @@ type t =
   | Rstmt            of Pos.t
   | Rno_return       of Pos.t
   | Rno_return_async of Pos.t
-  | Rasync_ret       of Pos.t
+  | Rret_fun_kind    of Pos.t * Ast.fun_kind
   | Rhint            of Pos.t
   | Rnull_check      of Pos.t
   | Rnot_in_cstr     of Pos.t
   | Rthrow           of Pos.t
+  | Rplaceholder     of Pos.t
   | Rattr            of Pos.t
   | Rxhp             of Pos.t
   | Rret_div         of Pos.t
@@ -55,8 +53,12 @@ type t =
   | Rdynamic_yield   of Pos.t * Pos.t * string * string
   | Rmap_append      of Pos.t
   | Rvar_param       of Pos.t
+  | Runpack_param    of Pos.t
   | Rinstantiate     of t * string * t
   | Rarray_filter    of Pos.t * t
+  | Rtype_access     of t * string list * t
+  | Rexpr_dep_type   of t * Pos.t * string
+  | Rnullsafe_op     of Pos.t (* ?-> operator is used *)
 
 (* Translate a reason to a (pos, string) list, suitable for error_l. This
  * previously returned a string, however the need to return multiple lines with
@@ -73,7 +75,6 @@ let rec to_string prefix r =
   | Rforeach         _ -> [(p, prefix ^ " because this is used in a foreach statement")]
   | Rasyncforeach    _ -> [(p, prefix ^ " because this is used in a foreach statement with \"await as\"")]
   | Raccess          _ -> [(p, prefix ^ " because one of its elements is accessed")]
-  | Rcall            _ -> [(p, prefix ^ " because this is used as a function")]
   | Rarith           _ -> [(p, prefix ^ " because this is used in an arithmetic operation")]
   | Rarith_ret       _ -> [(p, prefix ^ " because this is the result of an arithmetic operation")]
   | Rstring2         _ -> [(p, prefix ^ " because this is used in a string")]
@@ -87,11 +88,17 @@ let rec to_string prefix r =
   | Rstmt            _ -> [(p, prefix ^ " because this is a statement")]
   | Rno_return       _ -> [(p, prefix ^ " because this function implicitly returns void")]
   | Rno_return_async _ -> [(p, prefix ^ " because this async function implicitly returns Awaitable<void>")]
-  | Rasync_ret       _ -> [(p, prefix ^ " (result of 'async function')")]
+  | Rret_fun_kind    (_, kind) ->
+    [(p, match kind with
+      | Ast.FAsyncGenerator -> prefix ^ " (result of 'async function' containing a 'yield')"
+      | Ast.FGenerator -> prefix ^ " (result of function containing a 'yield')"
+      | Ast.FAsync -> prefix ^ " (result of 'async function')"
+      | Ast.FSync -> prefix)]
   | Rhint            _ -> [(p, prefix)]
   | Rnull_check      _ -> [(p, prefix ^ " because this was checked to see if the value was null")]
   | Rnot_in_cstr     _ -> [(p, prefix ^ " because it is not always defined in __construct")]
   | Rthrow           _ -> [(p, prefix ^ " because it is used as an exception")]
+  | Rplaceholder     _ -> [(p, prefix ^ " ($_ is a placeholder variable not meant to be used)")]
   | Rattr            _ -> [(p, prefix ^ " because it is used in an attribute")]
   | Rxhp             _ -> [(p, prefix ^ " because it is used as an XML element")]
   | Rret_div         _ -> [(p, prefix ^ " because it is the result of a division (/)")]
@@ -100,7 +107,9 @@ let rec to_string prefix r =
   | Ryield_asyncnull _ -> [(p, prefix ^ " because \"yield x\" is equivalent to \"yield null => x\" in an async function")]
   | Ryield_send      _ -> [(p, prefix ^ " ($generator->send() can always send a null back to a \"yield\")")]
   | Rvar_param       _ -> [(p, prefix ^ " (variadic argument)")]
-  | Rcoerced     (p1, p2, s)  ->
+  | Runpack_param    _ -> [(p, prefix ^ " (it is unpacked with '...')")]
+  | Rnullsafe_op     _ -> [(p, prefix ^ " (use of ?-> operator)")]
+  | Rcoerced     (_, p2, s)  ->
       [
         (p, prefix);
         (p2, "It was implicitly typed as "^s^" during this operation")
@@ -125,7 +134,7 @@ let rec to_string prefix r =
   | Rdynamic_yield (_, yield_pos, implicit_name, yield_name) ->
       [(p, prefix ^ (Printf.sprintf
         "\n%s\nDynamicYield implicitly defines %s() from the definition of %s()"
-        (Pos.string yield_pos)
+        (Pos.string (Pos.to_absolute yield_pos))
         implicit_name
         yield_name))]
   | Rmap_append _ ->
@@ -136,9 +145,21 @@ let rec to_string prefix r =
         (to_string ("  via this generic " ^ generic_name) r_inst)
   | Rarray_filter (_, r) ->
       (to_string prefix r) @
-      [(p, "Single argument array_filter converts KeyedContainer<Tk, ?Tv> to \
-      array<Tk, Tv>, and Container<?Tv> to array<mixed, Tv>")]
-
+      [(p, "array_filter converts KeyedContainer<Tk, Tv> to \
+      array<Tk, Tv>, and Container<Tv> to array<arraykey, Tv>. \
+      Single argument calls additionally remove nullability from Tv.")]
+  | Rtype_access (r_orig, expansions, r_expanded) ->
+      (to_string prefix r_orig) @
+      (to_string
+        ("  resulting from expanding a type constant as follows:\n    "
+        ^String.concat " -> " expansions)
+        r_expanded
+      )
+  | Rexpr_dep_type (r, p, n) ->
+      let l = (to_string prefix r) in
+      List.hd l
+        :: (p, "  where '"^n^"' is a reference to this expression")
+        :: List.tl l
 
 and to_pos = function
   | Rnone     -> Pos.none
@@ -150,7 +171,6 @@ and to_pos = function
   | Rforeach     p -> p
   | Rasyncforeach p -> p
   | Raccess   p -> p
-  | Rcall        p -> p
   | Rarith       p -> p
   | Rarith_ret   p -> p
   | Rstring2     p -> p
@@ -164,11 +184,12 @@ and to_pos = function
   | Rstmt        p -> p
   | Rno_return   p -> p
   | Rno_return_async p -> p
-  | Rasync_ret   p -> p
+  | Rret_fun_kind (p, _) -> p
   | Rhint        p -> p
   | Rnull_check  p -> p
   | Rnot_in_cstr p -> p
   | Rthrow       p -> p
+  | Rplaceholder p -> p
   | Rattr        p -> p
   | Rxhp         p -> p
   | Rret_div     p -> p
@@ -184,8 +205,12 @@ and to_pos = function
   | Rdynamic_yield (p, _, _, _) -> p
   | Rmap_append p -> p
   | Rvar_param p -> p
+  | Runpack_param p -> p
   | Rinstantiate (_, _, r) -> to_pos r
   | Rarray_filter (p, _) -> p
+  | Rtype_access (r, _, _) -> to_pos r
+  | Rexpr_dep_type (r, _, _) -> to_pos r
+  | Rnullsafe_op p -> p
 
 type ureason =
   | URnone
@@ -285,6 +310,13 @@ let none = Rnone
 (* When the subtyping fails because of a constraint. *)
 (*****************************************************************************)
 
-let explain_generic_constraint reason name error =
-  let pos = to_pos reason in
-  Errors.explain_constraint pos name error
+let explain_generic_constraint p_inst reason name error =
+  match reason with
+  | Rexpr_dep_type _ ->
+      let msgl =
+        to_string ("Considering the constraint on '"^name^"'") reason in
+      Errors.explain_type_constant msgl error
+  | Rtype_access (_, _, reason)
+  | reason ->
+      let pos = to_pos reason in
+      Errors.explain_constraint p_inst pos name error

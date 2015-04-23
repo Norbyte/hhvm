@@ -20,48 +20,41 @@
 #include "hphp/runtime/base/apc-array.h"
 #include "hphp/runtime/base/apc-object.h"
 #include "hphp/runtime/base/mixed-array.h"
-#include "hphp/runtime/ext/ext_apc.h"
+#include "hphp/runtime/ext/apc/ext_apc.h"
 
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
 
-APCHandle* APCHandle::Create(const Variant& source,
-                             size_t& size,
-                             bool serialized,
-                             bool inner /* = false */,
-                             bool unserializeObj /* = false */) {
+APCHandle::Pair APCHandle::Create(const Variant& source,
+                                  bool serialized,
+                                  bool inner /* = false */,
+                                  bool unserializeObj /* = false */) {
   auto type = source.getType(); // this gets rid of the ref, if it was one
   switch (type) {
-    case KindOfBoolean: {
-      auto value = new APCTypedValue(type,
-          static_cast<int64_t>(source.getBoolean()));
-      size = sizeof(APCTypedValue);
-      return value->getHandle();
-    }
-    case KindOfInt64: {
-      auto value = new APCTypedValue(type, source.getInt64());
-      size = sizeof(APCTypedValue);
-      return value->getHandle();
-    }
-    case KindOfDouble: {
-      auto value = new APCTypedValue(type, source.getDouble());
-      size = sizeof(APCTypedValue);
-      return value->getHandle();
-    }
     case KindOfUninit:
     case KindOfNull: {
       auto value = new APCTypedValue(type);
-      size = sizeof(APCTypedValue);
-      return value->getHandle();
+      return {value->getHandle(), sizeof(APCTypedValue)};
     }
-
+    case KindOfBoolean: {
+      auto value = new APCTypedValue(type,
+          static_cast<int64_t>(source.getBoolean()));
+      return {value->getHandle(), sizeof(APCTypedValue)};
+    }
+    case KindOfInt64: {
+      auto value = new APCTypedValue(type, source.getInt64());
+      return {value->getHandle(), sizeof(APCTypedValue)};
+    }
+    case KindOfDouble: {
+      auto value = new APCTypedValue(type, source.getDouble());
+      return {value->getHandle(), sizeof(APCTypedValue)};
+    }
     case KindOfStaticString: {
       if (serialized) goto StringCase;
 
       auto value = new APCTypedValue(type, source.getStringData());
-      size = sizeof(APCTypedValue);
-      return value->getHandle();
+      return {value->getHandle(), sizeof(APCTypedValue)};
     }
 StringCase:
     case KindOfString: {
@@ -69,105 +62,102 @@ StringCase:
       if (serialized) {
         // It is priming, and there might not be the right class definitions
         // for unserialization.
-        return APCObject::MakeShared(apc_reserialize(s), size);
+        return APCObject::MakeSharedObj(apc_reserialize(s));
       }
 
       auto const st = lookupStaticString(s);
       if (st) {
         APCTypedValue* value = new APCTypedValue(KindOfStaticString, st);
-        size = sizeof(APCTypedValue);
-        return value->getHandle();
+        return {value->getHandle(), sizeof(APCTypedValue)};
       }
 
       assert(!s->isStatic()); // would've been handled above
       if (!inner && apcExtension::UseUncounted) {
         StringData* st = StringData::MakeUncounted(s->slice());
         APCTypedValue* value = new APCTypedValue(st);
-        size = sizeof(APCTypedValue) + st->size();
-        return value->getHandle();
+        return {value->getHandle(), st->size() + sizeof(APCTypedValue)};
       }
-      return APCString::MakeShared(type, s, size);
+      return APCString::MakeSharedString(type, s);
     }
 
     case KindOfArray:
-      return APCArray::MakeShared(source.getArrayData(),
-                                  size,
-                                  inner,
-                                  unserializeObj);
+      return APCArray::MakeSharedArray(source.getArrayData(), inner,
+                                       unserializeObj);
+
+    case KindOfObject:
+      return unserializeObj ? APCObject::Construct(source.getObjectData()) :
+             APCObject::MakeSharedObj(apc_serialize(source));
 
     case KindOfResource:
       // TODO Task #2661075: Here and elsewhere in the runtime, we convert
       // Resources to the empty array during various serialization operations,
       // which does not match Zend behavior. We should fix this.
-      size = sizeof(APCArray);
-      return APCArray::MakeShared();
+      return APCArray::MakeSharedEmptyArray();
 
-    case KindOfObject:
-      return unserializeObj ?
-          APCObject::Construct(source.getObjectData(), size) :
-          APCObject::MakeShared(apc_serialize(source), size);
-
-    default:
-      return nullptr;
+    case KindOfRef:
+    case KindOfClass:
+      return {nullptr, 0};
   }
+  not_reached();
 }
 
 Variant APCHandle::toLocal() const {
   switch (m_type) {
+    case KindOfUninit:
+    case KindOfNull:
+      return init_null(); // shortcut.. no point to forward
     case KindOfBoolean:
       return APCTypedValue::fromHandle(this)->getBoolean();
     case KindOfInt64:
       return APCTypedValue::fromHandle(this)->getInt64();
     case KindOfDouble:
       return APCTypedValue::fromHandle(this)->getDouble();
-    case KindOfUninit:
-    case KindOfNull:
-      return init_null(); // shortcut.. no point to forward
     case KindOfStaticString:
       return APCTypedValue::fromHandle(this)->getStringData();
-
     case KindOfString:
       return APCString::MakeString(this);
-
     case KindOfArray:
       return APCArray::MakeArray(this);
-
     case KindOfObject:
       return APCObject::MakeObject(this);
-
-    default:
-      assert(false);
-      return init_null();
+    case KindOfResource:
+    case KindOfRef:
+    case KindOfClass:
+      break;
   }
+  not_reached();
 }
 
 void APCHandle::deleteShared() {
   assert(!isUncounted());
   switch (m_type) {
+    case KindOfUninit:
+    case KindOfNull:
     case KindOfBoolean:
     case KindOfInt64:
     case KindOfDouble:
-    case KindOfUninit:
-    case KindOfNull:
     case KindOfStaticString:
       delete APCTypedValue::fromHandle(this);
-      break;
+      return;
 
     case KindOfString:
       delete APCString::fromHandle(this);
-      break;
+      return;
 
     case KindOfArray:
       APCArray::Delete(this);
-      break;
+      return;
 
     case KindOfObject:
       APCObject::Delete(this);
-      break;
+      return;
 
-    default:
-      assert(false);
+    case KindOfResource:
+    case KindOfRef:
+    case KindOfClass:
+      break;
   }
+  not_reached();
 }
 
 //////////////////////////////////////////////////////////////////////

@@ -113,17 +113,17 @@ string at the PHP level).
   Uninit         | `KindOfUninit`
   InitNull       | `KindOfNull`
   Null           | `{Uninit+InitNull}`
-  Bool           | `false=0`, `true=1` (actual bit width varies)
+  Bool           | `false=0`, `true=1` (8 bits at runtime)
   Int            | `int64_t` (64-bit twos compliment binary integer)
   Dbl            | `double` (IEEE 754 64-bit binary floating point)
   StaticStr      | `StringData*` where `isStatic() == true`
   CountedStr     | `StringData*` where `isStatic() == false`
-  UncountedInit  | `TypedValue`: `{Null+Bool+Int+Dbl+StaticStr+StaticArr}`
-  Uncounted      | `TypedValue`: `{Uninit+Null+Bool+Int+Dbl+StaticStr+StaticArr}`
   Str            | `StringData*` `{CountedStr+StaticStr}`
   StaticArr      | `ArrayData*` where `isStatic() == true`
   CountedArr     | `ArrayData*` where `isStatic() == false`
   Arr            | `ArrayData*` `{CountedArr+StaticArr}`
+  UncountedInit  | `TypedValue`: `{Null+Bool+Int+Dbl+StaticStr+StaticArr}`
+  Uncounted      | `TypedValue`: `{Uninit+Null+Bool+Int+Dbl+StaticStr+StaticArr}`
   Obj            | `ObjectData*`
   Obj<Class>     | `ObjectData*` of the specific type Class
   Counted        | `{CountedStr+CountedArr+Obj+BoxedCell}`
@@ -172,7 +172,7 @@ be on the VM evaluation stack: all PHP-visible types plus the runtime-internal
 
   Type          | HHVM representation
   --------------|--------------------
-  StackElem     | `{Gen+Cls}`
+  StkElem       | `{Gen+Cls}`
 
 ### Values, Instructions, and Blocks
 

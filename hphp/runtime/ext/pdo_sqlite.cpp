@@ -16,9 +16,11 @@
 */
 
 #include "hphp/runtime/ext/pdo_sqlite.h"
-#include "hphp/runtime/ext/ext_function.h"
+#include "hphp/runtime/ext/sqlite3/ext_sqlite3.h"
+#include "hphp/runtime/ext/std/ext_std_function.h"
 #include "hphp/runtime/ext/stream/ext_stream.h"
-#include "hphp/runtime/ext/ext_sqlite3.h"
+#include "hphp/runtime/base/comparisons.h"
+#include "hphp/runtime/base/file.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include <sqlite3.h>
 
@@ -39,7 +41,7 @@ public:
   virtual bool fetcher(PDOFetchOrientation ori, long offset);
   virtual bool describer(int colno);
   virtual bool getColumn(int colno, Variant &value);
-  virtual bool paramHook(PDOBoundParam *param, PDOParamEvent event_type);
+  virtual bool paramHook(PDOBoundParam* param, PDOParamEvent event_type);
   virtual bool getColumnMeta(int64_t colno, Array &return_value);
   virtual bool cursorCloser();
 
@@ -117,15 +119,6 @@ bool PDOSqliteConnection::create(const Array& options) {
   return true;
 }
 
-void PDOSqliteConnection::sweep() {
-  for (auto& udf : m_udfs) {
-    udf->func.asTypedValue()->m_type = KindOfNull;
-    udf->step.asTypedValue()->m_type = KindOfNull;
-    udf->fini.asTypedValue()->m_type = KindOfNull;
-  }
-  PDOConnection::sweep();
-}
-
 bool PDOSqliteConnection::support(SupportedMethod method) {
   return method != MethodCheckLiveness;
 }
@@ -189,8 +182,7 @@ bool PDOSqliteConnection::preparer(const String& sql, sp_PDOStatement *stmt,
   if (sqlite3_prepare(m_db, sql.data(), sql.size(), &rawstmt, &tail)
       == SQLITE_OK) {
 
-    PDOSqliteStatement *s = NEWOBJ(PDOSqliteStatement)(m_db, rawstmt);
-    *stmt = s;
+    *stmt = makeSmartPtr<PDOSqliteStatement>(m_db, rawstmt);
     return true;
   }
 
@@ -212,7 +204,7 @@ bool PDOSqliteConnection::quoter(const String& input, String &quoted,
                                  PDOParamType paramtype) {
   int len = 2 * input.size() + 3;
   String s(len, ReserveString);
-  char *buf = s.bufferSlice().ptr;
+  char *buf = s.mutableData();
   sqlite3_snprintf(len, buf, "'%q'", input.data());
   quoted = s.setSize(strlen(buf));
   return true;
@@ -281,10 +273,6 @@ int PDOSqliteConnection::getAttribute(int64_t attr, Variant &value) {
   return true;
 }
 
-void PDOSqliteConnection::persistentShutdown() {
-  // do nothing
-}
-
 // hidden in ext/ext_sqlite.cpp
 void php_sqlite3_callback_func(sqlite3_context* context, int argc,
                                sqlite3_value** argv);
@@ -292,22 +280,52 @@ void php_sqlite3_callback_func(sqlite3_context* context, int argc,
 bool PDOSqliteConnection::createFunction(const String& name,
                                          const Variant& callback,
                                          int argcount) {
-  if (!f_is_callable(callback)) {
+  if (!HHVM_FN(is_callable)(callback)) {
     raise_warning("function '%s' is not callable", callback.toString().data());
     return false;
   }
 
-  auto udf = std::make_shared<c_SQLite3::UserDefinedFunc>();
-  auto stat = sqlite3_create_function(m_db, name.data(), argcount, SQLITE_UTF8,
-                                      udf.get(), php_sqlite3_callback_func,
+  auto udf = std::make_shared<UDF>();
+
+  udf->func = callback;
+  udf->argc = argcount;
+  udf->name = name.toCppString();
+
+  auto stat = sqlite3_create_function(m_db, udf->name.c_str(), argcount,
+                                      SQLITE_UTF8, udf.get(),
+                                      php_sqlite3_callback_func,
                                       nullptr, nullptr);
   if (stat != SQLITE_OK) {
     return false;
   }
-  udf->func = callback;
-  udf->argc = argcount;
   m_udfs.push_back(udf);
+
   return true;
+}
+
+void PDOSqliteConnection::clearFunctions() {
+  for (auto& udf : m_udfs) {
+    sqlite3_create_function(m_db, udf->name.data(), 0, SQLITE_UTF8,
+                            nullptr, nullptr, nullptr, nullptr);
+  }
+  m_udfs.clear();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+void PDOSqliteResource::sweep() {
+  for (auto& udf : conn()->m_udfs) {
+    udf->func.releaseForSweep();
+    udf->step.releaseForSweep();
+    udf->fini.releaseForSweep();
+  }
+  PDOResource::sweep();
+}
+
+void PDOSqliteResource::persistentSave() {
+  conn()->clearFunctions();
+
+  PDOResource::persistentSave();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -340,7 +358,9 @@ bool PDOSqliteStatement::support(SupportedMethod method) {
 }
 
 int PDOSqliteStatement::handleError(const char *file, int line) {
-  PDOSqliteConnection *conn = dynamic_cast<PDOSqliteConnection*>(dbh.get());
+  auto rsrc = unsafe_cast<PDOSqliteResource>(dbh);
+  assert(rsrc);
+  auto conn = rsrc->conn();
   assert(conn);
   return conn->handleError(file, line, this);
 }
@@ -412,11 +432,11 @@ bool PDOSqliteStatement::describer(int colno) {
 
   if (columns.empty()) {
     for (int i = 0; i < column_count; i++) {
-      columns.set(i, Resource(NEWOBJ(PDOColumn)));
+      columns.set(i, Variant(makeSmartPtr<PDOColumn>()));
     }
   }
 
-  PDOColumn *col = columns[colno].toResource().getTyped<PDOColumn>();
+  auto col = cast<PDOColumn>(columns[colno]);
   col->name = String(sqlite3_column_name(m_stmt, colno), CopyString);
   col->maxlen = 0xffffffff;
   col->precision = 0;
@@ -467,7 +487,7 @@ bool PDOSqliteStatement::getColumn(int colno, Variant &value) {
   return true;
 }
 
-bool PDOSqliteStatement::paramHook(PDOBoundParam *param,
+bool PDOSqliteStatement::paramHook(PDOBoundParam* param,
                                    PDOParamEvent event_type) {
   switch (event_type) {
   case PDO_PARAM_EVT_EXEC_PRE:
@@ -510,7 +530,8 @@ bool PDOSqliteStatement::paramHook(PDOBoundParam *param,
 
       case PDO_PARAM_LOB:
         if (param->parameter.isResource()) {
-          Variant buf = f_stream_get_contents(param->parameter.toResource());
+          Variant buf = HHVM_FN(stream_get_contents)(
+                        param->parameter.toResource());
           if (!same(buf, false)) {
             param->parameter = buf;
           } else {
@@ -616,12 +637,11 @@ bool PDOSqliteStatement::cursorCloser() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-PDOSqlite::PDOSqlite() : PDODriver("sqlite") {
-}
+PDOSqlite::PDOSqlite() : PDODriver("sqlite") {}
 
-PDOConnection *PDOSqlite::createConnectionObject() {
-  // Doesn't use NEWOBJ because PDOConnection is malloced
-  return new PDOSqliteConnection();
+SmartPtr<PDOResource> PDOSqlite::createResourceImpl() {
+  return makeSmartPtr<PDOSqliteResource>(
+    std::make_shared<PDOSqliteConnection>());
 }
 
 ///////////////////////////////////////////////////////////////////////////////

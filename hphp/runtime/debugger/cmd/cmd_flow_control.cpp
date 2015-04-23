@@ -18,6 +18,7 @@
 
 #include <algorithm>
 
+#include "hphp/runtime/debugger/debugger_client.h"
 #include "hphp/runtime/vm/debugger-hook.h"
 #include "hphp/runtime/vm/vm-regs.h"
 
@@ -86,7 +87,8 @@ bool CmdFlowControl::onServer(DebuggerProxy &proxy) {
 void CmdFlowControl::installLocationFilterForLine(InterruptSite *site) {
   // We may be stopped at a place with no source info.
   if (!site || !site->valid()) return;
-  g_context->m_flowFilter.clear();
+  RequestInjectionData &rid = ThreadInfo::s_threadInfo->m_reqInjectionData;
+  rid.m_flowFilter.clear();
   TRACE(3, "Prepare location filter for %s:%d, unit %p:\n",
         site->getFile(), site->getLine0(), site->getUnit());
   OffsetRangeVec ranges;
@@ -113,15 +115,15 @@ void CmdFlowControl::installLocationFilterForLine(InterruptSite *site) {
              (op != OpAwait) &&
              (op != OpRetC);
     };
-    g_context->m_flowFilter.addRanges(unit, ranges,
+    rid.m_flowFilter.addRanges(unit, ranges,
                                       excludeResumableReturns);
   } else {
-    g_context->m_flowFilter.addRanges(unit, ranges);
+    rid.m_flowFilter.addRanges(unit, ranges);
   }
 }
 
 void CmdFlowControl::removeLocationFilter() {
-  g_context->m_flowFilter.clear();
+  ThreadInfo::s_threadInfo->m_reqInjectionData.m_flowFilter.clear();
 }
 
 bool CmdFlowControl::hasStepOuts() {
@@ -212,7 +214,7 @@ void CmdFlowControl::cleanupStepOuts() {
 // a StepDestination is constructed then it will not remove the
 // breakpoint when it is destructed. The move assignment operator
 // handles the transfer of ownership, and we delete the copy
-// constructor/assignment operators explictly to ensure no two
+// constructor/assignment operators explicitly to ensure no two
 // StepDestinations believe they can remove the same internal
 // breakpoint.
 //

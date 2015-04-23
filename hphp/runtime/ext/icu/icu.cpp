@@ -19,7 +19,7 @@
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/request-event-handler.h"
 #include "hphp/util/string-vsnprintf.h"
-#include "hphp/runtime/ext/ext_datetime.h"
+#include "hphp/runtime/ext/datetime/ext_datetime.h"
 
 #include <unicode/uloc.h>
 
@@ -37,6 +37,8 @@ void IntlError::setError(UErrorCode code, const char *format, ...) {
     va_start(args, format);
     string_vsnprintf(m_errorMessage, format, args);
     va_end(args);
+  } else {
+    m_errorMessage.clear();
   }
 
   if (this != s_intl_error.get()) {
@@ -58,34 +60,34 @@ void IntlError::clearError(bool clearGlobalError /*= true */) {
 /////////////////////////////////////////////////////////////////////////////
 // INI Setting
 
-/* gcc 4.7 doesn't support thread_locale storage
- * required for dynamic initializers (like std::string)
- * So wrap it up in a RequestEventHandler until we set
- * gcc 4.8 as our minimum version
- */
-struct DefaultLocale final : RequestEventHandler {
-  void requestInit() override {}
-  void requestShutdown() override {}
-  std::string m_defaultLocale;
-};
-IMPLEMENT_STATIC_REQUEST_LOCAL(DefaultLocale, s_default_locale);
+static __thread std::string* s_defaultLocale;
 
 void IntlExtension::bindIniSettings() {
+  // TODO: t5226715 We shouldn't need to check s_defaultLocale here,
+  // but right now this is called for every request.
+  if (s_defaultLocale) return;
+  s_defaultLocale = new std::string;
   IniSetting::Bind(this, IniSetting::PHP_INI_ALL,
                    "intl.default_locale", "",
-                   &s_default_locale->m_defaultLocale);
+                   s_defaultLocale);
+}
+
+void IntlExtension::threadShutdown() {
+  delete s_defaultLocale;
+  s_defaultLocale = nullptr;
 }
 
 const String GetDefaultLocale() {
-  String locale(s_default_locale->m_defaultLocale);
-  if (locale.empty()) {
-    locale = String(uloc_getDefault(), CopyString);
+  assert(s_defaultLocale);
+  if (s_defaultLocale->empty()) {
+    return String(uloc_getDefault(), CopyString);
   }
-  return locale;
+  return *s_defaultLocale;
 }
 
 bool SetDefaultLocale(const String& locale) {
-  s_default_locale->m_defaultLocale = locale.toCppString();
+  assert(s_defaultLocale);
+  *s_defaultLocale = locale.toCppString();
   return true;
 }
 
@@ -107,6 +109,150 @@ void IntlExtension::bindConstants() {
 #endif
   Native::registerConstant<KindOfString>(s_INTL_ICU_VERSION.get(),
                                          s_U_ICU_VERSION.get());
+
+  // UErrorCode constants
+#define UERRCODE(cns) \
+  Native::registerConstant<KindOfInt64>(makeStaticString(#cns), cns)
+  UERRCODE(U_AMBIGUOUS_ALIAS_WARNING);
+  UERRCODE(U_BAD_VARIABLE_DEFINITION);
+  UERRCODE(U_BRK_ASSIGN_ERROR);
+  UERRCODE(U_BRK_ERROR_LIMIT);
+  UERRCODE(U_BRK_ERROR_START);
+  UERRCODE(U_BRK_HEX_DIGITS_EXPECTED);
+  UERRCODE(U_BRK_INIT_ERROR);
+  UERRCODE(U_BRK_INTERNAL_ERROR);
+  UERRCODE(U_BRK_MALFORMED_RULE_TAG);
+  UERRCODE(U_BRK_MISMATCHED_PAREN);
+  UERRCODE(U_BRK_NEW_LINE_IN_QUOTED_STRING);
+  UERRCODE(U_BRK_RULE_EMPTY_SET);
+  UERRCODE(U_BRK_RULE_SYNTAX);
+  UERRCODE(U_BRK_SEMICOLON_EXPECTED);
+  UERRCODE(U_BRK_UNCLOSED_SET);
+  UERRCODE(U_BRK_UNDEFINED_VARIABLE);
+  UERRCODE(U_BRK_UNRECOGNIZED_OPTION);
+  UERRCODE(U_BRK_VARIABLE_REDFINITION);
+  UERRCODE(U_BUFFER_OVERFLOW_ERROR);
+  UERRCODE(U_CE_NOT_FOUND_ERROR);
+  UERRCODE(U_COLLATOR_VERSION_MISMATCH);
+  UERRCODE(U_DIFFERENT_UCA_VERSION);
+  UERRCODE(U_ENUM_OUT_OF_SYNC_ERROR);
+  UERRCODE(U_ERROR_LIMIT);
+  UERRCODE(U_ERROR_WARNING_LIMIT);
+  UERRCODE(U_ERROR_WARNING_START);
+  UERRCODE(U_FILE_ACCESS_ERROR);
+  UERRCODE(U_FMT_PARSE_ERROR_LIMIT);
+  UERRCODE(U_FMT_PARSE_ERROR_START);
+  UERRCODE(U_ILLEGAL_ARGUMENT_ERROR);
+  UERRCODE(U_ILLEGAL_CHARACTER);
+  UERRCODE(U_ILLEGAL_CHAR_FOUND);
+  UERRCODE(U_ILLEGAL_CHAR_IN_SEGMENT);
+  UERRCODE(U_ILLEGAL_ESCAPE_SEQUENCE);
+  UERRCODE(U_ILLEGAL_PAD_POSITION);
+  UERRCODE(U_INDEX_OUTOFBOUNDS_ERROR);
+  UERRCODE(U_INTERNAL_PROGRAM_ERROR);
+  UERRCODE(U_INTERNAL_TRANSLITERATOR_ERROR);
+  UERRCODE(U_INVALID_CHAR_FOUND);
+  UERRCODE(U_INVALID_FORMAT_ERROR);
+  UERRCODE(U_INVALID_FUNCTION);
+  UERRCODE(U_INVALID_ID);
+  UERRCODE(U_INVALID_PROPERTY_PATTERN);
+  UERRCODE(U_INVALID_RBT_SYNTAX);
+  UERRCODE(U_INVALID_STATE_ERROR);
+  UERRCODE(U_INVALID_TABLE_FILE);
+  UERRCODE(U_INVALID_TABLE_FORMAT);
+  UERRCODE(U_INVARIANT_CONVERSION_ERROR);
+  UERRCODE(U_MALFORMED_EXPONENTIAL_PATTERN);
+  UERRCODE(U_MALFORMED_PRAGMA);
+  UERRCODE(U_MALFORMED_RULE);
+  UERRCODE(U_MALFORMED_SET);
+  UERRCODE(U_MALFORMED_SYMBOL_REFERENCE);
+  UERRCODE(U_MALFORMED_UNICODE_ESCAPE);
+  UERRCODE(U_MALFORMED_VARIABLE_DEFINITION);
+  UERRCODE(U_MALFORMED_VARIABLE_REFERENCE);
+  UERRCODE(U_MEMORY_ALLOCATION_ERROR);
+  UERRCODE(U_MESSAGE_PARSE_ERROR);
+  UERRCODE(U_MISMATCHED_SEGMENT_DELIMITERS);
+  UERRCODE(U_MISPLACED_ANCHOR_START);
+  UERRCODE(U_MISPLACED_COMPOUND_FILTER);
+  UERRCODE(U_MISPLACED_CURSOR_OFFSET);
+  UERRCODE(U_MISPLACED_QUANTIFIER);
+  UERRCODE(U_MISSING_OPERATOR);
+  UERRCODE(U_MISSING_RESOURCE_ERROR);
+  UERRCODE(U_MISSING_SEGMENT_CLOSE);
+  UERRCODE(U_MULTIPLE_ANTE_CONTEXTS);
+  UERRCODE(U_MULTIPLE_COMPOUND_FILTERS);
+  UERRCODE(U_MULTIPLE_CURSORS);
+  UERRCODE(U_MULTIPLE_EXPONENTIAL_SYMBOLS);
+  UERRCODE(U_MULTIPLE_PAD_SPECIFIERS);
+  UERRCODE(U_MULTIPLE_PERCENT_SYMBOLS);
+  UERRCODE(U_MULTIPLE_PERMILL_SYMBOLS);
+  UERRCODE(U_MULTIPLE_POST_CONTEXTS);
+  UERRCODE(U_NO_SPACE_AVAILABLE);
+  UERRCODE(U_NO_WRITE_PERMISSION);
+  UERRCODE(U_PARSE_ERROR);
+  UERRCODE(U_PARSE_ERROR_LIMIT);
+  UERRCODE(U_PARSE_ERROR_START);
+  UERRCODE(U_PATTERN_SYNTAX_ERROR);
+  UERRCODE(U_PRIMARY_TOO_LONG_ERROR);
+  UERRCODE(U_REGEX_BAD_ESCAPE_SEQUENCE);
+  UERRCODE(U_REGEX_BAD_INTERVAL);
+  UERRCODE(U_REGEX_ERROR_LIMIT);
+  UERRCODE(U_REGEX_ERROR_START);
+  UERRCODE(U_REGEX_INTERNAL_ERROR);
+  UERRCODE(U_REGEX_INVALID_BACK_REF);
+  UERRCODE(U_REGEX_INVALID_FLAG);
+  UERRCODE(U_REGEX_INVALID_STATE);
+  UERRCODE(U_REGEX_LOOK_BEHIND_LIMIT);
+  UERRCODE(U_REGEX_MAX_LT_MIN);
+  UERRCODE(U_REGEX_MISMATCHED_PAREN);
+  UERRCODE(U_REGEX_NUMBER_TOO_BIG);
+  UERRCODE(U_REGEX_PROPERTY_SYNTAX);
+  UERRCODE(U_REGEX_RULE_SYNTAX);
+  UERRCODE(U_REGEX_SET_CONTAINS_STRING);
+  UERRCODE(U_REGEX_UNIMPLEMENTED);
+  UERRCODE(U_RESOURCE_TYPE_MISMATCH);
+  UERRCODE(U_RULE_MASK_ERROR);
+  UERRCODE(U_SAFECLONE_ALLOCATED_WARNING);
+  UERRCODE(U_SORT_KEY_TOO_SHORT_WARNING);
+  UERRCODE(U_STANDARD_ERROR_LIMIT);
+  UERRCODE(U_STATE_OLD_WARNING);
+  UERRCODE(U_STATE_TOO_OLD_ERROR);
+  UERRCODE(U_STRING_NOT_TERMINATED_WARNING);
+  UERRCODE(U_TOO_MANY_ALIASES_ERROR);
+  UERRCODE(U_TRAILING_BACKSLASH);
+  UERRCODE(U_TRUNCATED_CHAR_FOUND);
+  UERRCODE(U_UNCLOSED_SEGMENT);
+  UERRCODE(U_UNDEFINED_SEGMENT_REFERENCE);
+  UERRCODE(U_UNDEFINED_VARIABLE);
+  UERRCODE(U_UNEXPECTED_TOKEN);
+  UERRCODE(U_UNMATCHED_BRACES);
+  UERRCODE(U_UNQUOTED_SPECIAL);
+  UERRCODE(U_UNSUPPORTED_ATTRIBUTE);
+  UERRCODE(U_UNSUPPORTED_ERROR);
+  UERRCODE(U_UNSUPPORTED_ESCAPE_SEQUENCE);
+  UERRCODE(U_UNSUPPORTED_PROPERTY);
+  UERRCODE(U_UNTERMINATED_QUOTE);
+  UERRCODE(U_USELESS_COLLATOR_ERROR);
+  UERRCODE(U_USING_DEFAULT_WARNING);
+  UERRCODE(U_USING_FALLBACK_WARNING);
+  UERRCODE(U_VARIABLE_RANGE_EXHAUSTED);
+  UERRCODE(U_VARIABLE_RANGE_OVERLAP);
+  UERRCODE(U_ZERO_ERROR);
+
+  // Legacy constants
+#ifndef U_STRINGPREP_PROHIBITED_ERROR
+# define U_STRINGPREP_PROHIBITED_ERROR 66560
+#endif
+#ifndef U_STRINGPREP_UNASSIGNED_ERROR
+# define U_STRINGPREP_UNASSIGNED_ERROR 66561
+#endif
+#ifndef U_STRINGPREP_CHECK_BIDI_ERROR
+# define U_STRINGPREP_CHECK_BIDI_ERROR 66562
+#endif
+  UERRCODE(U_STRINGPREP_PROHIBITED_ERROR);
+  UERRCODE(U_STRINGPREP_UNASSIGNED_ERROR);
+  UERRCODE(U_STRINGPREP_CHECK_BIDI_ERROR);
+#undef UERRCODE
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -172,7 +318,7 @@ double VariantToMilliseconds(const Variant& arg) {
   if (arg.isObject() &&
       arg.toObject()->instanceof(SystemLib::s_DateTimeInterfaceClass)) {
     return U_MILLIS_PER_SECOND *
-           (double) c_DateTime::GetTimestamp(arg.toObject());
+           (double) DateTimeData::getTimestamp(arg.toObject());
   }
   // TODO: Handle object IntlCalendar
   return NAN;

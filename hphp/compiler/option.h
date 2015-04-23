@@ -19,7 +19,7 @@
 
 #include "hphp/util/hdf.h"
 
-#include "folly/dynamic.h"
+#include <folly/dynamic.h>
 
 #include <map>
 #include <set>
@@ -114,6 +114,7 @@ public:
   static bool PostOptimization;
   static bool AnalyzePerfectVirtuals;
   static bool HardTypeHints;
+  static bool HardReturnTypeHints;
 
   /*
    * Flags that only affect HHBBC right now.  See hhbbc/hhbbc.h for
@@ -267,7 +268,6 @@ public:
   static bool RecordErrors;
   static std::string DocJson; // filename to dump doc JSON to
 
-  static bool (*PersistenceHook)(BlockScopeRawPtr scope, FileScopeRawPtr fs);
 private:
   static StringBag OptionStrings;
 

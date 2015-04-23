@@ -39,7 +39,7 @@ bool match(const IRInstruction* inst, Opcode op, Args... args) {
 
 template<typename... Args>
 bool match(const IRInstruction* inst, Type type, Args... args) {
-  return (inst->hasTypeParam() && inst->typeParam().equals(type)) &&
+  return (inst->hasTypeParam() && inst->typeParam() == type) &&
     match(inst, std::forward<Args>(args)...);
 }
 
@@ -57,8 +57,10 @@ bool match(const IRInstruction* inst, SSATmp* hd, SSATmps... tl) {
   auto tmpsSame = [] (const SSATmp* expected, const SSATmp* actual) {
     // If a tmp is expected to have a constant value, identity comparison (i.e.
     // by pointer) is too restrictive; compare the constant values.
-    if (expected->isConst()) {
-      return expected->type().equals(actual->type());
+    auto const type = expected->type();
+    if (type.hasConstVal() ||
+        type.subtypeOfAny(TUninit, TInitNull, TNullptr)) {
+      return type == actual->type();
     }
     return expected == actual;
   };

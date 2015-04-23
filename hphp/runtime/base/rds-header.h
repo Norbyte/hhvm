@@ -23,11 +23,12 @@
 #include "hphp/runtime/base/rds.h"
 #include "hphp/runtime/base/types.h"
 #include "hphp/runtime/vm/bytecode.h"
+#include "hphp/runtime/vm/minstr-state.h"
 
 namespace HPHP {
 
 /*
- * Do not access this struct directly from RDS::header(). Use the accessors in
+ * Do not access this struct directly from rds::header(). Use the accessors in
  * runtime/vm/vm-regs.h.
  */
 struct VMRegs {
@@ -44,11 +45,22 @@ struct VMRegs {
    * bytecode instruction. */
   PC pc;
 
+  /* Scratch space for use by member instructions. */
+  MInstrState mInstrState;
+
   /* First ActRec of this VM instance. */
   ActRec* firstAR;
+
+  /* If the current VM nesting level is dispatchBB() as called by
+   * MCGenerator::handleResume(), this is set to what vmfp() was on the first
+   * entry to dispatchBB(). Otherwise, it's nullptr. See jitReturnPre() and
+   * jitReturnPost() in bytecode.cpp for usage. Note that we will have at most
+   * one active call to handleResume() in each VM nesting level, which is why
+   * this is just a single pointer. */
+  ActRec* jitCalledFrame;
 };
 
-namespace RDS {
+namespace rds {
 
 /*
  * Statically layed-out header that goes at the front of RDS.
@@ -59,12 +71,10 @@ struct Header {
    * points, the runtime will check whether this word is non-zero, and
    * if so go to a slow path to handle unusual conditions (e.g. OOM).
    */
-  std::atomic<ssize_t> conditionFlags;
+  std::atomic<ssize_t> surpriseFlags;
 
   VMRegs vmRegs;
 };
-
-static_assert(sizeof(Header) <= 64, "RDS::Header should fit in one cache line");
 
 /*
  * Access to the statically layed out header.
@@ -73,13 +83,20 @@ inline Header* header() {
   return static_cast<Header*>(tl_base);
 }
 
-constexpr ptrdiff_t kConditionFlagsOff = offsetof(Header, conditionFlags);
+constexpr ptrdiff_t kSurpriseFlagsOff  = offsetof(Header, surpriseFlags);
 constexpr ptrdiff_t kVmRegsOff         = offsetof(Header, vmRegs);
 constexpr ptrdiff_t kVmspOff           = kVmRegsOff + offsetof(VMRegs, stack) +
                                            Stack::topOfStackOffset();
 constexpr ptrdiff_t kVmfpOff           = kVmRegsOff + offsetof(VMRegs, fp);
 constexpr ptrdiff_t kVmpcOff           = kVmRegsOff + offsetof(VMRegs, pc);
 constexpr ptrdiff_t kVmFirstAROff      = kVmRegsOff + offsetof(VMRegs, firstAR);
+constexpr ptrdiff_t kVmMInstrStateOff  = kVmRegsOff +
+                                           offsetof(VMRegs, mInstrState);
+
+static_assert((kVmMInstrStateOff % 16) == 0,
+              "MInstrState should be 16-byte aligned in rds::Header");
+static_assert(kVmspOff == 16, "Eager vm-reg save in translator-asm-helpers.S");
+static_assert(kVmfpOff == 32, "Eager vm-reg save in translator-asm-helpers.S");
 
 } }
 

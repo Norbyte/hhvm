@@ -11,12 +11,16 @@
 
 function f(): void {
   switch (1) {
-  case 1:
-    if (true) {
+    case 1:
+      if (condition()) {
+        break;
+      } else {
+      }
+    case 2:
       break;
-    } else {
-    }
-  case 2:
-    break;
   }
+}
+
+function condition(): bool {
+  return true;
 }

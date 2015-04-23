@@ -21,7 +21,7 @@
 
 #include <boost/variant.hpp>
 
-#include "folly/String.h"
+#include <folly/String.h>
 
 #include "hphp/util/match.h"
 #include "hphp/runtime/vm/as-shared.h"
@@ -29,7 +29,6 @@
 #include "hphp/runtime/vm/repo-global-data.h"
 #include "hphp/runtime/base/repo-auth-type-array.h"
 #include "hphp/runtime/base/repo-auth-type-codec.h"
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/builtin-functions.h" // f_serialize
 #include "hphp/runtime/vm/unit.h"
 #include "hphp/runtime/vm/func.h"
@@ -503,14 +502,23 @@ std::string func_flag_list(const FuncInfo& finfo) {
 }
 
 
+std::string opt_attrs(AttrContext ctx, Attr attrs) {
+  auto str = attrs_to_string(ctx, attrs);
+  if (!str.empty()) str = folly::format(" [{}]", str).str();
+  return str;
+}
+
 void print_func(Output& out, const Func* func) {
   auto const finfo = find_func_info(func);
 
   if (func->isPseudoMain()) {
     out.fmtln(".main {{");
   } else {
-    out.fmtln(".function {}({}){}{{", func->name()->data(),
-      func_param_list(finfo), func_flag_list(finfo));
+    out.fmtln(".function{} {}({}){}{{",
+      opt_attrs(AttrContext::Func, func->attrs()),
+      func->name()->data(),
+      func_param_list(finfo),
+      func_flag_list(finfo));
   }
   indented(out, [&] {
     print_func_directives(out, func);
@@ -520,12 +528,6 @@ void print_func(Output& out, const Func* func) {
   out.nl();
 }
 
-std::string opt_attrs(AttrContext ctx, Attr attrs) {
-  auto str = attrs_to_string(ctx, attrs);
-  if (!str.empty()) str = folly::format(" [{}]", str).str();
-  return str;
-}
-
 std::string member_tv_initializer(Cell cell) {
   assert(cellIsPlausible(cell));
   if (cell.m_type == KindOfUninit) return "uninit";
@@ -533,6 +535,7 @@ std::string member_tv_initializer(Cell cell) {
 }
 
 void print_constant(Output& out, const PreClass::Const* cns) {
+  if (cns->isAbstract()) { return; }
   out.fmtln(".const {} = {};", cns->name()->data(),
     member_tv_initializer(cns->val()));
 }

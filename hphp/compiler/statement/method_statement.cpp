@@ -15,7 +15,7 @@
 */
 
 #include "hphp/compiler/statement/method_statement.h"
-#include "folly/Conv.h"
+#include <folly/Conv.h>
 #include <map>
 #include <set>
 #include "hphp/compiler/statement/return_statement.h"
@@ -48,7 +48,6 @@
 #include "hphp/compiler/builtin_symbols.h"
 #include "hphp/compiler/analysis/alias_manager.h"
 
-#include "hphp/runtime/base/complex-types.h"
 
 #include "hphp/parser/parser.h"
 #include "hphp/util/text-util.h"
@@ -213,7 +212,12 @@ FunctionScopePtr MethodStatement::onInitialParse(AnalysisResultConstPtr ar,
   funcScope->setParamCounts(ar, -1, -1);
 
   if (funcScope->isNative()) {
-    if (m_retTypeAnnotation) {
+    if ((m_name == "__construct") || (m_name == "__destruct")) {
+      funcScope->setReturnType(ar, Type::Null);
+      assert(!m_retTypeAnnotation ||
+             !m_retTypeAnnotation->dataType().hasValue() ||
+             (m_retTypeAnnotation->dataType() == KindOfNull));
+    } else if (m_retTypeAnnotation) {
       funcScope->setReturnType(
         ar, Type::FromDataType(m_retTypeAnnotation->dataType(), Type::Variant));
     } else {
@@ -303,6 +307,16 @@ void MethodStatement::onParseRecur(AnalysisResultConstPtr ar,
         );
       }
     }
+    if (!m_modifiers->isStatic() && classScope->isStaticUtil()) {
+      m_modifiers->parseTimeFatal(
+        Compiler::InvalidAttribute,
+        "Class %s contains non-static method %s and "
+        "therefore cannot be declared 'abstract final'",
+        classScope->getOriginalName().c_str(),
+        getOriginalName().c_str()
+      );
+    }
+
     if (isNative) {
       if (getStmts()) {
         parseTimeFatal(Compiler::InvalidAttribute,
@@ -310,9 +324,17 @@ void MethodStatement::onParseRecur(AnalysisResultConstPtr ar,
                        classScope->getOriginalName().c_str(),
                        getOriginalName().c_str());
       }
-      if (!m_retTypeAnnotation) {
+      auto is_ctordtor = (m_name == "__construct") || (m_name == "__destruct");
+      if (!m_retTypeAnnotation && !is_ctordtor) {
         parseTimeFatal(Compiler::InvalidAttribute,
                        "Native method %s::%s() must have a return type hint",
+                       classScope->getOriginalName().c_str(),
+                       getOriginalName().c_str());
+      } else if (m_retTypeAnnotation &&
+                 is_ctordtor &&
+                (m_retTypeAnnotation->dataType() != KindOfNull)) {
+        parseTimeFatal(Compiler::InvalidAttribute,
+                       "Native method %s::%s() must return void",
                        classScope->getOriginalName().c_str(),
                        getOriginalName().c_str());
       }
@@ -425,7 +447,7 @@ void MethodStatement::setSpecialMethod(ClassScopePtr classScope) {
         m_originalClassName.c_str(), m_originalName.c_str());
     }
     // Fatal if any arguments are variadic
-    if (m_params && hasRefParam()) {
+    if (m_params && getFunctionScope()->hasVariadicParam()) {
       parseTimeFatal(Compiler::InvalidMagicMethod,
                      "Method %s::%s() cannot take a variadic argument",
                      m_originalClassName.c_str(), m_originalName.c_str());
@@ -468,14 +490,11 @@ void MethodStatement::analyzeProgram(AnalysisResultPtr ar) {
   if (m_stmt) m_stmt->analyzeProgram(ar);
 
   if (ar->getPhase() == AnalysisResult::AnalyzeAll) {
-    funcScope->setParamSpecs(ar);
-
     if (Option::IsDynamicFunction(m_method, m_name) || Option::AllDynamic) {
       funcScope->setDynamic();
     }
     // TODO: this may have to expand to a concept of "virtual" functions...
     if (m_method) {
-      funcScope->disableInline();
       if (m_name.length() > 2 && m_name.substr(0,2) == "__") {
         bool magic = true;
         int paramCount = 0;
@@ -531,12 +550,6 @@ void MethodStatement::analyzeProgram(AnalysisResultPtr ar) {
           funcScope->setOverriding(Type::Variant, Type::Variant);
         }
       }
-    }
-  } else if (ar->getPhase() == AnalysisResult::AnalyzeFinal) {
-    TypePtr ret = funcScope->getReturnType();
-    if (ret && ret->isSpecificObject()) {
-      FileScopePtr fs = getFileScope();
-      if (fs) fs->addClassDependency(ar, ret->getName());
     }
   }
 }

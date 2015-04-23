@@ -23,21 +23,6 @@ namespace HPHP {
 // EH and FPI tables.
 
 template<class SerDe>
-void EHEnt::serde(SerDe& sd) {
-  sd(m_type)
-    (m_base)
-    (m_past)
-    (m_iterId)
-    (m_fault)
-    (m_itRef)
-    (m_parentIndex)
-    ;
-  if (m_type == Type::Catch) {
-    sd(m_catches);
-  }
-}
-
-template<class SerDe>
 void FPIEnt::serde(SerDe& sd) {
   sd(m_fpushOff)
     (m_fcallOff)
@@ -49,11 +34,43 @@ void FPIEnt::serde(SerDe& sd) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// ParamInfo.
+
+inline Func::ParamInfo::ParamInfo()
+  : defaultValue(make_tv<KindOfUninit>())
+{}
+
+template<class SerDe>
+inline void Func::ParamInfo::serde(SerDe& sd) {
+  sd(builtinType)
+    (funcletOff)
+    (defaultValue)
+    (phpCode)
+    (typeConstraint)
+    (variadic)
+    (userAttributes)
+    (userType)
+    ;
+}
+
+inline bool Func::ParamInfo::hasDefaultValue() const {
+  return funcletOff != InvalidAbsoluteOffset;
+}
+
+inline bool Func::ParamInfo::hasScalarDefaultValue() const {
+  return hasDefaultValue() && defaultValue.m_type != KindOfUninit;
+}
+
+inline bool Func::ParamInfo::isVariadic() const {
+  return variadic;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Func.
 
 inline void Func::validate() const {
 #ifdef DEBUG
-  assert(this && m_magic == kMagic);
+  assert(m_magic == kMagic);
 #endif
   assert(m_name != nullptr);
 }
@@ -189,7 +206,7 @@ inline bool Func::contains(Offset offset) const {
 ///////////////////////////////////////////////////////////////////////////////
 // Return type.
 
-inline DataType Func::returnType() const {
+inline MaybeDataType Func::returnType() const {
   return shared()->m_returnType;
 }
 
@@ -487,7 +504,7 @@ inline const Func::FPIEntVec& Func::fpitab() const {
 ///////////////////////////////////////////////////////////////////////////////
 // JIT data.
 
-inline RDS::Handle Func::funcHandle() const {
+inline rds::Handle Func::funcHandle() const {
   return m_cachedFunc.handle();
 }
 
@@ -538,7 +555,7 @@ inline void Func::setBaseCls(Class* baseCls) {
   m_baseCls = baseCls;
 }
 
-inline void Func::setFuncHandle(RDS::Link<Func*> l) {
+inline void Func::setFuncHandle(rds::Link<Func*> l) {
   // TODO(#2950356): This assertion fails for create_function with an existing
   // declared function named __lambda_func.
   //assert(!m_cachedFunc.valid());

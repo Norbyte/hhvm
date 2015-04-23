@@ -22,11 +22,11 @@
 #include "hphp/runtime/vm/jit/state-vector.h"
 #include "hphp/runtime/vm/jit/translator.h"
 #include "hphp/util/code-cache.h"
-#include "hphp/runtime/vm/jit/vasm-x64.h"
+#include "hphp/runtime/vm/jit/vasm.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 
 namespace HPHP { namespace jit {
-
-struct RegAllocInfo;
+///////////////////////////////////////////////////////////////////////////////
 
 enum class SyncOptions {
   kNoSyncPoint,
@@ -35,43 +35,34 @@ enum class SyncOptions {
   kSmashableAndSyncPoint,
 };
 
-typedef StateVector<IRInstruction, RegSet> LiveRegs;
-
-struct CatchInfo {
-  /* rspOffset is the number of bytes pushed on the C++ stack for the call,
-   * for functions with stack arguments. The catch trace will adjust rsp
-   * by this amount before executing the catch block */
-  Offset rspOffset;
-};
-
 // Stuff we need to preserve between blocks while generating code,
 // and address information produced during codegen.
 struct CodegenState {
-  CodegenState(const IRUnit& unit, AsmInfo* asmInfo)
-    : asmInfo(asmInfo)
-    , catches(unit, CatchInfo())
+  CodegenState(const IRUnit& unit, AsmInfo* asmInfo, CodeBlock& frozen)
+    : unit(unit)
+    , asmInfo(asmInfo)
+    , frozen(frozen)
+    , catch_offsets(unit, 0)
     , labels(unit, Vlabel())
     , locs(unit, Vloc{})
   {}
 
-  // True if this block's terminal Jmp has a desination equal to the
-  // next block in the same assmbler.
-  bool noTerminalJmp;
+  const IRUnit& unit;
 
   // Output: start/end ranges of machine code addresses of each instruction.
   AsmInfo* asmInfo;
 
-  // Used to pass information about the state of the world at native
-  // calls between cgCallHelper and cgBeginCatch.
-  StateVector<Block, CatchInfo> catches;
+  // Frozen code section, when we need to eagerly generate stubs
+  CodeBlock& frozen;
+
+  // Each catch block needs to know the number of bytes pushed at the
+  // callsite so it can fix rsp before executing the catch block.
+  StateVector<Block,Offset> catch_offsets;
 
   // Have we progressed past the guards? Used to suppress TransBCMappings until
   // we're translating code that can properly be attributed to specific
   // bytecode.
   bool pastGuards{false};
-
-  // Postponed code "points" can obtain code addresses after Vasm::finish().
-  Vmeta meta;
 
   // vasm block labels, one for each hhir block
   StateVector<Block,Vlabel> labels;
@@ -80,15 +71,12 @@ struct CodegenState {
   StateVector<SSATmp,Vloc> locs;
 };
 
-// Allocate registers and generate machine code. Mutates the global
-// singleton MCGenerator (adds code, allocates data, adds fixups).
-void genCode(IRUnit&);
+// Generate machine code; converts to vasm, optionally converts to llvm,
+// further optimizes, emits code into main/cold/frozen sections, allocates rds
+// and global data, and adds fixup metadata.
+void genCode(IRUnit& unit);
 
-struct CodeGenerator {
-  virtual ~CodeGenerator() {}
-  virtual void cgInst(IRInstruction* inst) = 0;
-};
-
+///////////////////////////////////////////////////////////////////////////////
 }}
 
 #endif

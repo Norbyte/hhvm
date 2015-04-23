@@ -19,12 +19,11 @@
 #include "hphp/runtime/ext/xdebug/ext_xdebug.h"
 #include "hphp/runtime/ext/xdebug/xdebug_utils.h"
 
+#include "hphp/runtime/base/externals.h"
 #include "hphp/runtime/base/thread-info.h"
 #include "hphp/runtime/ext/ext_hotprofiler.h"
 #include "hphp/runtime/vm/vm-regs.h"
 #include "hphp/util/timer.h"
-
-using std::vector;
 
 namespace HPHP {
 
@@ -46,9 +45,9 @@ void XDebugProfiler::ensureBufferSpace() {
   } catch (const OutOfMemoryException& e) {
     raise_error("Cannot allocate more memory for the xdebug profiler. Consider "
                 "turning off profiling or tracing. Note that certain ini "
-                "settings such as hhvm.xdebug.collect_memory and "
-                "hhvm.xdebug.collect_time implicitly "
-                "turn on tracing, so turn those off if this is unexpected.\n"
+                "settings such as xdebug.collect_memory and "
+                "xdebug.collect_time implicitly turn on tracing, so turn those "
+                " off if this is unexpected.\n"
                 "Current frame buffer length: %zu\n"
                 "Failed to expand to length: %zu\n",
                 m_frameBufferSize,
@@ -592,7 +591,7 @@ int64_t XDebugProfiler::writeProfilingFrame(int64_t startIdx) {
   // within the frameData itself, but that's probably not worth the runtime
   // memory penalty so we take the performance hit now. We've already completed
   // the request at this point anyways.
-  vector<Frame> children;
+  std::vector<Frame> children;
   int64_t children_cost = 0; // Time spent in children
 
   // Iterate until we find the end frame
@@ -625,7 +624,7 @@ int64_t XDebugProfiler::writeProfilingFrame(int64_t startIdx) {
 
 
 void XDebugProfiler::writeCachegrindFrame(const Frame& frame,
-                                          const vector<Frame>& children,
+                                          const std::vector<Frame>& children,
                                           int64_t childrenCost,
                                           bool isTopPseudoMain) {
   // Write out the frame's info

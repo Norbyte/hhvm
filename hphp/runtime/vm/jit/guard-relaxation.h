@@ -19,6 +19,7 @@
 
 #include "hphp/runtime/base/datatype.h"
 #include "hphp/runtime/vm/jit/region-selection.h"
+#include "hphp/runtime/vm/jit/type-constraint.h"
 #include "hphp/runtime/vm/jit/type.h"
 
 #include "hphp/runtime/vm/jit/block.h"
@@ -46,12 +47,14 @@ bool typeMightRelax(const SSATmp* tmp);
 bool relaxGuards(IRUnit&, const GuardConstraints& guards,
                  RelaxGuardsFlags flags);
 
-typedef std::function<void(const RegionDesc::Location&, Type)> VisitGuardFn;
-void visitGuards(IRUnit&, const VisitGuardFn& func);
-
+/*
+ * Returns true iff `t' is specific enough to fit `cat', meaning a consumer
+ * constraining a value with `cat' would be satisfied with `t' as the value's
+ * type after relaxation.
+ */
 bool typeFitsConstraint(Type t, TypeConstraint cat);
+
 Type relaxType(Type t, TypeConstraint cat);
-void incCategory(DataTypeCategory& c);
 TypeConstraint relaxConstraint(const TypeConstraint origTc,
                                const Type knownType, const Type toRelax);
 TypeConstraint applyConstraint(TypeConstraint origTc, TypeConstraint newTc);

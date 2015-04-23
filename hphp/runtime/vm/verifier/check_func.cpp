@@ -16,7 +16,8 @@
 
 #include "hphp/runtime/vm/verifier/check.h"
 
-#include "hphp/runtime/base/mixed-array.h"
+#include "hphp/runtime/base/struct-array.h"
+#include "hphp/runtime/vm/native.h"
 
 #include "hphp/runtime/vm/verifier/cfg.h"
 #include "hphp/runtime/vm/verifier/util.h"
@@ -127,6 +128,36 @@ class FuncChecker {
   bool m_verbose;
   FlavorDesc* m_tmp_sig;
 };
+
+bool checkNativeFunc(const Func* func, bool verbose) {
+  auto const funcname = func->name();
+  auto const pc = func->preClass();
+  auto const clsname = pc ? pc->name() : nullptr;
+  auto const& info = Native::GetBuiltinFunction(funcname, clsname,
+                                                func->isStatic());
+
+  if (func->builtinFuncPtr() == Native::unimplementedWrapper) return true;
+
+  auto const& tc = func->returnTypeConstraint();
+  auto const message = Native::checkTypeFunc(info.sig, tc, func);
+
+  if (message) {
+    auto const tstr = info.sig.toString(clsname ? clsname->data() : nullptr,
+                                        funcname->data());
+    verify_error(func->unit(), func,
+      "<<__Native>> function %s%s%s does not match C++ function "
+      "signature (%s): %s\n",
+      clsname ? clsname->data() : "",
+      clsname ? "::" : "",
+      funcname->data(),
+      tstr.c_str(),
+      message
+    );
+    return false;
+  }
+
+  return true;
+}
 
 bool checkFunc(const Func* func, bool verbose) {
   if (verbose) {
@@ -274,7 +305,7 @@ bool FuncChecker::checkSection(bool is_main, const char* name, Offset base,
         ok = false;
       }
       if (!isTF(pc)) {
-        error("Last instruction in %s is not teriminal %d:%s\n",
+        error("Last instruction in %s is not terminal %d:%s\n",
                name, offset(pc), instrToString((Op*)pc, unit()).c_str());
         ok = false;
       } else {
@@ -303,6 +334,10 @@ bool FuncChecker::checkSection(bool is_main, const char* name, Offset base,
     } else {
       Offset target = instrJumpTarget((Op*)bc, offset(branch));
       ok &= checkOffset("branch target", target, name, base, past);
+      if (*(Op*)branch == Op::JmpNS && target == offset(branch)) {
+        error("JmpNS may not have zero offset in %s\n", name);
+        ok = false;
+      }
     }
   }
   return ok;
@@ -428,6 +463,24 @@ bool FuncChecker::checkImmediates(const char* name, const Op* instr) {
           } else if (vr.frontString() != -1) {
             ok &= checkString(pc, vr.frontString());
           }
+          if (member == MQT) {
+            switch (*instr) {
+              case Op::CGetM:
+              case Op::IssetM:
+              case Op::EmptyM:
+                break;
+              case Op::VGetM:
+              case Op::FPassM:
+                break;
+              default:
+                error(
+                  "Illegal QT member code at %d: %s\n",
+                  offset((PC)instr),
+                  instrToString(instr).c_str()
+                );
+                ok = false;
+            }
+          }
         }
       }
       break;
@@ -494,7 +547,7 @@ bool FuncChecker::checkImmediates(const char* name, const Op* instr) {
     }
     case VSA: { // vector of litstr ids
       auto len = *(uint32_t*)pc;
-      if (len < 1 || len > MixedArray::MaxMakeSize) {
+      if (len < 1 || len > StructArray::MaxMakeSize) {
         error("invalid length of immedate VSA vector %d at offset %d\n",
               len, offset(pc));
         return false;
@@ -601,9 +654,20 @@ bool FuncChecker::checkImmediates(const char* name, const Op* instr) {
   return ok;
 }
 
-static char stkflav(FlavorDesc f) {
-  static const char flavs[] = { 'N', 'C', 'V', 'A', 'R', 'F' };
-  return f > NOV && f <= FV ? flavs[f] : '?';
+static const char* stkflav(FlavorDesc f) {
+  switch (f) {
+  case NOV:  return "N";
+  case CV:   return "C";
+  case VV:   return "V";
+  case AV:   return "A";
+  case RV:   return "R";
+  case FV:   return "F";
+  case UV:   return "U";
+  case CUV:  return "C|U";
+  case CVV:  return "C|V";
+  case CVUV: return "C|V|U";
+  }
+  not_reached();
 }
 
 bool FuncChecker::checkSig(PC pc, int len, const FlavorDesc* args,
@@ -611,8 +675,9 @@ bool FuncChecker::checkSig(PC pc, int len, const FlavorDesc* args,
   for (int i = 0; i < len; ++i) {
     if (args[i] != (FlavorDesc)sig[i] &&
         !((FlavorDesc)sig[i] == CVV && (args[i] == CV || args[i] == VV)) &&
+        !((FlavorDesc)sig[i] == CUV && (args[i] == CV || args[i] == UV)) &&
         !((FlavorDesc)sig[i] == CVUV && (args[i] == CV || args[i] == VV ||
-                                         args[i] == UV))) {
+                                         args[i] == UV || args[i] == CUV))) {
       error("flavor mismatch at %d, got %s expected %s\n",
              offset(pc), stkToString(len, args).c_str(),
              sigToString(len, sig).c_str());
@@ -721,9 +786,9 @@ const FlavorDesc* FuncChecker::sig(PC pc) {
       m_tmp_sig[i] = CVUV;
     }
     return m_tmp_sig;
-  case Op::CreateCl:  // TWO(IVA,SA),  CVMANY,   ONE(CV)
+  case Op::CreateCl:  // TWO(IVA,SA),  CVUMANY,   ONE(CV)
     for (int i = 0, n = instrNumPops((Op*)pc); i < n; ++i) {
-      m_tmp_sig[i] = CVV;
+      m_tmp_sig[i] = CVUV;
     }
     return m_tmp_sig;
   case Op::NewPackedArray:  // ONE(IVA),     CMANY,   ONE(CV)
@@ -1089,7 +1154,7 @@ bool FuncChecker::checkEdge(Block* b, const State& cur, Block *t) {
   State& state = m_info[t->id].state_in;
   if (!state.stk) {
     copyState(&state, &cur);
-    return false;
+    return true;
   }
   // Check stack.
   if (state.stklen != cur.stklen) {

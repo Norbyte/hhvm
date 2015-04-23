@@ -8,50 +8,81 @@
  *
  *)
 
+open Coverage_level
 open Utils
+open Sys_utils
 
 (*****************************************************************************)
 (* Types, constants *)
 (*****************************************************************************)
 
+type mode =
+  | Ai
+  | Autocomplete
+  | Color
+  | Errors
+  | Coverage
+  | Lint
+  | Prolog
+  | Suggest
+
 type options = {
   filename : string;
-  suggest : bool;
-  rest : string list
+  mode : mode;
 }
 
-let builtins_filename = "builtins.hhi"
+let builtins_filename =
+  Relative_path.create Relative_path.Dummy "builtins.hhi"
+
 let builtins = "<?hh // decl\n"^
-  "class Object {\n"^
-  "  public function get_class(): string {} \n"^
-  "  public function get_parent_class(): ?string {} \n"^
-  "}\n"^
   "interface Traversable<Tv> {}\n"^
   "interface Container<Tv> extends Traversable<Tv> {}\n"^
   "interface Iterator<Tv> extends Traversable<Tv> {}\n"^
   "interface Iterable<Tv> extends Traversable<Tv> {}\n"^
   "interface KeyedTraversable<Tk, Tv> extends Traversable<Tv> {}\n"^
   "interface KeyedContainer<Tk, Tv> extends Container<Tv>, KeyedTraversable<Tk,Tv> {}\n"^
-  "interface Indexish<Tk, Tv> extends KeyedContainer<Tk, Tv> {}\n"^
   "interface KeyedIterator<Tk, Tv> extends KeyedTraversable<Tk, Tv>, Iterator<Tv> {}\n"^
   "interface KeyedIterable<Tk, Tv> extends KeyedTraversable<Tk, Tv>, Iterable<Tv> {}\n"^
-  "interface Awaitable<T> {}\n"^
-  "interface WaitHandle<T> extends Awaitable<T> {}\n"^
-  "interface ConstVector<Tv> extends KeyedIterable<int, Tv>, Indexish<int, Tv>{}\n"^
-  "interface ConstSet<Tv> extends KeyedIterable<mixed, Tv>, Container<Tv>{}\n"^
-  "interface ConstMap<Tk, Tv> extends KeyedIterable<Tk, Tv>, Indexish<Tk, Tv>{}\n"^
+  "interface Awaitable<+T> {"^
+  "  public function getWaitHandle(): WaitHandle<T>;"^
+  "}\n"^
+  "interface WaitHandle<+T> extends Awaitable<T> {}\n"^
+  "interface ConstVector<+Tv> extends KeyedIterable<int, Tv>, KeyedContainer<int, Tv>{"^
+  "  public function map<Tu>((function(Tv): Tu) $callback): ConstVector<Tu>;"^
+  "}\n"^
+  "interface ConstSet<+Tv> extends KeyedIterable<mixed, Tv>, Container<Tv>{}\n"^
+  "interface ConstMap<Tk, +Tv> extends KeyedIterable<Tk, Tv>, KeyedContainer<Tk, Tv>{"^
+  "  public function map<Tu>((function(Tv): Tu) $callback): ConstMap<Tk, Tu>;"^
+  "  public function mapWithKey<Tu>((function(Tk, Tv): Tu) $fn): ConstMap<Tk, Tu>;"^
+  "}\n"^
   "final class Vector<Tv> implements ConstVector<Tv>{\n"^
   "  public function map<Tu>((function(Tv): Tu) $callback): Vector<Tu>;\n"^
   "  public function filter((function(Tv): bool) $callback): Vector<Tv>;\n"^
+  "  public function reserve(int $sz): void;"^
+  "  public function add(Tv $value): Vector<Tv>;"^
+  "  public function addAll(?Traversable<Tv> $it): Vector<Tv>;"^
   "}\n"^
-  "final class ImmVector<Tv> implements ConstVector<Tv> {}\n"^
-  "final class Map<Tk, Tv> implements ConstMap<Tk, Tv> {}\n"^
-  "final class ImmMap<Tk, Tv> implements ConstMap<Tk, Tv>{}\n"^
-  "final class StableMap<Tk, Tv> implements ConstMap<Tk, Tv> {}\n"^
-  "final class Set<Tv> extends ConstSet<Tv> {}\n"^
-  "final class ImmSet<Tv> extends ConstSet<Tv> {}\n"^
+  "final class ImmVector<Tv> implements ConstVector<Tv> {"^
+  "  public function map<Tu>((function(Tv): Tu) $callback): ImmVector<Tu>;"^
+  "}\n"^
+  "final class Map<Tk, Tv> implements ConstMap<Tk, Tv> {"^
+  "  /* HH_FIXME[3007]: This is intentional; not a constructor */"^
+  "  public function map<Tu>((function(Tv): Tu) $callback): Map<Tk, Tu>;"^
+  "  public function mapWithKey<Tu>((function(Tk, Tv): Tu) $fn): Map<Tk, Tu>;"^
+  "  public function contains(Tk $k): bool;"^
+  "}\n"^
+  "final class ImmMap<Tk, Tv> implements ConstMap<Tk, Tv>{"^
+  "  public function map<Tu>((function(Tv): Tu) $callback): ImmMap<Tk, Tu>;"^
+  "  public function mapWithKey<Tu>((function(Tk, Tv): Tu) $fn): ImmMap<Tk, Tu>;"^
+  "}\n"^
+  "final class StableMap<Tk, Tv> implements ConstMap<Tk, Tv> {"^
+  "  public function map<Tu>((function(Tv): Tu) $callback): StableMap<Tk, Tu>;"^
+  "  public function mapWithKey<Tu>((function(Tk, Tv): Tu) $fn): StableMap<Tk, Tu>;"^
+  "}\n"^
+  "final class Set<Tv> implements ConstSet<Tv> {}\n"^
+  "final class ImmSet<Tv> implements ConstSet<Tv> {}\n"^
   "class Exception { public function __construct(string $x) {} }\n"^
-  "class Generator<Tk, Tv, Ts> implements KeyedIterator<Tk, Tv> {\n"^
+  "class Generator<+Tk, +Tv, -Ts> implements KeyedIterator<Tk, Tv> {\n"^
   "  public function next(): void;\n"^
   "  public function current(): Tv;\n"^
   "  public function key(): Tk;\n"^
@@ -59,20 +90,20 @@ let builtins = "<?hh // decl\n"^
   "  public function valid(): bool;\n"^
   "  public function send(?Ts $v): void;\n"^
   "}\n"^
-  "type Continuation<Tv> = Generator<int, Tv, void>;\n"^
-  "final class Pair<Tk, Tv> extends Indexish<int,mixed> {public function isEmpty(): bool {}}\n"^
+  "final class Pair<Tk, Tv> implements KeyedContainer<int,mixed> {public function isEmpty(): bool {}}\n"^
   "interface Stringish {public function __toString(): string {}}\n"^
   "interface XHPChild {}\n"^
   "function hh_show($val) {}\n"^
   "interface Countable { public function count(): int; }\n"^
   "interface AsyncIterator<Tv> {}\n"^
   "interface AsyncKeyedIterator<Tk, Tv> extends AsyncIterator<Tv> {}\n"^
-  "class AsyncGenerator<Tk, Tv, Ts> implements AsyncKeyedIterator<Tk, Tv> {\n"^
+  "class AsyncGenerator<+Tk, +Tv, -Ts> implements AsyncKeyedIterator<Tk, Tv> {\n"^
   "  public function next(): Awaitable<?(Tk, Tv)> {}\n"^
   "  public function send(?Ts $v): Awaitable<?(Tk, Tv)> {}\n"^
   "  public function raise(Exception $e): Awaitable<?(Tk, Tv)> {}"^
   "}\n"^
   "function isset($x): bool;"^
+  "function empty($x): bool;"^
   "function unset($x): void;"^
   "namespace HH {\n"^
   "abstract class BuiltinEnum<T> {\n"^
@@ -83,7 +114,12 @@ let builtins = "<?hh // decl\n"^
   "  final public static function isValid(mixed $value): bool;\n"^
   "  final public static function assertAll(Traversable<mixed> $values): Container<T>;\n"^
   "}\n"^
-  "}\n"
+  "}\n"^
+  "function array_map($x, $y, ...);\n"^
+  "function idx<Tk, Tv>(?KeyedContainer<Tk, Tv> $c, $i, $d = null) {}\n"^
+  "final class stdClass {}\n" ^
+  "function rand($x, $y): int;\n" ^
+  "function invariant($x, ...): void;\n"
 
 (*****************************************************************************)
 (* Helpers *)
@@ -95,29 +131,49 @@ let die str =
   close_out oc;
   exit 2
 
-let error l = die (Errors.to_string l)
+let error l = output_string stderr (Errors.to_string (Errors.to_absolute l))
 
 let parse_options () =
   let fn_ref = ref None in
-  let suggest = ref false in
-  let rest_options = ref [] in
-  let rest x = rest_options := x :: !rest_options in
   let usage = Printf.sprintf "Usage: %s filename\n" Sys.argv.(0) in
+  let mode = ref Errors in
+  let set_mode x () =
+    if !mode <> Errors
+    then raise (Arg.Bad "only a single mode should be specified")
+    else mode := x
+  in
   let options = [
+    "--ai",
+      Arg.Unit (set_mode Ai),
+      "Run the abstract interpreter";
+    "--auto-complete",
+      Arg.Unit (set_mode Autocomplete),
+      "Produce autocomplete suggestions";
+    "--color",
+      Arg.Unit (set_mode Color),
+      "Produce color output";
+    "--coverage",
+      Arg.Unit (set_mode Coverage),
+      "Produce coverage output";
+    "--lint",
+      Arg.Unit (set_mode Lint),
+      "Produce lint errors";
+    "--prolog",
+      Arg.Unit (set_mode Prolog),
+      "Produce prolog facts";
     "--suggest",
-      Arg.Set suggest,
+      Arg.Unit (set_mode Suggest),
       "Suggest missing typehints";
-    "--",
-      Arg.Rest rest,
-      "";
   ] in
   Arg.parse options (fun fn -> fn_ref := Some fn) usage;
   let fn = match !fn_ref with
     | Some fn -> fn
     | None -> die usage in
-  { filename = fn; suggest = !suggest; rest = !rest_options }
+  { filename = fn;
+    mode = !mode;
+  }
 
-let suggest_and_print fn funs classes typedefs consts =
+let suggest_and_print fn { FileInfo.funs; classes; typedefs; consts; _ } =
   let make_set =
     List.fold_left (fun acc (_, x) -> SSet.add x acc) SSet.empty in
   let n_funs = make_set funs in
@@ -125,9 +181,9 @@ let suggest_and_print fn funs classes typedefs consts =
   let n_types = make_set typedefs in
   let n_consts = make_set consts in
   let names = { FileInfo.n_funs; n_classes; n_types; n_consts } in
-  let fast = SMap.add fn names SMap.empty in
+  let fast = Relative_path.Map.add fn names Relative_path.Map.empty in
   let patch_map = Typing_suggest_service.go None fast in
-  match SMap.get fn patch_map with
+  match Relative_path.Map.get fn patch_map with
     | None -> ()
     | Some l -> begin
       (* Sort so that the unit tests come out in a consistent order, normally
@@ -137,8 +193,8 @@ let suggest_and_print fn funs classes typedefs consts =
     end
 
 (* This allows to fake having multiple files in one file. This
- * is used only in unit test files. Indeed
- * There are some features that require mutliple files to be tested.
+ * is used only in unit test files.
+ * Indeed, there are some features that require mutliple files to be tested.
  * For example, newtype has a different meaning depending on the file.
  *)
 let rec make_files = function
@@ -151,79 +207,170 @@ let rec make_files = function
       (filename, content) :: make_files rl
   | _ -> assert false
 
-let parse_file fn =
-  let content = cat fn in
+let parse_file file =
+  let abs_fn = Relative_path.to_absolute file in
+  let content = cat abs_fn in
   let delim = Str.regexp "////.*" in
   if Str.string_match delim content 0
   then
     let contentl = Str.full_split delim content in
     let files = make_files contentl in
-    List.fold_right begin fun (sub_fn, content) ast ->
-      Pos.file := fn^"--"^sub_fn ;
-      let {Parser_hack.is_hh_file; comments; ast = ast'} =
-        Parser_hack.program content
-      in
-      ast' @ ast
-    end files []
-  else begin
-    Pos.file := fn ;
-    let {Parser_hack.is_hh_file; comments; ast} =
-      Parser_hack.program content
-    in
-    ast
-  end
+    List.fold_left begin fun acc (sub_fn, content) ->
+      let file =
+        Relative_path.create Relative_path.Dummy (abs_fn^"--"^sub_fn) in
+      Relative_path.Map.add file (Parser_hack.program file content) acc
+    end Relative_path.Map.empty files
+  else if str_starts_with content "// @directory " then
+    let contentl = Str.split (Str.regexp "\n") content in
+    let first_line = List.hd contentl in
+    let regexp = Str.regexp "^// @directory *\\([^ ]*\\)" in
+    let has_match = Str.string_match regexp first_line 0 in
+    assert has_match;
+    let dir = Str.matched_group 1 first_line in
+    let file = Relative_path.create Relative_path.Dummy (dir ^ abs_fn) in
+    let content = String.concat "\n" (List.tl contentl) in
+    Relative_path.Map.singleton file (Parser_hack.program file content)
+  else
+    Relative_path.Map.singleton file (Parser_hack.program file content)
 
-(* collect definition names from parsed ast *)
-let collect_defs ast =
-  List.fold_right begin fun def (funs, classes, typedefs, consts) ->
-    match def with
-    | Ast.Fun f -> f.Ast.f_name :: funs, classes, typedefs, consts
-    | Ast.Class c -> funs, c.Ast.c_name :: classes, typedefs, consts
-    | Ast.Typedef td -> funs, classes, td.Ast.t_id :: typedefs, consts
-    | Ast.Constant cst -> funs, classes, typedefs, cst.Ast.cst_name :: consts
-    | _ -> funs, classes, typedefs, consts
-  end ast ([], [], [], [])
+(* Make readable test output *)
+let replace_color input =
+  match input with
+  | (Some Unchecked, str) -> "<unchecked>"^str^"</unchecked>"
+  | (Some Checked, str) -> "<checked>"^str^"</checked>"
+  | (Some Partial, str) -> "<partial>"^str^"</partial>"
+  | (None, str) -> str
+
+let print_colored fn type_acc =
+  let content = cat (Relative_path.to_absolute fn) in
+  let results = ColorFile.go content type_acc in
+  if Unix.isatty Unix.stdout
+  then Tty.print (ClientColorFile.replace_colors results)
+  else print_string (List.map replace_color results |> String.concat "")
+
+let print_coverage fn type_acc =
+  let counts = ServerCoverageMetric.count_exprs fn type_acc in
+  ClientCoverageMetric.go ~json:false (Some (Leaf counts))
+
+let print_prolog files_info =
+  let facts = Relative_path.Map.fold begin fun _ file_info acc ->
+    let { FileInfo.funs; classes; typedefs; consts; _ } = file_info in
+    Prolog.facts_of_defs acc funs classes typedefs consts
+  end files_info [] in
+  PrologMain.output_facts stdout facts
+
+let handle_mode mode filename nenv files_info errors lint_errors ai_results =
+  match mode with
+  | Ai -> ()
+  | Autocomplete ->
+      let file = cat (Relative_path.to_absolute filename) in
+      let result = ServerAutoComplete.auto_complete nenv file in
+      List.iter begin fun r ->
+        let open AutocompleteService in
+        Printf.printf "%s %s\n" r.res_name r.res_ty
+      end result
+  | Color ->
+      Relative_path.Map.iter begin fun fn fileinfo ->
+        if fn = builtins_filename then () else begin
+          let result = ServerColorFile.get_level_list
+            (fun () -> ignore (ServerIdeUtils.check_defs
+              TypecheckerOptions.default fileinfo); fn) in
+          print_colored fn result;
+        end
+      end files_info
+  | Coverage ->
+      Relative_path.Map.iter begin fun fn fileinfo ->
+        if fn = builtins_filename then () else begin
+          let type_acc = ServerCoverageMetric.accumulate_types fileinfo in
+          print_coverage fn type_acc;
+        end
+      end files_info
+  | Lint ->
+      let lint_errors =
+        Relative_path.Map.fold begin fun fn fileinfo lint_errors ->
+          lint_errors @ fst (Lint.do_ begin fun () ->
+            Linting_service.lint fn fileinfo
+          end)
+        end files_info lint_errors in
+      if lint_errors <> []
+      then begin
+        let lint_errors = List.sort begin fun x y ->
+          Pos.compare (Lint.get_pos x) (Lint.get_pos y)
+        end lint_errors in
+        let lint_errors = List.map Lint.to_absolute lint_errors in
+        ServerLint.output_text stdout lint_errors;
+        exit 2
+      end
+      else Printf.printf "No lint errors\n"
+  | Prolog ->
+      print_prolog files_info
+  | Suggest
+  | Errors ->
+      let errors = Relative_path.Map.fold begin fun _ fileinfo errors ->
+        errors @ ServerIdeUtils.check_defs TypecheckerOptions.default fileinfo
+      end files_info errors in
+      if mode = Suggest
+      then Relative_path.Map.iter suggest_and_print files_info;
+      if errors <> []
+      then (error (List.hd errors); exit 2)
+      else Printf.printf "No errors\n"
 
 (*****************************************************************************)
 (* Main entry point *)
 (*****************************************************************************)
 
-(* This was the original main ... before there was a daemon.
- * This function can also be called interactively from top_single to
- * populate the global typing environment (see typing_env.ml) for
- * a given file. You can then inspect this typing environment, e.g.
- * with 'Typing_env.Classes.get "Foo";;'
- *)
-let main_hack { filename; suggest; _ } =
+let main_hack { filename; mode; } =
   ignore (Sys.signal Sys.sigusr1 (Sys.Signal_handle Typing.debug_print_last_pos));
   SharedMem.init();
-  Hhi.set_hhi_root_for_unit_test (Path.mk_path "/tmp/hhi");
-  let errors, () =
-    Errors.do_ begin fun () ->
-      Pos.file := builtins_filename;
-      let {Parser_hack.is_hh_file; comments; ast = ast_builtins} =
-        Parser_hack.program builtins
-      in
-      Pos.file := filename;
-      let ast_file = parse_file filename in
-      let ast = ast_builtins @ ast_file in
-      Parser_heap.ParserHeap.add filename ast;
-      let funs, classes, typedefs, consts = collect_defs ast in
-      let nenv = Naming.make_env Naming.empty ~funs ~classes ~typedefs ~consts in
-      let all_classes = List.fold_right begin fun (_, cname) acc ->
-        SMap.add cname (SSet.singleton filename) acc
-      end classes SMap.empty in
-      Typing_decl.make_env nenv all_classes filename;
-      List.iter (fun (_, fname) -> Typing_check_service.type_fun fname) funs;
-      List.iter (fun (_, cname) -> Typing_check_service.type_class cname) classes;
-      List.iter (fun (_, x) -> Typing_check_service.check_typedef x) typedefs;
-      if suggest
-      then suggest_and_print filename funs classes typedefs consts
-    end
-  in
-  if errors <> []
-  then error (List.hd errors)
-  else Printf.printf "No errors\n"
+  Hhi.set_hhi_root_for_unit_test "/tmp/hhi";
+  let outer_do f = match mode with
+    | Ai ->
+       let ai_results, inner_results = Ai.do_ f in
+       ai_results, [], inner_results
+    | _ ->
+       let lint_results, inner_results = Lint.do_ f in
+       [], lint_results, inner_results in
+  let filename = Relative_path.create Relative_path.Dummy filename in
+  let ai_results, lint_errors, (errors, (nenv, files_info)) =
+    outer_do begin fun () ->
+      Errors.do_ begin fun () ->
+        let parsed_files = parse_file filename in
+        let parsed_builtins = Parser_hack.program builtins_filename builtins in
+        let parsed_files =
+          Relative_path.Map.add builtins_filename parsed_builtins parsed_files
+        in
+
+        let files_info =
+          Relative_path.Map.mapi begin fun fn parsed_file ->
+            let {Parser_hack.file_mode; comments; ast} = parsed_file in
+            Parser_heap.ParserHeap.add fn ast;
+            let funs, classes, typedefs, consts = Ast_utils.get_defs ast in
+            { FileInfo.
+              file_mode; funs; classes; typedefs; consts; comments;
+              consider_names_just_for_autoload = false }
+          end parsed_files in
+
+        (* Note that nenv.Naming.itcopt remains TypecheckerOptions.default *)
+        let nenv = Relative_path.Map.fold begin fun fn fileinfo nenv ->
+          let {FileInfo.funs; classes; typedefs; consts; _} = fileinfo in
+          Naming.make_env nenv ~funs ~classes ~typedefs ~consts
+        end files_info (Naming.empty TypecheckerOptions.default) in
+
+        let all_classes =
+          Relative_path.Map.fold begin fun fn {FileInfo.classes; _} acc ->
+            List.fold_left begin fun acc (_, cname) ->
+              SMap.add cname (Relative_path.Set.singleton fn) acc
+            end acc classes
+          end files_info SMap.empty in
+
+        Relative_path.Map.iter begin fun fn _ ->
+          Typing_decl.make_env nenv all_classes fn
+        end files_info;
+
+        nenv, files_info
+      end
+    end in
+  handle_mode mode filename nenv files_info errors lint_errors ai_results
 
 (* command line driver *)
 let _ =

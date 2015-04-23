@@ -26,9 +26,9 @@
 #include <set>
 #include <utility>
 
-#include "folly/MapUtil.h"
-#include "folly/Memory.h"
-#include "folly/ScopeGuard.h"
+#include <folly/MapUtil.h>
+#include <folly/Memory.h>
+#include <folly/ScopeGuard.h>
 
 #include "hphp/compiler/builtin_symbols.h"
 #include "hphp/compiler/analysis/class_scope.h"
@@ -49,7 +49,6 @@
 #include "hphp/compiler/expression/modifier_expression.h"
 #include "hphp/compiler/expression/new_object_expression.h"
 #include "hphp/compiler/expression/object_method_expression.h"
-#include "hphp/compiler/expression/object_property_expression.h"
 #include "hphp/compiler/expression/parameter_expression.h"
 #include "hphp/compiler/expression/qop_expression.h"
 #include "hphp/compiler/expression/scalar_expression.h"
@@ -106,6 +105,7 @@
 #include "hphp/runtime/vm/as.h"
 #include "hphp/runtime/base/stats.h"
 #include "hphp/runtime/base/static-string-table.h"
+#include "hphp/runtime/base/struct-array.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/runtime/base/zend-functions.h"
@@ -114,6 +114,7 @@
 #include "hphp/runtime/base/variable-serializer.h"
 #include "hphp/runtime/base/program-functions.h"
 #include "hphp/runtime/base/unit-cache.h"
+#include "hphp/runtime/base/collections.h"
 #include "hphp/runtime/ext_hhvm/ext_hhvm.h"
 #include "hphp/runtime/ext_zend_compat/hhvm/zend-wrap-func.h"
 #include "hphp/runtime/vm/preclass-emitter.h"
@@ -123,8 +124,6 @@
 namespace HPHP {
 namespace Compiler {
 ///////////////////////////////////////////////////////////////////////////////
-
-TRACE_SET_MOD(emitter)
 
 using uchar = unsigned char;
 
@@ -155,6 +154,7 @@ namespace StackSym {
   static const char S = 0x60; // Static property marker
   static const char M = 0x70; // Non elem/prop/W part of M-vector
   static const char K = 0x80; // Marker for information about a class base
+  static const char Q = 0x90; // NullSafe Property marker
 
   static const char CN = C | N;
   static const char CG = C | G;
@@ -188,6 +188,7 @@ namespace StackSym {
       case StackSym::E: res += "E"; break;
       case StackSym::W: res += "W"; break;
       case StackSym::P: res += "P"; break;
+      case StackSym::Q: res += "Q"; break;
       case StackSym::S: res += "S"; break;
       case StackSym::K: res += "K"; break;
       default: break;
@@ -221,12 +222,10 @@ class FuncFinisher {
 
  public:
   FuncFinisher(EmitterVisitor* ev, Emitter& e, FuncEmitter* fe)
-    : m_ev(ev), m_e(e), m_fe(fe) {
-      TRACE(2, "FuncFinisher constructed: %s\n", m_fe->name->data());
-    }
+    : m_ev(ev), m_e(e), m_fe(fe)
+  {}
 
   ~FuncFinisher() {
-    TRACE(2, "Finishing func: %s\n", m_fe->name->data());
     m_ev->finishFunc(m_e, m_fe);
   }
 };
@@ -435,6 +434,7 @@ static int32_t countStackValues(const std::vector<uchar>& immVec) {
 
 #define PUSH_CV getEmitterVisitor().pushEvalStack(StackSym::C)
 #define PUSH_UV PUSH_CV
+#define PUSH_CUV PUSH_CV
 #define PUSH_VV getEmitterVisitor().pushEvalStack(StackSym::V)
 #define PUSH_AV getEmitterVisitor().pushEvalStack(StackSym::A)
 #define PUSH_RV getEmitterVisitor().pushEvalStack(StackSym::R)
@@ -661,6 +661,7 @@ static int32_t countStackValues(const std::vector<uchar>& immVec) {
 #undef PUSH_FOUR
 #undef PUSH_CV
 #undef PUSH_UV
+#undef PUSH_CUV
 #undef PUSH_VV
 #undef PUSH_HV
 #undef PUSH_AV
@@ -799,8 +800,8 @@ void SymbolicStack::push(char sym) {
   if (sym != StackSym::W && sym != StackSym::K && sym != StackSym::L &&
       sym != StackSym::T && sym != StackSym::I && sym != StackSym::H) {
     m_actualStack.push_back(m_symStack.size());
-    *m_actualStackHighWaterPtr = MAX(*m_actualStackHighWaterPtr,
-                                     (int)m_actualStack.size());
+    *m_actualStackHighWaterPtr = std::max(*m_actualStackHighWaterPtr,
+                                          (int)m_actualStack.size());
   }
   m_symStack.push_back(SymEntry(sym));
 }
@@ -1010,7 +1011,7 @@ int SymbolicStack::sizeActual() const {
 
 void SymbolicStack::pushFDesc() {
   m_fdescCount += kNumActRecCells;
-  *m_fdescHighWaterPtr = MAX(*m_fdescHighWaterPtr, m_fdescCount);
+  *m_fdescHighWaterPtr = std::max(*m_fdescHighWaterPtr, m_fdescCount);
 }
 
 void SymbolicStack::popFDesc() {
@@ -1363,8 +1364,7 @@ void EmitterVisitor::emitJump(Emitter& e, IterVec& iters, Label& target) {
   }
 }
 
-void EmitterVisitor::emitReturn(Emitter& e, char sym, bool hasConstraint,
-                                StatementPtr s) {
+void EmitterVisitor::emitReturn(Emitter& e, char sym, StatementPtr s) {
   Region* region = m_regions.back().get();
   registerReturn(s, region, sym);
   assert(getEvalStack().size() == 1);
@@ -1374,18 +1374,21 @@ void EmitterVisitor::emitReturn(Emitter& e, char sym, bool hasConstraint,
     auto& t = r->m_returnTargets[sym].target;
     if (r->m_parent == nullptr) {
       // At the top of the hierarchy, no more finally blocks to run.
-      // Free the pending iterators and perform the actual return.
-      emitIterFree(e, iters);
+      // Check return type, free pending iterators and actually return.
       if (sym == StackSym::C) {
-        if (hasConstraint) {
+        if (shouldEmitVerifyRetType()) {
           e.VerifyRetTypeC();
         }
+        // IterFree must come after VerifyRetType, because VerifyRetType may
+        // throw, in which case any Iters will be freed by the fault funclet.
+        emitIterFree(e, iters);
         e.RetC();
       } else {
         assert(sym == StackSym::V);
-        if (hasConstraint) {
+        if (shouldEmitVerifyRetType()) {
           e.VerifyRetTypeV();
         }
+        emitIterFree(e, iters);
         e.RetV();
       }
       return;
@@ -1628,10 +1631,16 @@ void EmitterVisitor::emitReturnTrampoline(Emitter& e,
       emitVirtualLocal(retLocal);
       if (sym == StackSym::C) {
         e.CGetL(retLocal);
+        if (shouldEmitVerifyRetType()) {
+          e.VerifyRetTypeC();
+        }
         e.RetC();
       } else {
         assert(sym == StackSym::V);
         e.VGetL(retLocal);
+        if (shouldEmitVerifyRetType()) {
+          e.VerifyRetTypeV();
+        }
         e.RetV();
       }
       return;
@@ -1772,6 +1781,11 @@ void EmitterVisitor::emitContinueTrampoline(Emitter& e, Region* region,
     }
     --depth;
   }
+}
+
+bool EmitterVisitor::shouldEmitVerifyRetType() {
+  return (m_curFunc->retTypeConstraint.hasConstraint() &&
+          !m_curFunc->isGenerator);
 }
 
 int Region::getMaxBreakContinueDepth() {
@@ -1969,7 +1983,8 @@ void EmitterVisitor::popEvalStackMMany() {
     char sym = m_evalStack.top();
     char symFlavor = StackSym::GetSymFlavor(sym);
     char marker = StackSym::GetMarker(sym);
-    if (marker == StackSym::E || marker == StackSym::P) {
+    if (marker == StackSym::E || marker == StackSym::P ||
+        marker == StackSym::Q) {
       if (symFlavor != StackSym::C && symFlavor != StackSym::L &&
           symFlavor != StackSym::T && symFlavor != StackSym::I) {
         InvariantViolation(
@@ -2427,7 +2442,7 @@ void EmitterVisitor::visit(FileScopePtr file) {
     }
     FuncFinisher ff(this, e, m_curFunc);
     TypedValue mainReturn;
-    mainReturn.m_type = KindOfInvalid;
+    mainReturn.m_type = kInvalidDataType;
     bool notMergeOnly = false;
 
     if (Option::UseHHBBC && SystemLib::s_inited) notMergeOnly = true;
@@ -2458,7 +2473,7 @@ void EmitterVisitor::visit(FileScopePtr file) {
           notMergeOnly = true; // TODO(#2103206): typedefs should be mergable
           break;
         case Statement::KindOfReturnStatement:
-          if (mainReturn.m_type != KindOfInvalid) break;
+          if (mainReturn.m_type != kInvalidDataType) break;
 
           visit(s);
           if (notMergeOnly) {
@@ -2489,7 +2504,7 @@ void EmitterVisitor::visit(FileScopePtr file) {
           }
           break;
         case Statement::KindOfExpStatement:
-          if (mainReturn.m_type == KindOfInvalid) {
+          if (mainReturn.m_type == kInvalidDataType) {
             ExpressionPtr e =
               static_pointer_cast<ExpStatement>(s)->getExpression();
             switch (e->getKindOf()) {
@@ -2547,7 +2562,7 @@ void EmitterVisitor::visit(FileScopePtr file) {
             }
           } // fall through
         default:
-          if (mainReturn.m_type != KindOfInvalid) break;
+          if (mainReturn.m_type != kInvalidDataType) break;
           notMergeOnly = true;
           visit(s);
       }
@@ -2555,7 +2570,7 @@ void EmitterVisitor::visit(FileScopePtr file) {
 
     if (!notMergeOnly) {
       m_ue.m_mergeOnly = true;
-      if (mainReturn.m_type == KindOfInvalid) {
+      if (mainReturn.m_type == kInvalidDataType) {
         tvWriteUninit(&mainReturn);
         if (boost::algorithm::ends_with(filename, EVAL_FILENAME_SUFFIX)) {
           tvAsVariant(&mainReturn) = init_null();
@@ -2599,15 +2614,6 @@ static StringData* getClassName(ExpressionPtr e) {
   ClassScopeRawPtr cls;
   if (e->isThis()) {
     cls = e->getOriginalClass();
-    if (TypePtr t = e->getAssertedType()) {
-      if (t->isSpecificObject()) {
-        AnalysisResultConstPtr ar = e->getScope()->getContainingProgram();
-        ClassScopeRawPtr c2 = t->getClass(ar, e->getScope());
-        if (c2 && c2->derivesFrom(ar, cls->getName(), true, false)) {
-          cls = c2;
-        }
-      }
-    }
   } else if (TypePtr t = e->getActualType()) {
     if (t->isSpecificObject()) {
       cls = t->getClass(e->getScope()->getContainingProgram(), e->getScope());
@@ -2661,7 +2667,7 @@ void EmitterVisitor::visitKids(ConstructPtr c) {
   }
 }
 
-template<class Fun>
+template<typename ArrayType, class Fun>
 bool checkKeys(ExpressionPtr init_expr, bool check_size, Fun fun) {
   if (init_expr->getKindOf() != Expression::KindOfExpressionList) {
     return false;
@@ -2669,7 +2675,7 @@ bool checkKeys(ExpressionPtr init_expr, bool check_size, Fun fun) {
 
   auto el = static_pointer_cast<ExpressionList>(init_expr);
   int n = el->getCount();
-  if (n < 1 || (check_size && n > MixedArray::MaxMakeSize)) {
+  if (n < 1 || (check_size && n > ArrayType::MaxMakeSize)) {
     return false;
   }
 
@@ -2696,32 +2702,36 @@ bool checkKeys(ExpressionPtr init_expr, bool check_size, Fun fun) {
 bool isPackedInit(ExpressionPtr init_expr, int* size,
                   bool check_size = true) {
   *size = 0;
-  return checkKeys(init_expr, check_size, [&](ArrayPairExpressionPtr ap) {
-    Variant key;
+  return checkKeys<MixedArray>(init_expr, check_size,
+    [&](ArrayPairExpressionPtr ap) {
+      Variant key;
 
-    // If we have a key...
-    if (ap->getName() != nullptr) {
-      // ...and it has no scalar value, bail.
-      if (!ap->getScalarValue(key)) return false;
+      // If we have a key...
+      if (ap->getName() != nullptr) {
+        // ...and it has no scalar value, bail.
+        if (!ap->getName()->getScalarValue(key)) return false;
 
-      if (key.isInteger()) {
-        // If it's an integer key, check if it's the next packed index.
-        if (key.asInt64Val() != *size) return false;
-      } else {
-        // Give up if it's not a string.
-        if (!key.isString()) return false;
+        if (key.isInteger()) {
+          // If it's an integer key, check if it's the next packed index.
+          if (key.asInt64Val() != *size) return false;
+        } else if (key.isBoolean()) {
+          // Bool to Int conversion
+          if (static_cast<int>(key.asBooleanVal()) != *size) return false;
+        } else {
+          // Give up if it's not a string.
+          if (!key.isString()) return false;
 
-        int64_t i; double d;
-        auto numtype = key.getStringData()->isNumericWithVal(i, d, false);
+          int64_t i; double d;
+          auto numtype = key.getStringData()->isNumericWithVal(i, d, false);
 
-        // If it's a string of the next packed index,
-        if (numtype != KindOfInt64 || i != *size) return false;
+          // If it's a string of the next packed index,
+          if (numtype != KindOfInt64 || i != *size) return false;
+        }
       }
-    }
 
-    (*size)++;
-    return true;
-  });
+      (*size)++;
+      return true;
+    });
 }
 
 /*
@@ -2729,18 +2739,19 @@ bool isPackedInit(ExpressionPtr init_expr, int* size,
  * all static strings with no duplicates.
  */
 bool isStructInit(ExpressionPtr init_expr, std::vector<std::string>& keys) {
-  return checkKeys(init_expr, true, [&](ArrayPairExpressionPtr ap) {
-    auto key = ap->getName();
-    if (key == nullptr || !key->isLiteralString()) return false;
-    auto name = key->getLiteralString();
-    int64_t ival;
-    double dval;
-    auto kind = is_numeric_string(name.data(), name.size(), &ival, &dval, 0);
-    if (kind != KindOfNull) return false; // don't allow numeric keys
-    if (std::find(keys.begin(), keys.end(), name) != keys.end()) return false;
-    keys.push_back(name);
-    return true;
-  });
+  return checkKeys<StructArray>(init_expr, true,
+    [&](ArrayPairExpressionPtr ap) {
+      auto key = ap->getName();
+      if (key == nullptr || !key->isLiteralString()) return false;
+      auto name = key->getLiteralString();
+      int64_t ival;
+      double dval;
+      auto kind = is_numeric_string(name.data(), name.size(), &ival, &dval, 0);
+      if (kind != KindOfNull) return false; // don't allow numeric keys
+      if (std::find(keys.begin(), keys.end(), name) != keys.end()) return false;
+      keys.push_back(name);
+      return true;
+    });
 }
 
 bool EmitterVisitor::visit(ConstructPtr node) {
@@ -2859,12 +2870,15 @@ bool EmitterVisitor::visit(ConstructPtr node) {
         Label preCond(e);
         Label& preInc = registerContinue(fs, region.get(), 1, false)->m_label;
         Label& fail = registerBreak(fs, region.get(), 1, false)->m_label;
-        if (ExpressionPtr condExp = fs->getCondExp()) {
-          Label tru;
+        ExpressionPtr condExp = fs->getCondExp();
+        auto emit_cond = [&] (Label& tru, bool truFallthrough) {
+          if (!condExp) return;
           Emitter condEmitter(condExp, m_ue, *this);
-          visitIfCondition(condExp, condEmitter, tru, fail, true);
-          if (tru.isUsed()) tru.set(e);
-        }
+          visitIfCondition(condExp, condEmitter, tru, fail, truFallthrough);
+        };
+        Label top;
+        emit_cond(top, true);
+        top.set(e);
         {
           enterRegion(region);
           SCOPE_EXIT { leaveRegion(region); };
@@ -2874,7 +2888,11 @@ bool EmitterVisitor::visit(ConstructPtr node) {
         if (visit(fs->getIncExp())) {
           emitPop(e);
         }
-        e.Jmp(preCond);
+        if (!condExp) {
+          e.Jmp(top);
+        } else {
+          emit_cond(top, false);
+        }
         if (fail.isUsed()) fail.set(e);
         return false;
       }
@@ -2976,17 +2994,10 @@ bool EmitterVisitor::visit(ConstructPtr node) {
         } else {
           e.Null();
         }
-
         assert(m_evalStack.size() == 1);
-        bool hasConstraint = m_curFunc->retTypeConstraint.hasConstraint();
-
-        // resumables
-        if (m_curFunc->isAsync || m_curFunc->isGenerator) {
-          assert(retSym == StackSym::C);
-          hasConstraint = false;
-        }
-
-        emitReturn(e, retSym, hasConstraint, r);
+        assert(IMPLIES(m_curFunc->isAsync || m_curFunc->isGenerator,
+                       retSym == StackSym::C));
+        emitReturn(e, retSym, r);
         return false;
       }
 
@@ -3076,8 +3087,8 @@ bool EmitterVisitor::visit(ConstructPtr node) {
         SwitchState state;
         bool didSwitch = false;
         if (enabled) {
-          DataType stype = analyzeSwitch(sw, state);
-          if (stype != KindOfInvalid) {
+          MaybeDataType stype = analyzeSwitch(sw, state);
+          if (stype) {
             e.incStat(stype == KindOfInt64 ? Stats::Switch_Integer
                                            : Stats::Switch_String,
                       1);
@@ -3090,7 +3101,7 @@ bool EmitterVisitor::visit(ConstructPtr node) {
             } else if (stype == KindOfInt64) {
               emitIntegerSwitch(e, sw, caseLabels, brkTarget, state);
             } else {
-              assert(IS_STRING_TYPE(stype));
+              assert(IS_STRING_TYPE(*stype));
               emitStringSwitch(e, sw, caseLabels, brkTarget, state);
             }
             didSwitch = true;
@@ -3288,22 +3299,24 @@ bool EmitterVisitor::visit(ConstructPtr node) {
       case Statement::KindOfWhileStatement: {
         auto region = createRegion(s, Region::Kind::LoopOrSwitch);
         WhileStatementPtr ws(static_pointer_cast<WhileStatement>(s));
-        Label& preCond = registerContinue(ws, region.get(), 1, false)->m_label;
-        preCond.set(e);
+        ExpressionPtr condExp(ws->getCondExp());
+        Label& lcontinue = registerContinue(ws, region.get(), 1,
+          false)->m_label;
         Label& fail = registerBreak(ws, region.get(), 1, false)->m_label;
-        {
-          Label tru;
-          ExpressionPtr c(ws->getCondExp());
-          Emitter condEmitter(c, m_ue, *this);
-          visitIfCondition(c, condEmitter, tru, fail, true);
-          if (tru.isUsed()) tru.set(e);
-        }
+        Label top;
+        auto emit_cond = [&] (Label& tru, bool truFallthrough) {
+          Emitter condEmitter(condExp, m_ue, *this);
+          visitIfCondition(condExp, condEmitter, tru, fail, truFallthrough);
+        };
+        emit_cond(top, true);
+        top.set(e);
         {
           enterRegion(region);
           SCOPE_EXIT { leaveRegion(region); };
           visit(ws->getBody());
         }
-        e.Jmp(preCond);
+        if (lcontinue.isUsed()) lcontinue.set(e);
+        emit_cond(top, false);
         if (fail.isUsed()) fail.set(e);
         return false;
       }
@@ -3430,31 +3443,6 @@ bool EmitterVisitor::visit(ConstructPtr node) {
             }
             visit(ex);
           }
-          return true;
-        } else if (op == T_VARRAY || op == T_MIARRAY || op == T_MSARRAY) {
-          assert(m_staticArrays.empty());
-          auto capacityHint = MixedArray::SmallSize;
-
-          ExpressionPtr ex = u->getExpression();
-          if (ex->getKindOf() == Expression::KindOfExpressionList) {
-            auto el = static_pointer_cast<ExpressionList>(ex);
-
-            int capacity = el->getCount();
-            if (capacity > 0) {
-              capacityHint = capacity;
-            }
-          }
-
-          if (op == T_VARRAY) {
-            e.NewVArray(capacityHint);
-          } else if (op == T_MIARRAY) {
-            e.NewMIArray(capacityHint);
-          } else {
-            assert(op == T_MSARRAY);
-            e.NewMSArray(capacityHint);
-          }
-          visit(ex);
-
           return true;
         } else if (op == T_ISSET) {
           ExpressionListPtr list =
@@ -3716,19 +3704,17 @@ bool EmitterVisitor::visit(ConstructPtr node) {
           }
           const std::string* clsName = nullptr;
           cls->getString(clsName);
-          int cType = Collection::stringToType(*clsName);
-          if (cType == Collection::PairType) {
-            if (nElms != 2) {
-              throw IncludeTimeFatalException(b,
-                "Pair objects must have exactly 2 elements");
-            }
-          } else if (cType == Collection::InvalidType) {
+          auto ct = stringToCollectionType(*clsName);
+          if (!ct.hasValue()) {
             throw IncludeTimeFatalException(b,
               "Cannot use collection initialization for non-collection class");
+          } else if (ct == CollectionType::Pair && nElms != 2) {
+            throw IncludeTimeFatalException(b,
+                "Pair objects must have exactly 2 elements");
           }
-          bool kvPairs = (cType == Collection::MapType ||
-                          cType == Collection::ImmMapType);
-          e.NewCol(cType, nElms);
+          bool kvPairs = (ct == CollectionType::Map ||
+                          ct == CollectionType::ImmMap);
+          e.NewCol(int(ct.value()), nElms);
           if (kvPairs) {
             for (int i = 0; i < nElms; i++) {
               ArrayPairExpressionPtr ap(
@@ -4018,6 +4004,8 @@ bool EmitterVisitor::visit(ConstructPtr node) {
             e.AKExists();
             return true;
           }
+        } else if (call->isCallToFunction("hh\\invariant")) {
+          if (emitHHInvariant(e, call)) return true;
         } else if (call->isCallToFunction("idx") &&
                    call->isOptimizable() &&
                    systemlibDefinesIdx &&
@@ -4057,30 +4045,6 @@ bool EmitterVisitor::visit(ConstructPtr node) {
             e.Strlen();
             return true;
           }
-        } else if (call->isCallToFunction("floor")) {
-          if (params && params->getCount() == 1) {
-            visit((*params)[0]);
-            emitConvertToCell(e);
-            call->changeToBytecode();
-            e.Floor();
-            return true;
-          }
-        } else if (call->isCallToFunction("ceil")) {
-          if (params && params->getCount() == 1) {
-            visit((*params)[0]);
-            emitConvertToCell(e);
-            call->changeToBytecode();
-            e.Ceil();
-            return true;
-          }
-        } else if (call->isCallToFunction("sqrt")) {
-          if (params && params->getCount() == 1) {
-            visit((*params)[0]);
-            emitConvertToCell(e);
-            call->changeToBytecode();
-            e.Sqrt();
-            return true;
-          }
         } else if (call->isCallToFunction("define")) {
           if (params && params->getCount() == 2) {
             ExpressionPtr p0 = (*params)[0];
@@ -4116,14 +4080,6 @@ bool EmitterVisitor::visit(ConstructPtr node) {
             }
           }
           // fall through
-        } else if (call->isCallToFunction("abs")) {
-          if (params && params->getCount() == 1) {
-            visit((*params)[0]);
-            emitConvertToCell(e);
-            call->changeToBytecode();
-            e.Abs();
-            return true;
-          }
         } else if ((call->isCallToFunction("class_exists") ||
                     call->isCallToFunction("interface_exists") ||
                     call->isCallToFunction("trait_exists"))
@@ -4330,7 +4286,8 @@ bool EmitterVisitor::visit(ConstructPtr node) {
         {
           FPIRegionRecorder fpi(this, m_ue, m_evalStack, fpiStart);
           for (int i = 0; i < numParams; i++) {
-            emitFuncCallArg(e, (*params)[i], i);
+            emitFuncCallArg(e, (*params)[i], i,
+                            ne->hasUnpack() && i + 1 == numParams);
           }
         }
 
@@ -4393,7 +4350,8 @@ bool EmitterVisitor::visit(ConstructPtr node) {
           // $obj->name(...)
           //           ^^^^^
           for (int i = 0; i < numParams; i++) {
-            emitFuncCallArg(e, (*params)[i], i);
+            emitFuncCallArg(e, (*params)[i], i,
+                            om->hasUnpack() && i + 1 == numParams);
           }
         }
         if (om->hasUnpack()) {
@@ -4407,6 +4365,16 @@ bool EmitterVisitor::visit(ConstructPtr node) {
       case Expression::KindOfObjectPropertyExpression: {
         ObjectPropertyExpressionPtr op(
           static_pointer_cast<ObjectPropertyExpression>(node));
+        if (op->isNullSafe() &&
+            op->hasAnyContext(
+                Expression::RefValue
+              | Expression::LValue
+              | Expression::DeepReference
+            ) && !op->hasContext(Expression::InvokeArgument)
+        ) {
+          throw IncludeTimeFatalException(op,
+            Strings::NULLSAFE_PROP_WRITE_ERROR);
+        }
         ExpressionPtr obj = op->getObject();
         SimpleVariablePtr sv = dynamic_pointer_cast<SimpleVariable>(obj);
         if (sv && sv->isThis() && sv->hasContext(Expression::ObjectContext)) {
@@ -4424,7 +4392,12 @@ bool EmitterVisitor::visit(ConstructPtr node) {
                                Expression::ObjectContext)) {
           m_tempLoc = op->getLocation();
         }
-        markProp(e);
+        markProp(
+          e,
+          op->isNullSafe()
+            ? PropAccessType::NullSafe
+            : PropAccessType::Normal
+        );
         return true;
       }
 
@@ -4475,22 +4448,32 @@ bool EmitterVisitor::visit(ConstructPtr node) {
         Variant v;
         ex->getScalarValue(v);
         switch (v.getType()) {
-          case KindOfString:
-          case KindOfStaticString:
-          {
-            StringData* nValue = makeStaticString(v.getStringData());
-            e.String(nValue);
-            break;
-          }
           case KindOfInt64:
             e.Int(v.getInt64());
-            break;
+            return true;
+
           case KindOfDouble:
-            e.Double(v.getDouble()); break;
-          default:
-            assert(false);
+            e.Double(v.getDouble());
+            return true;
+
+          case KindOfStaticString:
+          case KindOfString: {
+            StringData* nValue = makeStaticString(v.getStringData());
+            e.String(nValue);
+            return true;
+          }
+
+          case KindOfUninit:
+          case KindOfNull:
+          case KindOfBoolean:
+          case KindOfArray:
+          case KindOfObject:
+          case KindOfResource:
+          case KindOfRef:
+          case KindOfClass:
+            break;
         }
-        return true;
+        not_reached();
       }
 
       case Expression::KindOfSimpleVariable: {
@@ -4656,7 +4639,9 @@ bool EmitterVisitor::visit(ConstructPtr node) {
         // the new anonymous class, with the use variables as arguments.
         ExpressionListPtr valuesList(ce->getClosureValues());
         for (int i = 0; i < useCount; ++i) {
-          emitBuiltinCallArg(e, (*valuesList)[i], i, useVars[i].second);
+          ce->type() == ClosureType::Short
+            ? emitLambdaCaptureArg(e, (*valuesList)[i])
+            : emitBuiltinCallArg(e, (*valuesList)[i], i, useVars[i].second);
         }
 
         // The parser generated a unique name for the function,
@@ -4764,7 +4749,7 @@ bool EmitterVisitor::visit(ConstructPtr node) {
           auto const ar = expr->getScope()->getContainingProgram();
           auto const type = expr->getActualType();
           return type && Type::SubType(ar, type,
-                           Type::GetType(Type::KindOfObject, "WaitHandle"));
+                           Type::GetType(Type::KindOfObject, "HH\\WaitHandle"));
         }();
 
         Label resume;
@@ -4780,7 +4765,8 @@ bool EmitterVisitor::visit(ConstructPtr node) {
 
         if (!isKnownWaitHandle) {
           Label likely;
-          StringData* nWaitHandle = makeStaticString("WaitHandle");
+          const static StringData* nWaitHandle =
+            makeStaticString("HH\\WaitHandle");
 
           e.Dup();
           e.InstanceOfD(nWaitHandle);
@@ -4856,13 +4842,50 @@ void EmitterVisitor::emitConstMethodCallNoParams(Emitter& e, string name) {
   emitConvertToCell(e);
 }
 
+const StaticString s_hh_invariant_violation("hh\\invariant_violation");
+const StaticString s_invariant_violation("invariant_violation");
+
+bool EmitterVisitor::emitHHInvariant(Emitter& e, SimpleFunctionCallPtr call) {
+  if (!m_ue.m_isHHFile && !RuntimeOption::EnableHipHopSyntax) return false;
+
+  auto const params = call->getParams();
+  if (!params || params->getCount() < 1) return false;
+
+  Label ok;
+
+  visit((*params)[0]);
+  emitCGet(e);
+  e.JmpNZ(ok);
+
+  auto const fpiStart = m_ue.bcPos();
+  e.FPushFuncD(params->getCount() - 1, s_hh_invariant_violation.get());
+  {
+    FPIRegionRecorder fpi(this, m_ue, m_evalStack, fpiStart);
+    for (auto i = uint32_t{1}; i < params->getCount(); ++i) {
+      emitFuncCallArg(e, (*params)[i], i - 1, false);
+    }
+  }
+  e.FCall(params->getCount() - 1);
+  emitPop(e);
+  // The invariant_violation can't return; but bytecode invariants mandate an
+  // opcode that can't fall through:
+  e.String(s_invariant_violation.get());
+  e.Fatal(FatalOp::Runtime);
+
+  ok.set(e);
+  e.Null(); // invariant returns null if used in an expression, void according
+            // to the typechecker.
+  return true;
+}
+
 int EmitterVisitor::scanStackForLocation(int iLast) {
   assert(iLast >= 0);
   assert(iLast < (int)m_evalStack.size());
   for (int i = iLast; i >= 0; --i) {
     char marker = StackSym::GetMarker(m_evalStack.get(i));
     if (marker != StackSym::E && marker != StackSym::W &&
-        marker != StackSym::P && marker != StackSym::M) {
+        marker != StackSym::P && marker != StackSym::M &&
+        marker != StackSym::Q) {
       return i;
     }
   }
@@ -4987,6 +5010,10 @@ void EmitterVisitor::buildVectorImm(std::vector<uchar>& vectorImm,
         } else {
           vectorImm.push_back(MPC);
         }
+      } break;
+      case StackSym::Q: {
+        assert(symFlavor == StackSym::T);
+        vectorImm.push_back(MQT);
       } break;
       case StackSym::S: {
         assert(false);
@@ -5199,16 +5226,19 @@ EmitterVisitor::getPassByRefKind(ExpressionPtr exp) {
     permissiveKind = PassByRefKind::WarnOnCell;
   }
 
-  // this only happens for calls that have been morphed into bytecode
-  // e.g. idx(), abs(), strlen(), etc..
-  // It is to allow the following code to work
-  // function f(&$arg) {...}
-  // f(idx($array, 'key')); <- this fails otherwise
-  if (exp->allowCellByRef()) {
-    return PassByRefKind::AllowCell;
-  }
-
   switch (exp->getKindOf()) {
+    case Expression::KindOfSimpleFunctionCall: {
+      SimpleFunctionCallPtr sfc(
+        static_pointer_cast<SimpleFunctionCall>(exp));
+      // this only happens for calls that have been morphed into bytecode
+      // e.g. idx(), abs(), strlen(), etc..
+      // It is to allow the following code to work
+      // function f(&$arg) {...}
+      // f(idx($array, 'key')); <- this fails otherwise
+      if (sfc->hasBeenChangedToBytecode()) {
+        return PassByRefKind::AllowCell;
+      }
+    } break;
     case Expression::KindOfNewObjectExpression:
     case Expression::KindOfIncludeExpression:
     case Expression::KindOfSimpleVariable:
@@ -5264,64 +5294,115 @@ void EmitterVisitor::emitBuiltinCallArg(Emitter& e,
   return;
 }
 
+static bool isNormalLocalVariable(const ExpressionPtr& expr) {
+  SimpleVariable* sv = static_cast<SimpleVariable*>(expr.get());
+  return (expr->is(Expression::KindOfSimpleVariable) &&
+          !sv->isSuperGlobal() &&
+          !sv->isThis());
+}
+
+void EmitterVisitor::emitLambdaCaptureArg(Emitter& e, ExpressionPtr exp) {
+  // Constant folding may lead this to be not a var anymore,
+  // so we should not be emitting *GetL in this case.
+  if (!isNormalLocalVariable(exp)) {
+    visit(exp);
+    return;
+  }
+  auto const sv = static_cast<SimpleVariable*>(exp.get());
+  Id locId = m_curFunc->lookupVarId(makeStaticString(sv->getName()));
+  emitVirtualLocal(locId);
+  e.CUGetL(locId);
+}
+
 void EmitterVisitor::emitBuiltinDefaultArg(Emitter& e, Variant& v,
-                                           DataType t, int paramId) {
+                                           MaybeDataType t, int paramId) {
   switch (v.getType()) {
-    case KindOfString:
-    case KindOfStaticString: {
-      StringData *nValue = makeStaticString(v.getStringData());
-      e.String(nValue);
-      break;
-    }
-    case KindOfInt64:
-      e.Int(v.getInt64());
-      break;
-    case KindOfDouble:
-      e.Double(v.toDouble());
-      break;
+    case KindOfNull:
+      if (t) {
+        [&] {
+          switch (*t) {
+            case KindOfStaticString:
+            case KindOfString:
+            case KindOfArray:
+            case KindOfObject:
+            case KindOfResource:
+              e.Int(0);
+              return;
+            case KindOfUninit:
+            case KindOfNull:
+            case KindOfBoolean:
+            case KindOfInt64:
+            case KindOfDouble:
+            case KindOfRef:
+            case KindOfClass:
+              break;
+          }
+          not_reached();
+        }();
+      } else {
+        e.NullUninit();
+      }
+      return;
+
     case KindOfBoolean:
       if (v.getBoolean()) {
         e.True();
       } else {
         e.False();
       }
-      break;
-    case KindOfNull:
-      switch (t) {
-        case KindOfString:
-        case KindOfStaticString:
-        case KindOfObject:
-        case KindOfResource:
-        case KindOfArray:
-          e.Int(0);
-          break;
-        case KindOfUnknown:
-          e.NullUninit();
-          break;
-        default:
-          not_reached();
-      }
-      break;
+      return;
+
+    case KindOfInt64:
+      e.Int(v.getInt64());
+      return;
+
+    case KindOfDouble:
+      e.Double(v.toDouble());
+      return;
+
+    case KindOfStaticString:
+    case KindOfString: {
+      StringData *nValue = makeStaticString(v.getStringData());
+      e.String(nValue);
+      return;
+    }
     case KindOfArray:
       e.Array(v.getArrayData());
+      return;
+
+    case KindOfUninit:
+    case KindOfObject:
+    case KindOfResource:
+    case KindOfRef:
+    case KindOfClass:
       break;
-    default:
-      not_reached();
   }
+  not_reached();
 }
 
 void EmitterVisitor::emitFuncCallArg(Emitter& e,
                                      ExpressionPtr exp,
-                                     int paramId) {
+                                     int paramId,
+                                     bool isUnpack) {
   visit(exp);
   if (checkIfStackEmpty("FPass*")) return;
 
   // TODO(4599379): if dealing with an unpack, here is where we'd want to
   // emit a bytecode to traverse any containers;
-  // TODO(4599368): if dealing with an unpack, would need to kick out of
-  // the pass-by-ref behavior and defer that to FCallUnpack
 
-  emitFPass(e, paramId, getPassByRefKind(exp));
+  auto kind = getPassByRefKind(exp);
+  if (isUnpack) {
+    // This deals with the case where the called function has a
+    // by ref param at the index of the unpack (because we don't
+    // want to box the unpack itself).
+    // But note that unless the user created the array manually,
+    // and added reference params at the correct places, we'll
+    // still get warnings, and the array elements will not be
+    // passed by reference.
+    emitConvertToCell(e);
+    kind = PassByRefKind::AllowCell;
+  }
+  emitFPass(e, paramId, kind);
 }
 
 void EmitterVisitor::emitFPass(Emitter& e, int paramId,
@@ -5803,8 +5884,8 @@ void EmitterVisitor::emitClsIfSPropBase(Emitter& e) {
                   m_evalStack.get(m_evalStack.size() - 1) | StackSym::M);
 }
 
-DataType EmitterVisitor::analyzeSwitch(SwitchStatementPtr sw,
-                                       SwitchState& state) {
+MaybeDataType EmitterVisitor::analyzeSwitch(SwitchStatementPtr sw,
+                                            SwitchState& state) {
   auto& caseMap = state.cases;
   DataType t = KindOfUninit;
   StatementListPtr cases(sw->getCases());
@@ -5822,11 +5903,11 @@ DataType EmitterVisitor::analyzeSwitch(SwitchStatementPtr sw,
         if (caseType == KindOfStaticString) caseType = KindOfString;
         if ((caseType != KindOfInt64 && caseType != KindOfString) ||
             !IMPLIES(t != KindOfUninit, caseType == t)) {
-          return KindOfInvalid;
+          return folly::none;
         }
         t = caseType;
       } else {
-        return KindOfInvalid;
+        return folly::none;
       }
       int64_t n;
       bool isNonZero;
@@ -5867,13 +5948,14 @@ DataType EmitterVisitor::analyzeSwitch(SwitchStatementPtr sw,
   if (t == KindOfInt64) {
     int64_t base = caseMap.begin()->first;
     int64_t nTargets = caseMap.rbegin()->first - base + 1;
-    // Fail if the cases are too sparse
-    if ((float)caseMap.size() / nTargets < 0.5) {
-      return KindOfInvalid;
+    // Fail if there aren't enough cases or they're too sparse.
+    if (caseMap.size() < kMinIntSwitchCases ||
+        (float)caseMap.size() / nTargets < 0.5) {
+      return folly::none;
     }
   } else if (t == KindOfString) {
     if (caseMap.size() < kMinStringSwitchCases) {
-      return KindOfInvalid;
+      return folly::none;
     }
   }
 
@@ -5951,7 +6033,7 @@ void EmitterVisitor::markNewElem(Emitter& e) {
   m_evalStack.push(StackSym::W);
 }
 
-void EmitterVisitor::markProp(Emitter& e) {
+void EmitterVisitor::markProp(Emitter& e, PropAccessType propAccessType) {
   if (m_evalStack.empty()) {
     InvariantViolation(
       "Emitter encountered an empty evaluation stack inside "
@@ -5961,7 +6043,13 @@ void EmitterVisitor::markProp(Emitter& e) {
   }
   char sym = m_evalStack.top();
   if (sym == StackSym::C || sym == StackSym::L || sym == StackSym::T) {
-    m_evalStack.set(m_evalStack.size()-1, (sym | StackSym::P));
+    m_evalStack.set(
+      m_evalStack.size()-1,
+      (sym | (propAccessType == PropAccessType::NullSafe
+        ? StackSym::Q
+        : StackSym::P
+      ))
+    );
   } else {
     InvariantViolation(
       "Emitter encountered an unsupported StackSym \"%s\" on "
@@ -6117,15 +6205,11 @@ static Attr buildAttrs(ModifierExpressionPtr mod, bool isRef = false) {
  * compile time with constant input to get deterministic output.
  */
 const StaticString
-  s_HipHopSpecific("__HipHopSpecific"),
   s_IsFoldable("__IsFoldable"),
   s_ParamCoerceModeNull("__ParamCoerceModeNull"),
   s_ParamCoerceModeFalse("__ParamCoerceModeFalse");
 
 static void parseUserAttributes(FuncEmitter* fe, Attr& attrs) {
-  if (fe->userAttributes.count(s_HipHopSpecific.get())) {
-    attrs = attrs | AttrHPHPSpecific;
-  }
   if (fe->userAttributes.count(s_IsFoldable.get())) {
     attrs = attrs | AttrIsFoldable;
   }
@@ -6155,7 +6239,7 @@ static Attr buildMethodAttrs(MethodStatementPtr meth, FuncEmitter* fe,
   auto it = Option::FunctionSections.find(fullName);
   if ((it != Option::FunctionSections.end() && it->second == "hot") ||
       (RuntimeOption::EvalRandomHotFuncs &&
-       (hash_string_i(fullName.c_str()) & 8))) {
+       (hash_string_i_unsafe(fullName.c_str(), fullName.size()) & 8))) {
     attrs = attrs | AttrHot;
   }
 
@@ -6219,6 +6303,9 @@ determine_type_constraint_from_annot(const TypeAnnotationPtr annot,
     // we don't know how to handle.
     if (annot->isFunction() || annot->isMixed()) {
       return {};
+    }
+    if (annot->isTypeAccess()) {
+      flags = flags | TypeConstraint::TypeConstant;
     }
     if (annot->isTypeVar()) {
       flags = flags | TypeConstraint::TypeVar;
@@ -6298,14 +6385,38 @@ void EmitterVisitor::emitPostponedMeths() {
     fe->isAsync = funcScope->isAsync();
     fe->isGenerator = funcScope->isGenerator();
 
+    if (fe->isAsync && !fe->isGenerator && meth->retTypeAnnotation()) {
+      auto rta = meth->retTypeAnnotation();
+      auto nTypeArgs = rta->numTypeArgs();
+      if (!rta->isAwaitable() && !rta->isWaitHandle()) {
+        if (fe->isClosureBody) {
+          throw IncludeTimeFatalException(
+            meth,
+            "Return type hint for async closure must be awaitable"
+          );
+        } else {
+          throw IncludeTimeFatalException(
+            meth,
+            "Return type hint for async %s %s() must be awaitable",
+            meth->getClassScope() ? "method" : "function",
+            meth->getOriginalFullName().c_str()
+          );
+        }
+      }
+      if (nTypeArgs >= 2) {
+        throw IncludeTimeFatalException(
+          meth,
+          "Awaitable interface expects 1 type argument, %d given",
+          nTypeArgs);
+      }
+    }
+
     if (funcScope->userAttributes().count("__Memoize")) {
       auto const originalName = fe->name;
       auto const rewrittenName = makeStaticString(
         folly::sformat("{}$memoize_impl", fe->name->data()));
-      FuncEmitter* memoizeFe = nullptr;
-      auto const propName = makeStaticString(
-        folly::sformat("{}$memoize_cache", fe->name->data()));
 
+      FuncEmitter* memoizeFe = nullptr;
       if (meth->is(Statement::KindOfFunctionStatement)) {
         if (!p.m_top) {
           throw IncludeTimeFatalException(meth,
@@ -6316,32 +6427,19 @@ void EmitterVisitor::emitPostponedMeths() {
         fe->name = rewrittenName;
         top_fes.push_back(memoizeFe);
       } else {
-        PreClassEmitter *pce = fe->pce();
-
-        // Add a property to hold the memoized results
-        TypedValue tvProp;
-        if (!meth->getParams() || meth->getParams()->getCount() == 0) {
-          tvWriteNull(&tvProp);
-        } else {
-          tvProp = make_tv<KindOfArray>(staticEmptyArray());
-        }
-        Attr attrs = AttrPrivate;
-        attrs = attrs | (funcScope->isStatic() ? AttrStatic : AttrNone);
-        pce->addProperty(propName, attrs, nullptr, nullptr,
-                         &tvProp, RepoAuthType{});
-
         // Rename the method and create a new method with the original name
-        pce->renameMethod(originalName, rewrittenName);
-        memoizeFe = m_ue.newMethodEmitter(originalName, pce);
-        bool added UNUSED = pce->addMethod(memoizeFe);
+        fe->pce()->renameMethod(originalName, rewrittenName);
+        memoizeFe = m_ue.newMethodEmitter(originalName, fe->pce());
+        bool added UNUSED = fe->pce()->addMethod(memoizeFe);
         assert(added);
       }
 
       // Emit the new method that handles the memoization
       m_curFunc = memoizeFe;
       m_curFunc->isMemoizeWrapper = true;
+      addMemoizeProp(meth);
       emitMethodMetadata(meth, p.m_closureUseVars, p.m_top);
-      emitMemoizeMethod(meth, rewrittenName, propName);
+      emitMemoizeMethod(meth, rewrittenName);
 
       // Switch back to the original method and mark it as a memoize
       // implementation
@@ -6395,6 +6493,10 @@ void EmitterVisitor::bindUserAttributes(MethodStatementPtr meth,
   }
 }
 
+const StaticString s_Void("HH\\void");
+const char* attr_Deprecated = "__Deprecated";
+const StaticString s_attr_Deprecated(attr_Deprecated);
+
 void EmitterVisitor::bindNativeFunc(MethodStatementPtr meth,
                                     FuncEmitter *fe) {
   if (SystemLib::s_inited &&
@@ -6443,14 +6545,18 @@ void EmitterVisitor::bindNativeFunc(MethodStatementPtr meth,
   fe->docComment = makeStaticString(
     Option::GenerateDocComments ? meth->getDocComment().c_str() : ""
   );
-  fe->returnType = meth->retTypeAnnotation()->dataType();
+  auto retType = meth->retTypeAnnotation();
+  assert(retType || (meth->getName() == "__construct") ||
+                    (meth->getName() == "__destruct"));
+  fe->returnType = retType ? retType->dataType() : KindOfNull;
   fe->retUserType = makeStaticString(meth->getReturnTypeConstraint());
 
   FunctionScopePtr funcScope = meth->getFunctionScope();
   const char *funcname  = funcScope->getName().c_str();
   const char *classname = pce ? pce->name()->data() : nullptr;
-  BuiltinFunction nif = Native::GetBuiltinFunction(funcname, classname,
-                                                   modifiers->isStatic());
+  auto const& info = Native::GetBuiltinFunction(funcname, classname,
+                                                modifiers->isStatic());
+  BuiltinFunction nif = info.ptr;
   BuiltinFunction bif;
   if (!nif) {
     bif = Native::unimplementedWrapper;
@@ -6459,6 +6565,15 @@ void EmitterVisitor::bindNativeFunc(MethodStatementPtr meth,
     if (nativeAttrs & Native::AttrZendCompat) {
       bif = zend_wrap_func;
     } else {
+      if (retType) {
+        fe->retTypeConstraint = determine_type_constraint_from_annot(retType,
+                                                                     true);
+      } else {
+        fe->retTypeConstraint = TypeConstraint {
+          s_Void.get(),
+          TypeConstraint::ExtendedHint | TypeConstraint::HHType
+        };
+      }
       if (nativeAttrs & Native::AttrActRec) {
         // Call this native function with a raw ActRec*
         // rather than pulling out args for normal func calling
@@ -6491,6 +6606,11 @@ void EmitterVisitor::bindNativeFunc(MethodStatementPtr meth,
   Label topOfBody(e);
 
   Offset base = m_ue.bcPos();
+
+  if (meth->getFunctionScope()->userAttributes().count(attr_Deprecated)) {
+    emitDeprecationWarning(e, meth);
+  }
+
   fe->setBuiltinFunc(bif, nif, attributes, base);
   fillFuncEmitterParams(fe, meth->getParams(), true);
   e.NativeImpl();
@@ -6535,6 +6655,21 @@ void EmitterVisitor::emitMethodMetadata(MethodStatementPtr meth,
   fe->retUserType = makeStaticString(meth->getReturnTypeConstraint());
 
   auto annot = meth->retTypeAnnotation();
+  // For a non-generator async function with a return annotation of the form
+  // "Awaitable<T>", we set m_retTypeConstraint to T. For all other async
+  // functions, we leave m_retTypeConstraint empty.
+  if (annot && fe->isAsync && !fe->isGenerator) {
+    // Semantic checks ensure that the return annotation is "Awaitable" or
+    // "WaitHandle" and that it has at most one type parameter
+    assert(annot->isAwaitable() || annot->isWaitHandle());
+    assert(annot->numTypeArgs() <= 1);
+    bool isSoft = annot->isSoft();
+    // If annot was "Awaitable" with no type args, getTypeArg() will return an
+    // empty annotation
+    annot = annot->getTypeArg(0);
+    // If the original annotation was soft, make sure we preserve the softness
+    if (annot && isSoft) annot->setSoft();
+  }
   // Ideally we should handle the void case in TypeConstraint::check. This
   // should however get done in a different diff, since it could impact
   // perf in a negative way (#3145038)
@@ -6669,6 +6804,49 @@ void EmitterVisitor::emitMethodPrologue(Emitter& e, MethodStatementPtr meth) {
   }
 }
 
+const StaticString
+  s_trigger_error("trigger_error"),
+  s_is_deprecated("deprecated function");
+
+void EmitterVisitor::emitDeprecationWarning(Emitter& e,
+                                            MethodStatementPtr meth) {
+  auto funcScope = meth->getFunctionScope();
+
+  auto userAttributes DEBUG_ONLY = funcScope->userAttributes();
+  assert(userAttributes.find(attr_Deprecated) != userAttributes.end());
+
+  // Include the message from <<__Deprecated('<message>')>> in the warning
+  auto deprArgs = funcScope->getUserAttributeStringParams(attr_Deprecated);
+  auto deprMessage = deprArgs.empty()
+    ? s_is_deprecated.data()
+    : deprArgs.front();
+
+  { // preface the message with the name of the offending function
+    auto funcName = funcScope->getOriginalName();
+    BlockScopeRawPtr b = funcScope->getOuterScope();
+    if (b && b->is(BlockScope::ClassScope)) {
+      ClassScopePtr clsScope = dynamic_pointer_cast<ClassScope>(b);
+      if (clsScope->isTrait()) {
+        e.Self();
+        e.NameA();
+        e.String(makeStaticString("::" + funcName + ": " + deprMessage));
+        e.Concat();
+      } else {
+        e.String(makeStaticString(
+                   clsScope->getOriginalName() + "::" + funcName
+                   + ": " + deprMessage));
+      }
+    } else {
+      e.String(makeStaticString(funcName + ": " + deprMessage));
+    }
+  }
+
+  e.Int((funcScope->isSystem() || funcScope->isNative())
+        ? k_E_DEPRECATED : k_E_USER_DEPRECATED);
+  e.FCallBuiltin(2, 2, s_trigger_error.get());
+  emitPop(e);
+}
+
 void EmitterVisitor::emitMethod(MethodStatementPtr meth) {
   auto region = createRegion(meth, Region::Kind::FuncBody);
   enterRegion(region);
@@ -6677,6 +6855,10 @@ void EmitterVisitor::emitMethod(MethodStatementPtr meth) {
   Emitter e(meth, m_ue, *this);
   Label topOfBody(e);
   emitMethodPrologue(e, meth);
+
+  if (meth->getFunctionScope()->userAttributes().count(attr_Deprecated)) {
+    emitDeprecationWarning(e, meth);
+  }
 
   // emit code to create generator object
   if (m_curFunc->isGenerator) {
@@ -6695,6 +6877,9 @@ void EmitterVisitor::emitMethod(MethodStatementPtr meth) {
     loc->char0 = loc->char1-1;
     e.setTempLocation(loc);
     e.Null();
+    if (shouldEmitVerifyRetType()) {
+      e.VerifyRetTypeC();
+    }
     e.RetC();
     e.setTempLocation(LocationPtr());
   }
@@ -6728,37 +6913,97 @@ void EmitterVisitor::emitMethodDVInitializers(Emitter& e,
   if (hasOptional) e.JmpNS(topOfBody);
 }
 
+void EmitterVisitor::addMemoizeProp(MethodStatementPtr meth) {
+  assert(m_curFunc->isMemoizeWrapper);
+
+  if (meth->is(Statement::KindOfFunctionStatement)) {
+    // Functions use statics within themselves. So all we need to do here is
+    // set the name
+    m_curFunc->memoizePropName = makeStaticString("static$memoize_cache");
+    return;
+  }
+
+  auto pce = m_curFunc->pce();
+  auto classScope = meth->getClassScope();
+  auto funcScope = meth->getFunctionScope();
+  bool useSharedProp = !funcScope->isStatic();
+
+  std::string propNameBase;
+  if (useSharedProp) {
+    propNameBase = "$shared";
+    m_curFunc->hasMemoizeSharedProp = true;
+    m_curFunc->memoizeSharedPropIndex = pce->getNextMemoizeCacheKey();
+  } else {
+    propNameBase = funcScope->getName();
+  }
+
+  // The prop definition in traits conflicts with the definition in a class
+  // so make a different prop for each trait
+  std::string traitNamePart;
+  if (classScope && classScope->isTrait()) {
+    traitNamePart = classScope->getName();
+    // the backslash comes from namespaces. @jan thought that would cause
+    // issues, so use $ instead
+    for (char &c: traitNamePart) {
+      c = (c == '\\' ? '$' : c);
+    }
+    traitNamePart += "$";
+  }
+
+  m_curFunc->memoizePropName = makeStaticString(
+    folly::sformat("{}${}memoize_cache", propNameBase, traitNamePart));
+
+  TypedValue tvProp;
+  if (useSharedProp ||
+      (meth->getParams() && meth->getParams()->getCount() > 0)) {
+    tvProp = make_tv<KindOfArray>(staticEmptyArray());
+  } else {
+    tvWriteNull(&tvProp);
+  }
+
+  Attr attrs = AttrPrivate | AttrBuiltin;
+  attrs = attrs | (funcScope->isStatic() ? AttrStatic : AttrNone);
+  pce->addProperty(m_curFunc->memoizePropName, attrs, nullptr, nullptr, &tvProp,
+                   RepoAuthType{});
+}
+
 void EmitterVisitor::emitMemoizeProp(Emitter& e,
                                      MethodStatementPtr meth,
-                                     const StringData* propName,
                                      Id localID,
                                      const std::vector<Id>& paramIDs,
                                      uint numParams) {
+  assert(m_curFunc->isMemoizeWrapper);
+
   if (meth->is(Statement::KindOfFunctionStatement)) {
     emitVirtualLocal(localID);
   } else if (meth->getFunctionScope()->isStatic()) {
     m_evalStack.push(StackSym::K);
     m_evalStack.setClsBaseType(SymbolicStack::CLS_SELF);
-    e.String(propName);
+    e.String(m_curFunc->memoizePropName);
     markSProp(e);
   } else {
     m_evalStack.push(StackSym::H);
     m_evalStack.setKnownCls(m_curFunc->pce()->name(), false);
     m_evalStack.push(StackSym::T);
-    m_evalStack.setString(propName);
-    markProp(e);
+    m_evalStack.setString(m_curFunc->memoizePropName);
+    markProp(e, PropAccessType::Normal);
   }
 
   assert(numParams <= paramIDs.size());
   for (uint i = 0; i < numParams; i++) {
-    emitVirtualLocal(paramIDs[i]);
+    if (i == 0 && m_curFunc->hasMemoizeSharedProp) {
+      e.Int(m_curFunc->memoizeSharedPropIndex);
+    } else {
+      emitVirtualLocal(paramIDs[i]);
+    }
     markElem(e);
   }
 }
 
 void EmitterVisitor::emitMemoizeMethod(MethodStatementPtr meth,
-                                       const StringData* methName,
-                                       const StringData* propName) {
+                                       const StringData* methName) {
+  assert(m_curFunc->isMemoizeWrapper);
+
   if (meth->getFunctionScope()->isRefReturn()) {
     throw IncludeTimeFatalException(meth,
       "<<__Memoize>> cannot be used on functions that return by reference");
@@ -6768,9 +7013,15 @@ void EmitterVisitor::emitMemoizeMethod(MethodStatementPtr meth,
       "<<__Memoize>> cannot be used on functions with variable arguments");
   }
 
+  auto classScope = meth->getClassScope();
+  if (classScope && classScope->isInterface()) {
+    throw IncludeTimeFatalException(meth,
+      "<<__Memoize>> cannot be used in interfaces");
+  }
+
   bool isFunc = meth->is(Statement::KindOfFunctionStatement);
   int numParams = m_curFunc->params.size();
-  int staticLocalID = 0;
+  std::vector<Id> cacheLookup;
 
   auto region = createRegion(meth, Region::Kind::FuncBody);
   enterRegion(region);
@@ -6783,6 +7034,7 @@ void EmitterVisitor::emitMemoizeMethod(MethodStatementPtr meth,
   emitMethodPrologue(e, meth);
 
   // Function start
+  int staticLocalID = 0;
   if (isFunc) {
     // static ${propName} = {numParams > 0 ? array() : null};
     staticLocalID = m_curFunc->allocUnnamedLocal();
@@ -6792,21 +7044,24 @@ void EmitterVisitor::emitMemoizeMethod(MethodStatementPtr meth,
     } else {
       e.Array(staticEmptyArray());
     }
-    e.StaticLocInit(staticLocalID, propName);
+    e.StaticLocInit(staticLocalID, m_curFunc->memoizePropName);
   } else if (!meth->getFunctionScope()->isStatic()) {
     e.CheckThis();
   }
 
-  std::vector<Id> paramNumToLocalID(numParams);
+  if (m_curFunc->hasMemoizeSharedProp) {
+    // The code below depends on cacheLookup having the right number of elements
+    // Push a dummy value even though we'll use the cacheID as an int instead
+    // instead of emitting a local
+    cacheLookup.push_back(0);
+  }
 
-  if (numParams == 0) {
+  if (numParams == 0 && cacheLookup.size() == 0) {
     // if (${propName} !== null)
-    emitMemoizeProp(e, meth, propName, staticLocalID, paramNumToLocalID, 0);
+    emitMemoizeProp(e, meth, staticLocalID, cacheLookup, 0);
     emitIsType(e, IsTypeOp::Null);
     e.JmpNZ(cacheMiss);
   } else {
-    auto serMethName = makeStaticString("HH\\serialize_memoize_param");
-
     // Serialize all the params into something we can use for the key
     for (int i = 0; i < numParams; i++) {
       if (m_curFunc->params[i].byRef) {
@@ -6815,48 +7070,14 @@ void EmitterVisitor::emitMemoizeMethod(MethodStatementPtr meth,
           "reference");
       }
 
-      const TypeConstraint &tc = m_curFunc->params[i].typeConstraint;
-      bool blessedType =
-        tc.underlyingDataType() == DataType::KindOfBoolean ||
-        tc.underlyingDataType() == DataType::KindOfInt64 ||
-        (tc.underlyingDataType() == DataType::KindOfString && !tc.isNullable());
-      blessedType &= tc.hasConstraint() && tc.isPrecise() && !tc.isSoft();
+      // Translate the arg to a memoize key
+      int serResultLocal = m_curFunc->allocUnnamedLocal();
+      cacheLookup.push_back(serResultLocal);
 
-      if (blessedType) {
-        paramNumToLocalID[i] = i;
-        continue;
-      }
-
-      // We don't know statically that the param is useable as a key. So:
-      //  1: Check if it's an int. If so, use it directly
-      //  2: Otherwise, call the serialization function
-      //  3: In either case, store the result in a new local
-      Label notInt, storeLocal;
-      paramNumToLocalID[i] = m_curFunc->allocUnnamedLocal();
-
-      // $valN = is_int($paramN) ?
-      //   $paramN : HH\serialize_memoize_param($paramN);
-      emitVirtualLocal(paramNumToLocalID[i]);
-      emitVirtualLocal(i);
-      emitIsType(e, IsTypeOp::Int);
-      e.JmpZ(notInt);
-
+      emitVirtualLocal(serResultLocal);
       emitVirtualLocal(i);
       emitCGet(e);
-      e.Jmp(storeLocal);
-
-      notInt.set(e);
-      auto fpiStart = m_ue.bcPos();
-      e.FPushFuncD(1, serMethName);
-      {
-        FPIRegionRecorder fpi(this, m_ue, m_evalStack, fpiStart);
-        emitVirtualLocal(i);
-        emitFPass(e, 0, PassByRefKind::ErrorOnCell);
-      }
-      e.FCall(1);
-      emitConvertToCell(e);
-
-      storeLocal.set(e);
+      e.GetMemoKey();
       emitSet(e);
       emitPop(e);
     }
@@ -6867,25 +7088,30 @@ void EmitterVisitor::emitMemoizeMethod(MethodStatementPtr meth,
     //    array_key_exists() check
     //  - Otherwise we need an isset check to make sure we can dereference the
     //    first N - 1 args, and then an array_key_exists() check
+    int cacheLookupLen = cacheLookup.size();
     bool noRetNull =
-      m_curFunc->retTypeConstraint.hasConstraint() &&
-      !m_curFunc->retTypeConstraint.isSoft() &&
-      !m_curFunc->retTypeConstraint.isNullable();
+      meth->getFunctionScope()->isAsync() ||
+        (m_curFunc->retTypeConstraint.hasConstraint() &&
+        !m_curFunc->retTypeConstraint.isSoft() &&
+        !m_curFunc->retTypeConstraint.isNullable());
 
-    if (numParams > 1 || noRetNull) {
+    if (cacheLookupLen > 1 || noRetNull) {
       // if (isset(${propName}[$param1]...[noRetNull ? $paramN : $paramN-1]))
-      emitMemoizeProp(e, meth, propName, staticLocalID, paramNumToLocalID,
-                      noRetNull ? numParams : numParams - 1);
+      emitMemoizeProp(e, meth, staticLocalID, cacheLookup,
+                      noRetNull ? cacheLookupLen : cacheLookupLen - 1);
       emitIsset(e);
       e.JmpZ(cacheMiss);
     }
 
     if (!noRetNull) {
       // if (array_key_exists($paramN, ${propName}[$param1][...][$paramN-1]))
-      emitVirtualLocal(paramNumToLocalID[numParams - 1]);
-      emitCGet(e);
-      emitMemoizeProp(e, meth, propName, staticLocalID, paramNumToLocalID,
-                      numParams - 1);
+      if (cacheLookupLen == 1 && m_curFunc->hasMemoizeSharedProp) {
+        e.Int(m_curFunc->memoizeSharedPropIndex);
+      } else {
+        emitVirtualLocal(cacheLookup[cacheLookupLen - 1]);
+        emitCGet(e);
+      }
+      emitMemoizeProp(e, meth, staticLocalID, cacheLookup, cacheLookupLen - 1);
       emitCGet(e);
       e.AKExists();
       e.JmpZ(cacheMiss);
@@ -6893,28 +7119,27 @@ void EmitterVisitor::emitMemoizeMethod(MethodStatementPtr meth,
   }
 
   // return $<propName>[$param1][...][$paramN]
-  emitMemoizeProp(e, meth, propName, staticLocalID, paramNumToLocalID,
-                  numParams);
+  int cacheLookupLen = cacheLookup.size();
+  emitMemoizeProp(e, meth, staticLocalID, cacheLookup, cacheLookupLen);
   emitCGet(e);
   e.RetC();
 
   // Otherwise, call the memoized func, store the result, and return it
   cacheMiss.set(e);
-  emitMemoizeProp(e, meth, propName, staticLocalID, paramNumToLocalID,
-                  numParams);
+  emitMemoizeProp(e, meth, staticLocalID, cacheLookup, cacheLookupLen);
   auto fpiStart = m_ue.bcPos();
   if (isFunc) {
     e.FPushFuncD(numParams, methName);
   } else if (meth->getFunctionScope()->isStatic()) {
     emitClsIfSPropBase(e);
 
-    auto classScope = meth->getClassScope();
     if (classScope && classScope->isTrait()) {
       e.String(methName);
       e.Self();
       fpiStart = m_ue.bcPos();
       e.FPushClsMethodF(numParams);
     } else {
+      fpiStart = m_ue.bcPos();
       e.FPushClsMethodD(numParams, methName, m_curFunc->pce()->name());
     }
   } else {
@@ -6924,7 +7149,7 @@ void EmitterVisitor::emitMemoizeMethod(MethodStatementPtr meth,
   }
   {
     FPIRegionRecorder fpi(this, m_ue, m_evalStack, fpiStart);
-    for (uint i = 0; i < m_curFunc->params.size(); i++) {
+    for (uint i = 0; i < numParams; i++) {
       emitVirtualLocal(i);
       emitFPass(e, i, PassByRefKind::ErrorOnCell);
     }
@@ -7078,13 +7303,6 @@ void EmitterVisitor::emitVirtualLocal(int localId) {
   m_evalStack.setInt(localId);
 }
 
-static bool isNormalLocalVariable(const ExpressionPtr& expr) {
-  SimpleVariable* sv = static_cast<SimpleVariable*>(expr.get());
-  return (expr->is(Expression::KindOfSimpleVariable) &&
-          !sv->isSuperGlobal() &&
-          !sv->isThis());
-}
-
 template<class Expr>
 void EmitterVisitor::emitVirtualClassBase(Emitter& e, Expr* node) {
   prepareEvalStack();
@@ -7151,6 +7369,9 @@ bool EmitterVisitor::emitSystemLibVarEnvFunc(Emitter& e,
   if (call->isCallToFunction("extract")) {
     emitFuncCall(e, call,
                  "__SystemLib\\extract", call->getParams());
+    return true;
+  } else if (call->isCallToFunction("assert")) {
+    emitFuncCall(e, call, "__SystemLib\\assert", call->getParams());
     return true;
   } else if (call->isCallToFunction("parse_str")) {
     emitFuncCall(e, call, "__SystemLib\\parse_str", call->getParams());
@@ -7277,7 +7498,9 @@ Func* EmitterVisitor::canEmitBuiltinCall(const std::string& name,
       f->isMethod() ||
       (f->numParams() > Native::maxFCallBuiltinArgs()) ||
       (numParams > f->numParams()) ||
-      f->hasVariadicCaptureParam()) return nullptr;
+      f->hasVariadicCaptureParam() ||
+      (f->userAttributes().count(
+        LowStringPtr(s_attr_Deprecated.get())))) return nullptr;
 
   if ((f->returnType() == KindOfDouble) &&
        !Native::allowFCallBuiltinDoubles()) return nullptr;
@@ -7287,8 +7510,7 @@ Func* EmitterVisitor::canEmitBuiltinCall(const std::string& name,
     const ClassInfo::MethodInfo* info = f->methInfo();
     if (info->attribute & (ClassInfo::NoFCallBuiltin |
                            ClassInfo::VariableArguments |
-                           ClassInfo::RefVariableArguments |
-                           ClassInfo::MixedVariableArguments)) {
+                           ClassInfo::RefVariableArguments)) {
       return nullptr;
     }
   } else if (!(f->attrs() & AttrNative)) {
@@ -7432,6 +7654,7 @@ void EmitterVisitor::emitFuncCall(Emitter& e, FunctionCallPtr node,
       bool byRef = fcallBuiltin->byRef(i);
       emitBuiltinCallArg(e, (*params)[i], i, byRef);
     }
+
     if (fcallBuiltin->methInfo()) {
       // IDL style
       for (; i < fcallBuiltin->numParams(); i++) {
@@ -7456,7 +7679,7 @@ void EmitterVisitor::emitFuncCall(Emitter& e, FunctionCallPtr node,
     {
       FPIRegionRecorder fpi(this, m_ue, m_evalStack, fpiStart);
       for (int i = 0; i < numParams; i++) {
-        emitFuncCallArg(e, (*params)[i], i);
+        emitFuncCallArg(e, (*params)[i], i, unpack && i + 1 == numParams);
       }
     }
     if (unpack) {
@@ -7477,11 +7700,10 @@ void EmitterVisitor::emitClassTraitPrecRule(PreClassEmitter* pce,
 
   PreClass::TraitPrecRule rule(traitName, methodName);
 
-  std::set<std::string> otherTraitNames;
+  std::unordered_set<std::string> otherTraitNames;
   stmt->getOtherTraitNames(otherTraitNames);
-  for (std::set<std::string>::iterator it = otherTraitNames.begin();
-       it != otherTraitNames.end(); it++) {
-    rule.addOtherTraitName(makeStaticString(*it));
+  for (auto const& name : otherTraitNames) {
+    rule.addOtherTraitName(makeStaticString(name));
   }
 
   pce->addTraitPrecRule(rule);
@@ -7523,16 +7745,8 @@ void EmitterVisitor::emitClassUseTrait(PreClassEmitter* pce,
 
 void EmitterVisitor::emitTypedef(Emitter& e, TypedefStatementPtr td) {
   auto const nullable = td->annot->isNullable();
-  auto const valueStr = td->annot->stripNullable().vanillaName();
-  auto const kind =
-    td->annot->stripNullable().isFunction()  ? KindOfAny :
-    td->annot->stripNullable().isMixed()     ? KindOfAny :
-    !strcasecmp(valueStr.c_str(), "array")   ? KindOfArray :
-    !strcasecmp(valueStr.c_str(), "HH\\int") ? KindOfInt64 :
-    !strcasecmp(valueStr.c_str(), "HH\\bool") ? KindOfBoolean :
-    !strcasecmp(valueStr.c_str(), "HH\\string") ? KindOfString :
-    !strcasecmp(valueStr.c_str(), "HH\\float") ? KindOfDouble :
-    KindOfObject;
+  auto const annot = td->annot->stripNullable();
+  auto const valueStr = annot.vanillaName();
 
   // We have to merge the strings as litstrs to ensure namedentity
   // creation.
@@ -7541,10 +7755,28 @@ void EmitterVisitor::emitTypedef(Emitter& e, TypedefStatementPtr td) {
   m_ue.mergeLitstr(name);
   m_ue.mergeLitstr(value);
 
+  AnnotType type;
+  if (annot.isFunction() || annot.isMixed()) {
+    type = AnnotType::Mixed;
+  } else {
+    auto const at = nameToAnnotType(value);
+    type = at ? *at : AnnotType::Object;
+    // Type aliases are always defined at top-level scope, so
+    // they're not allowed to reference "self" or "parent" (and
+    // "static" is already disallowed by the parser, so we don't
+    // need to worry about it here).
+    if (UNLIKELY(type == AnnotType::Self || type == AnnotType::Parent)) {
+      throw IncludeTimeFatalException(
+        e.getNode(),
+        "Cannot access %s when no class scope is active",
+        type == AnnotType::Self ? "self" : "parent");
+    }
+  }
+
   TypeAlias record;
   record.name     = name;
   record.value    = value;
-  record.kind     = kind;
+  record.type     = type;
   record.nullable = nullable;
   record.attrs    = AttrNone;
   Id id = m_ue.addTypeAlias(record);
@@ -7571,9 +7803,11 @@ void EmitterVisitor::emitClass(Emitter& e,
   Attr attr = cNode->isInterface() ? AttrInterface :
               cNode->isTrait()     ? AttrTrait     :
               cNode->isAbstract()  ? AttrAbstract  :
-              cNode->isFinal()     ? AttrFinal     :
-              cNode->isEnum()      ? AttrEnum      :
+              cNode->isEnum()      ? (AttrEnum | AttrFinal) :
                                      AttrNone;
+  if (cNode->isFinal()) {
+    attr = attr | AttrFinal;
+  }
   if (Option::WholeProgram) {
     if (!cNode->isRedeclaring() &&
         cNode->derivesFromRedeclaring() == Derivation::Normal) {
@@ -7644,7 +7878,8 @@ void EmitterVisitor::emitClass(Emitter& e,
   for (size_t i = 0; i < usedTraits.size(); i++) {
     pce->addUsedTrait(makeStaticString(usedTraits[i]));
   }
-  if (cNode->isTrait() || cNode->isInterface()) {
+  pce->setNumDeclMethods(cNode->getNumDeclMethods());
+  if (cNode->isTrait() || cNode->isInterface() || Option::WholeProgram) {
     for (auto& reqExtends : cNode->getClassRequiredExtends()) {
       pce->addClassRequirement(
         PreClass::ClassRequirement(makeStaticString(reqExtends), true));
@@ -7739,43 +7974,58 @@ void EmitterVisitor::emitClass(Emitter& e,
         }
       } else if (ClassConstantPtr cc =
                  dynamic_pointer_cast<ClassConstant>((*stmts)[i])) {
+
         ExpressionListPtr el(cc->getConList());
-        StringData* typeConstraint = makeStaticString(
-          cc->getTypeConstraint());
+        StringData* typeConstraint =
+          makeStaticString(cc->getTypeConstraint());
         int nCons = el->getCount();
-        for (int ii = 0; ii < nCons; ii++) {
-          AssignmentExpressionPtr ae(
-            static_pointer_cast<AssignmentExpression>((*el)[ii]));
-          ConstantExpressionPtr con(
-            static_pointer_cast<ConstantExpression>(ae->getVariable()));
-          ExpressionPtr vNode(ae->getValue());
-          StringData* constName = makeStaticString(con->getName());
-          assert(vNode);
-          TypedValue tvVal;
-          if (vNode->isArray()) {
-            throw IncludeTimeFatalException(
-              cc, "Arrays are not allowed in class constants");
-          } else if (vNode->isCollection()) {
-            throw IncludeTimeFatalException(
-              cc, "Collections are not allowed in class constants");
-          } else if (vNode->isScalar()) {
-            initScalar(tvVal, vNode);
-          } else {
-            tvWriteUninit(&tvVal);
-            if (nonScalarConstVec == nullptr) {
-              nonScalarConstVec = new NonScalarVec();
-            }
-            nonScalarConstVec->push_back(NonScalarPair(constName, vNode));
+
+        if (cc->isAbstract()) {
+          for (int ii = 0; ii < nCons; ii++) {
+            ConstantExpressionPtr con(
+              static_pointer_cast<ConstantExpression>((*el)[ii]));
+            StringData* constName = makeStaticString(con->getName());
+            bool added UNUSED =
+              pce->addAbstractConstant(constName, typeConstraint,
+                                       cc->isTypeconst());
+            assert(added);
           }
-          // Store PHP source code for constant initializer.
-          std::ostringstream os;
-          CodeGenerator cg(&os, CodeGenerator::PickledPHP);
-          AnalysisResultPtr ar(new AnalysisResult());
-          vNode->outputPHP(cg, ar);
-          bool added UNUSED = pce->addConstant(
-            constName, typeConstraint, &tvVal,
-            makeStaticString(os.str()));
-          assert(added);
+        } else {
+          for (int ii = 0; ii < nCons; ii++) {
+            AssignmentExpressionPtr ae(
+              static_pointer_cast<AssignmentExpression>((*el)[ii]));
+            ConstantExpressionPtr con(
+              static_pointer_cast<ConstantExpression>(ae->getVariable()));
+            ExpressionPtr vNode(ae->getValue());
+            StringData* constName = makeStaticString(con->getName());
+            assert(vNode);
+            TypedValue tvVal;
+            if (vNode->isArray()) {
+              throw IncludeTimeFatalException(
+                cc, "Arrays are not allowed in class constants");
+            } else if (vNode->isCollection()) {
+              throw IncludeTimeFatalException(
+                cc, "Collections are not allowed in class constants");
+            } else if (vNode->isScalar()) {
+              initScalar(tvVal, vNode);
+            } else {
+              tvWriteUninit(&tvVal);
+              if (nonScalarConstVec == nullptr) {
+                nonScalarConstVec = new NonScalarVec();
+              }
+              nonScalarConstVec->push_back(NonScalarPair(constName, vNode));
+            }
+            // Store PHP source code for constant initializer.
+            std::ostringstream os;
+            CodeGenerator cg(&os, CodeGenerator::PickledPHP);
+            AnalysisResultPtr ar(new AnalysisResult());
+            vNode->outputPHP(cg, ar);
+            bool added UNUSED = pce->addConstant(
+              constName, typeConstraint, &tvVal,
+              makeStaticString(os.str()),
+              cc->isTypeconst());
+            assert(added);
+          }
         }
       } else if (UseTraitStatementPtr useStmt =
                  dynamic_pointer_cast<UseTraitStatement>((*stmts)[i])) {
@@ -7961,6 +8211,7 @@ void EmitterVisitor::emitForeach(Emitter& e,
     bIterStart = m_ue.bcPos();
     if (key && !listKey) {
       visit(key);
+      emitClsIfSPropBase(e);
     }
     if (listVal) {
       emitForeachListAssignment(
@@ -7970,6 +8221,7 @@ void EmitterVisitor::emitForeach(Emitter& e,
       );
     } else {
       visit(val);
+      emitClsIfSPropBase(e);
       emitVirtualLocal(valTempLocal);
       if (strong) {
         emitVGet(e);
@@ -8245,7 +8497,7 @@ void EmitterVisitor::newFPIRegion(Offset start, Offset end, Offset fpOff) {
 
 void EmitterVisitor::copyOverCatchAndFaultRegions(FuncEmitter* fe) {
   for (auto& eh : m_catchRegions) {
-    EHEnt& e = fe->addEHEnt();
+    auto& e = fe->addEHEnt();
     e.m_type = EHEnt::Type::Catch;
     e.m_base = eh->m_start;
     e.m_past = eh->m_end;
@@ -8261,7 +8513,7 @@ void EmitterVisitor::copyOverCatchAndFaultRegions(FuncEmitter* fe) {
   }
   m_catchRegions.clear();
   for (auto& fr : m_faultRegions) {
-    EHEnt& e = fe->addEHEnt();
+    auto& e = fe->addEHEnt();
     e.m_type = EHEnt::Type::Fault;
     e.m_base = fr->m_start;
     e.m_past = fr->m_end;
@@ -8388,9 +8640,10 @@ void EmitterVisitor::initScalar(TypedValue& tvVal, ExpressionPtr val) {
 bool EmitterVisitor::requiresDeepInit(ExpressionPtr initExpr) const {
   switch (initExpr->getKindOf()) {
     case Expression::KindOfScalarExpression:
-    case Expression::KindOfConstantExpression:
-    case Expression::KindOfClassConstantExpression:
       return false;
+    case Expression::KindOfClassConstantExpression:
+    case Expression::KindOfConstantExpression:
+      return !initExpr->isScalar();
     case Expression::KindOfUnaryOpExpression: {
       UnaryOpExpressionPtr u(
         static_pointer_cast<UnaryOpExpression>(initExpr));
@@ -8415,7 +8668,12 @@ bool EmitterVisitor::requiresDeepInit(ExpressionPtr initExpr) const {
       } else if (u->getOp() == T_FILE || u->getOp() == T_DIR) {
         return false;
       }
-      // fall through
+      return true;
+    }
+    case Expression::KindOfBinaryOpExpression: {
+      BinaryOpExpressionPtr b(
+        static_pointer_cast<BinaryOpExpression>(initExpr));
+      return requiresDeepInit(b->getExp1()) || requiresDeepInit(b->getExp2());
     }
     default:
       return true;
@@ -8742,9 +9000,11 @@ emitHHBCNativeClassUnit(const HhbcExtClassInfo* builtinClasses,
     bool hasCtor = false;
     for (ssize_t j = 0; j < e.info->m_methodCount; ++j) {
       const HhbcExtMethodInfo* methodInfo = &(e.info->m_methods[j]);
-      static const StringData* asyncGenCls = makeStaticString("asyncgenerator");
+      static const StringData* asyncGenCls =
+        makeStaticString("hh\\asyncgenerator");
       static const StringData* generatorCls = makeStaticString("generator");
-      static const StringData* waitHandleCls = makeStaticString("waithandle");
+      static const StringData* waitHandleCls =
+        makeStaticString("hh\\waithandle");
       static const StringData* gwhMeth = makeStaticString("getwaithandle");
       StringData* methName = makeStaticString(methodInfo->m_name);
       GeneratorMethod* cmeth;
@@ -8811,11 +9071,14 @@ emitHHBCNativeClassUnit(const HhbcExtClassInfo* builtinClasses,
         } catch (Exception& e) {
           assert(false);
         }
+        // We are not supporting type constants for native classes
+        // AFAIK emitHHBCNativeClassUnit is only used for legacy idl files
         pce->addConstant(
           cnsInfo->name.get(),
           nullptr,
           (TypedValue*)(&val),
-          staticEmptyString());
+          staticEmptyString(),
+          /* typeconst = */ false);
       }
     }
     {
@@ -8956,6 +9219,7 @@ static void
 commitGlobalData(std::unique_ptr<ArrayTypeTable::Builder> arrTable) {
   auto gd                     = Repo::GlobalData{};
   gd.HardTypeHints            = Option::HardTypeHints;
+  gd.HardReturnTypeHints      = Option::HardReturnTypeHints;
   gd.UsedHHBBC                = Option::UseHHBBC;
   gd.HardPrivatePropInference = true;
 
@@ -9071,34 +9335,13 @@ void emitAllHHBC(AnalysisResultPtr&& ar) {
     return;
   }
 
+  RuntimeOption::EvalJit = false; // For HHBBC to invoke builtins.
   auto pair = HHBBC::whole_program(std::move(ues));
   batchCommit(std::move(pair.first));
   commitGlobalData(std::move(pair.second));
 }
 
 extern "C" {
-
-StringData* hphp_compiler_serialize_code_model_for(String code, String prefix) {
-  AnalysisResultPtr ar(new AnalysisResult());
-  auto statements = Parser::ParseString(code, ar, nullptr, false);
-  if (statements != nullptr) {
-    LabelScopePtr labelScope(new LabelScope());
-    auto block = BlockStatementPtr(
-      new BlockStatement(
-        BlockScopePtr(), labelScope, statements->getLocation(), statements
-      )
-    );
-    std::ostringstream serialized;
-    CodeGenerator cg(&serialized, CodeGenerator::Output::CodeModel);
-    cg.setAstClassPrefix(prefix.data());
-    block->outputCodeModel(cg);
-    return StringData::Make(serialized.str().c_str(),
-                            serialized.str().length(),
-                            CopyString);
-  } else {
-    return StringData::Make();
-  }
-}
 
 /**
  * This is the entry point from the runtime; i.e. online bytecode generation.
@@ -9114,6 +9357,8 @@ Unit* hphp_compiler_parse(const char* code, int codeLen, const MD5& md5,
   if (UNLIKELY(!code)) {
     // Do initialization when code is null; see above.
     Option::EnableHipHopSyntax = RuntimeOption::EnableHipHopSyntax;
+    Option::HardReturnTypeHints =
+      (RuntimeOption::EvalCheckReturnTypeHints >= 3);
     Option::EnableZendCompat = RuntimeOption::EnableZendCompat;
     Option::JitEnableRenameFunction = RuntimeOption::EvalJitEnableRenameFunction;
     for (auto& i : RuntimeOption::DynamicInvokeFunctions) {
@@ -9123,7 +9368,6 @@ Unit* hphp_compiler_parse(const char* code, int codeLen, const MD5& md5,
     Option::RecordErrors = false;
     Option::ParseTimeOpts = false;
     Option::WholeProgram = false;
-    Type::InitTypeHintMap();
     BuiltinSymbols::LoadSuperGlobals();
     TypeConstraint tc;
     return nullptr;

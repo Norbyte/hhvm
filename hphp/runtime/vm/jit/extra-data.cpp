@@ -16,8 +16,6 @@
 
 #include "hphp/runtime/vm/jit/extra-data.h"
 
-#include "hphp/runtime/ext/ext_generator.h"
-#include "hphp/runtime/ext/asio/async_function_wait_handle.h"
 #include "hphp/runtime/vm/jit/ssa-tmp.h"
 #include "hphp/runtime/vm/jit/abi-x64.h"
 #include "hphp/util/text-util.h"
@@ -26,6 +24,7 @@ namespace HPHP { namespace jit {
 
 std::string NewStructData::show() const {
   std::ostringstream os;
+  os << offset.offset << ',';
   auto delim = "";
   for (uint32_t i = 0; i < numKeys; i++) {
     os << delim << "\"" <<
@@ -36,46 +35,14 @@ std::string NewStructData::show() const {
   return os.str();
 }
 
-const RawMemData::Info& RawMemData::info() const {
-  static const Info infos[] = {
-    {c_WaitHandle::stateOff(),    sz::byte,  jit::Type::Int},
-    {c_AsyncFunctionWaitHandle::resumeAddrOff(),
-                                  sz::qword, jit::Type::TCA|jit::Type::Nullptr},
-    {c_AsyncFunctionWaitHandle::resumeOffsetOff(),
-                                  sz::dword, jit::Type::Int},
-    {c_Generator::resumeAddrOff(),
-                                  sz::qword, jit::Type::TCA|jit::Type::Nullptr},
-    {c_Generator::resumeOffsetOff(),
-                                  sz::dword, jit::Type::Int},
-    {c_Generator::stateOff(),  sz::byte,  jit::Type::Int},
-    {CONTOFF(m_index),            sz::qword, jit::Type::Int},
-    {StringData::sizeOff(),       sz::dword, jit::Type::Int},
-    {Func::paramCountsOff(),      sz::dword, jit::Type::Int},
-  };
-  static_assert(sizeof infos / sizeof infos[0] == kNumTypes,
-                "Incorrect size of infos array");
-
-  always_assert(type < kNumTypes);
-  return infos[type];
-}
-
-std::string RawMemData::show() const {
-  switch (type) {
-#   define RAW_TYPE(name) case name: return #name;
-    RAW_MEM_DATA_TYPES
-#   undef RAW_TYPE
-  }
-  not_reached();
-}
-
 //////////////////////////////////////////////////////////////////////
 
 namespace {
 
-FOLLY_CREATE_HAS_MEMBER_FN_TRAITS(has_cseHash,   cseHash);
-FOLLY_CREATE_HAS_MEMBER_FN_TRAITS(has_cseEquals, cseEquals);
-FOLLY_CREATE_HAS_MEMBER_FN_TRAITS(has_clone,     clone);
-FOLLY_CREATE_HAS_MEMBER_FN_TRAITS(has_show,      show);
+FOLLY_CREATE_HAS_MEMBER_FN_TRAITS(has_hash,   hash);
+FOLLY_CREATE_HAS_MEMBER_FN_TRAITS(has_equals, equals);
+FOLLY_CREATE_HAS_MEMBER_FN_TRAITS(has_clone,  clone);
+FOLLY_CREATE_HAS_MEMBER_FN_TRAITS(has_show,   show);
 
 /*
  * dispatchExtra translates from runtime values for the Opcode enum
@@ -129,27 +96,27 @@ RetType dispatchExtra(Opcode opc, IRExtraData* data, Args&&... args) {
 
 template<class T>
 typename std::enable_if<
-  has_cseHash<T,size_t () const>::value,
+  has_hash<T,size_t () const>::value,
   size_t
->::type cseHashExtraImpl(T* t) { return t->cseHash(); }
-size_t cseHashExtraImpl(IRExtraData*) {
-  // This probably means an instruction was marked CanCSE but its
-  // extra data had no hash function.
+>::type hashExtraImpl(T* t) { return t->hash(); }
+size_t hashExtraImpl(IRExtraData*) {
+  // This probably means we tried to hash an IRInstruction with extra data that
+  // had no hash function.
   always_assert(!"attempted to hash extra data that didn't "
     "provide a hash function");
 }
 
 template<class T>
 typename std::enable_if<
-  has_cseEquals<T,bool (T const&) const>::value ||
-  has_cseEquals<T,bool (T)        const>::value,
+  has_equals<T,bool (T const&) const>::value ||
+  has_equals<T,bool (T)        const>::value,
   bool
->::type cseEqualsExtraImpl(T* t, IRExtraData* o) {
-  return t->cseEquals(*static_cast<T*>(o));
+>::type equalsExtraImpl(T* t, IRExtraData* o) {
+  return t->equals(*static_cast<T*>(o));
 }
-bool cseEqualsExtraImpl(IRExtraData*, IRExtraData*) {
-  // This probably means an instruction was marked CanCSE but its
-  // extra data had no equals function.
+bool equalsExtraImpl(IRExtraData*, IRExtraData*) {
+  // This probably means we tried to compare IRInstructions with extra data that
+  // had no equals function.
   always_assert(!"attempted to compare extra data that didn't "
                  "provide an equals function");
 }
@@ -179,19 +146,27 @@ typename std::enable_if<
 >::type showExtraImpl(T* t) { return t->show(); }
 std::string showExtraImpl(const IRExtraData*) { return "..."; }
 
-MAKE_DISPATCHER(HashDispatcher, size_t, cseHashExtraImpl);
-MAKE_DISPATCHER(EqualsDispatcher, bool, cseEqualsExtraImpl);
+MAKE_DISPATCHER(HashDispatcher, size_t, hashExtraImpl);
+MAKE_DISPATCHER(EqualsDispatcher, bool, equalsExtraImpl);
 MAKE_DISPATCHER(CloneDispatcher, IRExtraData*, cloneExtraImpl);
 MAKE_DISPATCHER(ShowDispatcher, std::string, showExtraImpl);
 
-} // namespace
-
-size_t cseHashExtra(Opcode opc, IRExtraData* data) {
-  return dispatchExtra<size_t,HashDispatcher>(opc, data);
 }
 
-bool cseEqualsExtra(Opcode opc, IRExtraData* data, IRExtraData* other) {
-  return dispatchExtra<bool,EqualsDispatcher>(opc, data, other);
+//////////////////////////////////////////////////////////////////////
+
+size_t hashExtra(Opcode opc, const IRExtraData* data) {
+  return dispatchExtra<size_t,HashDispatcher>(
+    opc, const_cast<IRExtraData*>(data));
+}
+
+bool equalsExtra(
+  Opcode opc,
+  const IRExtraData* data,
+  const IRExtraData* other
+) {
+  return dispatchExtra<bool,EqualsDispatcher>(
+    opc, const_cast<IRExtraData*>(data), const_cast<IRExtraData*>(other));
 }
 
 IRExtraData* cloneExtra(Opcode opc, IRExtraData* data, Arena& a) {
@@ -203,4 +178,6 @@ std::string showExtra(Opcode opc, const IRExtraData* data) {
       const_cast<IRExtraData*>(data));
 }
 
-} }
+//////////////////////////////////////////////////////////////////////
+
+}}

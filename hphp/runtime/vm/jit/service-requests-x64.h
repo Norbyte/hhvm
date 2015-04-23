@@ -17,10 +17,13 @@
 #define incl_HPHP_JIT_SERVICE_REQUESTS_X64_H_
 
 #include "hphp/runtime/vm/jit/service-requests.h"
+#include "hphp/runtime/vm/jit/vasm-reg.h"
 #include "hphp/util/asm-x64.h"
 #include "hphp/util/data-block.h"
 
-namespace HPHP { namespace jit { namespace x64 {
+namespace HPHP { namespace jit {
+struct Vout;
+namespace x64 {
 
 /*
  * emitServiceReqWork --
@@ -40,15 +43,13 @@ namespace HPHP { namespace jit { namespace x64 {
 TCA emitServiceReqWork(CodeBlock& cb, TCA start, SRFlags flags,
                        ServiceRequest req, const ServiceReqArgVec& argInfo);
 
+size_t reusableStubSize();
+
 /*
  * "cb" may be either the main section or frozen section.
  */
-void emitBindJmp(CodeBlock& cb, CodeBlock& frozen, SrcKey dest,
-                 TransFlags trflags = TransFlags{});
-void emitBindJcc(CodeBlock& cb, CodeBlock& frozen, jit::ConditionCode cc,
-                 SrcKey dest);
-void emitBindSideExit(CodeBlock& cb, CodeBlock& frozen, jit::ConditionCode cc,
-                      SrcKey dest, TransFlags trflags = TransFlags{});
+void emitBindJ(CodeBlock& cb, CodeBlock& frozen, jit::ConditionCode cc,
+               SrcKey dest, TransFlags trflags = TransFlags{});
 
 /*
  * Similar to the emitBindJ() series.  The address of the jmp is returned.
@@ -57,11 +58,28 @@ TCA emitRetranslate(CodeBlock& cb, CodeBlock& frozen, jit::ConditionCode cc,
                     SrcKey dest, TransFlags trflags);
 
 /*
- * Emits a REQ_BIND_CALL service request, and adjusts rVmSp after the call.
+ * Emit a REQ_BIND_ADDR service request into `frozen', and return the
+ * starting address for the service request.  This function takes into
+ * account what the current block `cb' is while emitting the service
+ * request.  That is, if `cb' is the same as `frozen', a jump is
+ * emitted around the service request code.
  */
-void emitBindCall(CodeBlock& mainCode, CodeBlock& coldCode,
-                  CodeBlock& frozenCode, SrcKey srcKey,
-                  const Func* funcd, int numArgs);
+TCA emitBindAddr(CodeBlock& cb, CodeBlock& frozen, TCA* addr, SrcKey sk);
+
+/*
+ * Emit a REQ_BIND_JMPCC_FIRST service request in `frozen' and the
+ * corresponding jumps to be smashed in `cb'.  `frozen' and `cb' are
+ * allowed to be the same code block.
+ */
+void emitBindJmpccFirst(CodeBlock&    cb,
+                        CodeBlock&    frozen,
+                        ConditionCode cc,
+                        SrcKey        targetSk0,
+                        SrcKey        targetSk1);
+
+// An intentionally funny-looking-in-core-dumps constant for uninitialized
+// instruction pointers.
+constexpr uint64_t kUninitializedRIP = 0xba5eba11acc01ade;
 
 }}}
 
